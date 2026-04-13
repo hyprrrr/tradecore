@@ -59,6 +59,10 @@ const CONFIG = {
   gapFilter:         process.env.GAP_FILTER    !== 'false',
 
   scanIntervalMin: +(process.env.SCAN_INTERVAL_MIN || 5),
+
+  // Supabase
+  supabaseUrl: process.env.SUPABASE_URL || '',
+  supabaseKey: process.env.SUPABASE_ANON_KEY || '',
 };
 
 // Stocks that move together — avoid holding more than 1 from each group
@@ -69,6 +73,106 @@ const CORRELATION_GROUPS = [
   ['SPY', 'QQQ', 'IWM', 'DIA'],
   ['JPM', 'BAC', 'GS', 'MS'],
 ];
+
+// ─────────────────────────────────────────────
+// SUPABASE SYNC
+// ─────────────────────────────────────────────
+async function sbFetch(path, method = 'GET', body = null) {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return null;
+  try {
+    const { default: fetch } = await import('node-fetch');
+    const res = await fetch(`${CONFIG.supabaseUrl}/rest/v1/${path}`, {
+      method,
+      headers: {
+        'apikey': CONFIG.supabaseKey,
+        'Authorization': `Bearer ${CONFIG.supabaseKey}`,
+        'Content-Type': 'application/json',
+        'Prefer': method === 'POST' ? 'resolution=merge-duplicates' : '',
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 204 || res.status === 200) {
+      const text = await res.text();
+      return text ? JSON.parse(text) : null;
+    }
+    return null;
+  } catch (e) {
+    log('error', `Supabase ${method} ${path}: ${e.message}`);
+    return null;
+  }
+}
+
+async function syncPortfolio() {
+  const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    return acc + (cur - pos.entryPrice) * pos.qty;
+  }, 0);
+  const totalValue = portfolio + openPnl;
+  const dayPnl = totalValue - dailyStartPortfolio;
+
+  await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+    cash: +portfolio.toFixed(2),
+    total_value: +totalValue.toFixed(2),
+    day_pnl: +dayPnl.toFixed(2),
+    total_wins: totalWins,
+    total_losses: totalLosses,
+    circuit_breaker: circuitBreakerOn,
+    last_scan: new Date().toISOString(),
+    session: getCurrentSession(),
+    updated_at: new Date().toISOString(),
+  });
+}
+
+async function syncPositions() {
+  // Delete all then reinsert current positions
+  await sbFetch('tc_positions', 'DELETE', undefined);
+  // Supabase REST delete needs a filter — use neq on a dummy field
+  await sbFetch('tc_positions?symbol=neq.___NONE___', 'DELETE');
+
+  for (const [sym, pos] of Object.entries(positions)) {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const pnl = (cur - pos.entryPrice) * pos.qty;
+    const pnlPct = ((cur - pos.entryPrice) / pos.entryPrice) * 100;
+    await sbFetch('tc_positions', 'POST', {
+      symbol: sym,
+      entry_price: +pos.entryPrice.toFixed(4),
+      qty: pos.qty,
+      cost: +pos.cost.toFixed(2),
+      current_price: +cur.toFixed(4),
+      pnl: +pnl.toFixed(2),
+      pnl_pct: +pnlPct.toFixed(2),
+      entry_time: pos.entryTime.toISOString(),
+      high_water: +pos.highWater.toFixed(4),
+      confidence: pos.sigInfo?.confidence || 0,
+      updated_at: new Date().toISOString(),
+    });
+  }
+}
+
+async function syncTrade(trade) {
+  await sbFetch('tc_trades', 'POST', {
+    symbol: trade.sym,
+    side: trade.side,
+    qty: trade.qty,
+    price: +trade.price.toFixed(4),
+    pnl: trade.pnl !== null ? +trade.pnl.toFixed(2) : null,
+    reason: trade.reason || null,
+    confidence: trade.confidence || null,
+    created_at: new Date().toISOString(),
+  });
+}
+
+async function syncLog(type, msg) {
+  await sbFetch('tc_logs', 'POST', {
+    type,
+    message: msg,
+    created_at: new Date().toISOString(),
+  });
+}
+
+async function syncAll() {
+  await Promise.all([syncPortfolio(), syncPositions()]);
+}
 
 // ─────────────────────────────────────────────
 // INTERNATIONAL ETF SESSION MAP
@@ -169,17 +273,26 @@ function isWeekday() {
   return day >= 1 && day <= 5;
 }
 
+function isPreMarket() {
+  const et = getETTime();
+  const mins = et.getHours() * 60 + et.getMinutes();
+  return et.getDay() >= 1 && et.getDay() <= 5 && mins >= 240 && mins < 570;
+}
+
 /**
- * For international ETFs we scan whenever their home market is open,
- * even if the US market is closed. US stocks/ETFs only trade during US hours.
+ * For international ETFs we scan whenever their home market is open.
+ * For regular US stocks (AAPL, TSLA, MSFT etc.) we STRICTLY enforce
+ * US market hours — no scanning, no orders outside 9:31-3:55 ET.
  */
 function shouldScanSymbol(symbol) {
   if (!isWeekday()) return false;
-  const session = ETF_SESSIONS[symbol];
-  if (!session) return isMarketOpen(); // regular stock — US hours only
-  // International ETF: scan if in prime session OR during US hours
-  const mult = getSessionMultiplier(symbol);
-  return mult >= 0.80; // always true for ETFs on weekdays (just with different multiplier)
+  const isIntlETF = !!ETF_SESSIONS[symbol];
+  if (!isIntlETF) {
+    // Hard block — regular US stocks only trade during market hours
+    return isMarketOpen();
+  }
+  // International ETF — always scan on weekdays (with session multiplier applied)
+  return true;
 }
 
 // ─────────────────────────────────────────────
@@ -417,6 +530,12 @@ function calcQty(symbol, price, bars) {
 // TRADE EXECUTION
 // ─────────────────────────────────────────────
 async function enterPosition(sym, price, sigInfo, bars) {
+  // Final safety check — never place orders for US stocks outside market hours
+  const isIntlETF = !!ETF_SESSIONS[sym];
+  if (!isIntlETF && !isMarketOpen()) {
+    log('warn', `🚫 Blocked order for ${sym} — US market is closed`);
+    return;
+  }
   if (checkCircuitBreaker()) return;
   if (isCorrelated(sym))    return;
   if (hasLargeGap(sym, price)) return;
@@ -436,6 +555,9 @@ async function enterPosition(sym, price, sigInfo, bars) {
 
   log('buy', `✅ BUY ${qty}x ${sym} @ $${price.toFixed(2)} | conf=${sigInfo.confidence}% | cash=$${portfolio.toFixed(2)}`);
   await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo);
+  await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
+  await syncAll();
+  await syncLog('buy', `BUY ${qty}x ${sym} @ $${price.toFixed(2)} conf=${sigInfo.confidence}%`);
 }
 
 async function exitPosition(sym, price, reason) {
@@ -456,6 +578,9 @@ async function exitPosition(sym, price, reason) {
   const icon = { STOP_LOSS: '🛑', TAKE_PROFIT: '🎯', TRAILING_STOP: '📉', SIGNAL: '📤' }[reason] || '📤';
   log('sell', `${icon} SELL ${pos.qty}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${reason})`);
   await sendDiscordAlert('sell', sym, pos.qty, price, pnl, reason);
+  await syncTrade({ sym, side: 'SELL', qty: pos.qty, price, pnl, reason });
+  await syncAll();
+  await syncLog('sell', `${icon} SELL ${pos.qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${reason})`);
 }
 
 async function managePosition(sym, price) {
@@ -558,6 +683,7 @@ async function runScan() {
   const total = portfolio + openPnl;
   const dayPnl = total - dailyStartPortfolio;
   log('info', `${session} | Total=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
+  await syncAll();
 }
 
 async function storePrevClose() {
