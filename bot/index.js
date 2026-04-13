@@ -1,21 +1,24 @@
 /**
- * TradeCore Pro Bot — Upgraded Engine v2
+ * TradeCore Pro Bot — Upgraded Engine v3
  *
- * Improvements over v1:
- *  ✅ Real-time Alpaca market data (vs delayed Yahoo Finance)
- *  ✅ 200 EMA trend filter (only buy in uptrends)
- *  ✅ Volume confirmation (only trade on above-average volume)
- *  ✅ Multi-timeframe confirmation (5min + 15min must agree)
- *  ✅ Market regime detection (pauses if SPY is in downtrend)
- *  ✅ Volatility-based position sizing (ATR-based, risk 1% per trade)
- *  ✅ Correlation filter (avoids holding similar stocks at once)
- *  ✅ Daily loss circuit breaker (stops trading if down X% today)
- *  ✅ Pre-market gap filter (skips stocks that gapped >3% at open)
- *  ✅ Market hours enforcement (no trading outside 9:31-3:55 ET)
+ *  ✅ Real-time Alpaca market data
+ *  ✅ 200 EMA trend filter
+ *  ✅ Volume confirmation
+ *  ✅ Multi-timeframe confirmation (5min + 15min)
+ *  ✅ Market regime detection (SPY health check)
+ *  ✅ ATR-based position sizing (risk 1% per trade)
+ *  ✅ Correlation filter
+ *  ✅ Daily loss circuit breaker
+ *  ✅ Gap filter
+ *  ✅ Market hours enforcement
  *  ✅ Trailing stop loss
- *  ✅ VWAP + Bollinger Bands added to signal scoring
- *  ✅ Confidence scoring system (requires 60%+ to trade)
- *  ✅ Richer Discord alerts with signal reasoning
+ *  ✅ VWAP + Bollinger Bands
+ *  ✅ Confidence scoring (60%+ required)
+ *  ✅ International ETF session awareness
+ *     - Asia session  (7 PM - 2 AM ET)  → EWJ, FXI, EWA, EWY
+ *     - London session (3 AM - 9 AM ET) → EWU, EWG, EWZ
+ *     - US open (9:30 AM - 4 PM ET)     → all symbols
+ *     - ETFs boosted/dampened by their home market activity
  */
 
 'use strict';
@@ -33,7 +36,7 @@ const CONFIG = {
 
   discordWebhook: process.env.DISCORD_WEBHOOK || '',
 
-  symbols: (process.env.SYMBOLS || 'SPY,QQQ,AAPL,MSFT,NVDA,TSLA').split(',').map(s => s.trim().toUpperCase()),
+  symbols: (process.env.SYMBOLS || 'SPY,QQQ,AAPL,MSFT,NVDA,TSLA,EWJ,EWU,EWZ,EWC,FXI,EWA,EWG,EWY,INDA').split(',').map(s => s.trim().toUpperCase()),
 
   strategy:      process.env.STRATEGY      || 'rsi_macd',
   rsiPeriod:     +(process.env.RSI_PERIOD     || 14),
@@ -66,6 +69,63 @@ const CORRELATION_GROUPS = [
   ['SPY', 'QQQ', 'IWM', 'DIA'],
   ['JPM', 'BAC', 'GS', 'MS'],
 ];
+
+// ─────────────────────────────────────────────
+// INTERNATIONAL ETF SESSION MAP
+// ─────────────────────────────────────────────
+// Each ETF's home market hours in ET, and a session confidence multiplier.
+// During a symbol's "prime" window its signals get boosted.
+// Outside it, signals are dampened (ETF still trades but home market is closed).
+const ETF_SESSIONS = {
+  // Asia session  — prime: 7 PM – 2 AM ET
+  EWJ:  { region: 'Japan',       primeStart: 19, primeEnd:  2, multiplier: 1.25 },
+  FXI:  { region: 'China',       primeStart: 21, primeEnd:  3, multiplier: 1.25 },
+  EWA:  { region: 'Australia',   primeStart: 19, primeEnd:  1, multiplier: 1.20 },
+  EWY:  { region: 'S. Korea',    primeStart: 20, primeEnd:  2, multiplier: 1.20 },
+  // London/Europe session — prime: 3 AM – 11:30 AM ET
+  EWU:  { region: 'UK',          primeStart:  3, primeEnd: 11, multiplier: 1.25 },
+  EWG:  { region: 'Germany',     primeStart:  3, primeEnd: 11, multiplier: 1.25 },
+  EWZ:  { region: 'Brazil',      primeStart:  9, primeEnd: 16, multiplier: 1.15 },
+  // Americas/all-day
+  EWC:  { region: 'Canada',      primeStart:  9, primeEnd: 16, multiplier: 1.10 },
+  INDA: { region: 'India',       primeStart:  0, primeEnd:  6, multiplier: 1.20 },
+  // US ETFs — always prime during market hours
+  SPY:  { region: 'US (S&P500)', primeStart:  9, primeEnd: 16, multiplier: 1.00 },
+  QQQ:  { region: 'US (Nasdaq)', primeStart:  9, primeEnd: 16, multiplier: 1.00 },
+};
+
+/**
+ * Returns a session multiplier for the symbol right now.
+ * 1.0 = neutral, >1.0 = prime session (boost signals), <1.0 = off-hours (dampen)
+ */
+function getSessionMultiplier(symbol) {
+  const session = ETF_SESSIONS[symbol];
+  if (!session) return 1.0; // regular stock — no adjustment
+
+  const etHour = getETTime().getHours();
+  const { primeStart, primeEnd, multiplier } = session;
+
+  let inPrime;
+  if (primeStart < primeEnd) {
+    inPrime = etHour >= primeStart && etHour < primeEnd;
+  } else {
+    // Wraps midnight (e.g. 19 → 2)
+    inPrime = etHour >= primeStart || etHour < primeEnd;
+  }
+
+  return inPrime ? multiplier : 0.80; // off-prime: dampen confidence by 20%
+}
+
+/**
+ * Returns the current trading session name for logging/alerts
+ */
+function getCurrentSession() {
+  const h = getETTime().getHours();
+  if (h >= 19 || h < 2)  return '🌏 Asia Session';
+  if (h >= 2  && h < 9)  return '🇬🇧 London Session';
+  if (h >= 9  && h < 16) return '🇺🇸 US Session';
+  return '😴 Off Hours';
+}
 
 // ─────────────────────────────────────────────
 // STATE
@@ -104,10 +164,22 @@ function isMarketOpen() {
   return day >= 1 && day <= 5 && mins >= 571 && mins <= 955; // 9:31 - 3:55
 }
 
-function isPreMarket() {
-  const et = getETTime();
-  const mins = et.getHours() * 60 + et.getMinutes();
-  return et.getDay() >= 1 && et.getDay() <= 5 && mins >= 240 && mins < 570;
+function isWeekday() {
+  const day = getETTime().getDay();
+  return day >= 1 && day <= 5;
+}
+
+/**
+ * For international ETFs we scan whenever their home market is open,
+ * even if the US market is closed. US stocks/ETFs only trade during US hours.
+ */
+function shouldScanSymbol(symbol) {
+  if (!isWeekday()) return false;
+  const session = ETF_SESSIONS[symbol];
+  if (!session) return isMarketOpen(); // regular stock — US hours only
+  // International ETF: scan if in prime session OR during US hours
+  const mult = getSessionMultiplier(symbol);
+  return mult >= 0.80; // always true for ETFs on weekdays (just with different multiplier)
 }
 
 // ─────────────────────────────────────────────
@@ -408,24 +480,37 @@ async function managePosition(sym, price) {
 // ─────────────────────────────────────────────
 async function runScan() {
   lastScanTime = new Date();
+  const session = getCurrentSession();
 
-  if (!isMarketOpen()) {
-    log('scan', 'Market closed — skipping (open Mon-Fri 9:31-3:55 ET)');
-    if (isPreMarket()) await storePrevClose();
+  if (!isWeekday()) {
+    log('scan', 'Weekend — markets closed globally');
     return;
   }
 
-  log('scan', `═══ Scanning ${CONFIG.symbols.length} symbols ═══`);
-  const marketOk = await getMarketRegime();
+  log('scan', `═══ ${session} — Scanning ${CONFIG.symbols.length} symbols ═══`);
+
+  // Market regime only matters during US hours
+  const marketOk = isMarketOpen() ? await getMarketRegime() : true;
 
   // Log Alpaca account state
-  if (CONFIG.alpacaKey) {
+  if (CONFIG.alpacaKey && isMarketOpen()) {
     const acct = await getAccount();
     if (acct?.equity) log('acct', `Equity=$${(+acct.equity).toFixed(2)} BuyingPower=$${(+acct.buying_power).toFixed(2)}`);
   }
 
   for (const sym of CONFIG.symbols) {
     try {
+      // Skip if this symbol shouldn't be scanned right now
+      if (!shouldScanSymbol(sym)) {
+        log('skip', `${sym} — not in trading window`);
+        continue;
+      }
+
+      const sessionMult = getSessionMultiplier(sym);
+      const sessionLabel = ETF_SESSIONS[sym]
+        ? `[${ETF_SESSIONS[sym].region} ${sessionMult >= 1.0 ? '🟢 PRIME' : '🟡 off-hrs'} x${sessionMult}]`
+        : '[US stock]';
+
       const bars5m  = await fetchBars(sym, '5Min',  60);
       const bars15m = await fetchBars(sym, '15Min', 40);
       if (!bars5m || bars5m.length < 10) { log('warn', `No data for ${sym}`); continue; }
@@ -439,16 +524,26 @@ async function runScan() {
         await managePosition(sym, price);
         if (positions[sym]) {
           const pct = ((price - positions[sym].entryPrice) / positions[sym].entryPrice * 100).toFixed(2);
-          log('pos', `Holding ${positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${pct}%)`);
+          log('pos', `Holding ${positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${pct}%) ${sessionLabel}`);
         }
         continue;
       }
 
+      // Generate signal and apply session multiplier to confidence
       const sig = generateSignal(sym, bars5m, bars15m);
-      log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${sig.confidence}% RSI:${sig.rsi?.toFixed(1)})`);
+      const adjustedConfidence = Math.round(sig.confidence * sessionMult);
+      const adjustedSig = { ...sig, confidence: adjustedConfidence };
 
-      if (sig.signal === 'BUY' && marketOk && Object.keys(positions).length < CONFIG.maxOpenPositions) {
-        await enterPosition(sym, price, sig, bars5m);
+      if (sessionMult < 1.0) {
+        adjustedSig.reasons = [`Off-prime session (x${sessionMult} conf penalty)`, ...sig.reasons];
+      } else if (sessionMult > 1.0) {
+        adjustedSig.reasons = [`Prime session boost (x${sessionMult})`, ...sig.reasons];
+      }
+
+      log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)}) ${sessionLabel}`);
+
+      if (adjustedSig.signal === 'BUY' && marketOk && Object.keys(positions).length < CONFIG.maxOpenPositions) {
+        await enterPosition(sym, price, adjustedSig, bars5m);
       }
     } catch (e) {
       log('error', `Scan error ${sym}: ${e.message}`);
@@ -462,7 +557,7 @@ async function runScan() {
   }, 0);
   const total = portfolio + openPnl;
   const dayPnl = total - dailyStartPortfolio;
-  log('info', `Total=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
+  log('info', `${session} | Total=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
 }
 
 async function storePrevClose() {
@@ -571,19 +666,22 @@ async function sendDailySummary() {
 // STARTUP + SCHEDULER
 // ─────────────────────────────────────────────
 log('sys', '══════════════════════════════════════════');
-log('sys', '   TradeCore Pro — Upgraded Engine v2     ');
+log('sys', '   TradeCore Pro — Upgraded Engine v3     ');
+log('sys', '   + International ETF Session Awareness  ');
 log('sys', '══════════════════════════════════════════');
 log('sys', `Mode: ${CONFIG.mode.toUpperCase()} | Paper: ${CONFIG.alpacaPaper} | Strategy: ${CONFIG.strategy}`);
 log('sys', `Symbols: ${CONFIG.symbols.join(', ')}`);
+log('sys', `Intl ETFs: ${Object.keys(ETF_SESSIONS).filter(s => !['SPY','QQQ'].includes(s)).join(', ')}`);
 log('sys', `Risk: SL=${CONFIG.stopLossPct*100}% TP=${CONFIG.takeProfitPct*100}% Trailing=${CONFIG.trailingStop} MaxDailyLoss=${CONFIG.maxDailyLossPct*100}%`);
 log('sys', `Filters: Trend=${CONFIG.trendFilter} Volume=${CONFIG.volumeFilter} Regime=${CONFIG.regimeFilter} Corr=${CONFIG.correlationFilter}`);
+log('sys', `Current session: ${getCurrentSession()}`);
 
 // Scan every N minutes
 cron.schedule(`*/${CONFIG.scanIntervalMin} * * * *`, runScan);
 // End of day summary at 4:05 PM ET
 cron.schedule('5 16 * * 1-5', sendDailySummary, { timezone: 'America/New_York' });
-// Store prev day close at 9:00 AM ET for gap detection
-cron.schedule('0 9 * * 1-5', storePrevClose, { timezone: 'America/New_York' });
+// Pre-market: store prev day close at 8:55 AM ET for gap detection
+cron.schedule('55 8 * * 1-5', storePrevClose, { timezone: 'America/New_York' });
 
 // Run immediately on startup
 runScan();
@@ -599,6 +697,7 @@ http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'running',
+    session: getCurrentSession(),
     market_open: isMarketOpen(),
     portfolio: +portfolio.toFixed(2),
     open_pnl: +openPnl.toFixed(2),
