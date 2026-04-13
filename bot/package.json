@@ -1,0 +1,17 @@
+{
+  "name": "tradecore-bot",
+  "version": "1.0.0",
+  "description": "TradeCore autonomous trading bot backend",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3",
+    "node-fetch": "^3.3.2"
+  }
+}
