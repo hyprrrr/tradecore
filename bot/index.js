@@ -470,8 +470,11 @@ function generateSignal(sym, bars5m, bars15m) {
   const total = buy + sell;
   const confidence = total > 0 ? Math.round(Math.max(buy, sell) / total * 100) : 0;
 
-  if (buy >= 55 && buy > sell * 1.3)  return { signal: 'BUY',  confidence, score: buy,  reasons, rsi: r };
-  if (sell >= 55 && sell > buy * 1.3) return { signal: 'SELL', confidence, score: sell, reasons, rsi: r };
+  const minScore = +(process.env.MIN_SCORE || 45);
+  const minEdge  = +(process.env.MIN_EDGE  || 1.2);
+
+  if (buy >= minScore && buy > sell * minEdge)  return { signal: 'BUY',  confidence, score: buy,  reasons, rsi: r };
+  if (sell >= minScore && sell > buy * minEdge) return { signal: 'SELL', confidence, score: sell, reasons, rsi: r };
   return { signal: 'HOLD', confidence, reasons, rsi: r };
 }
 
@@ -485,9 +488,15 @@ async function getMarketRegime() {
     if (!bars || bars.length < 10) return true;
     const closes = bars.map(b => b.c);
     const e10 = ema(closes, 10), e30 = ema(closes, Math.min(30, closes.length));
-    const bullish = closes[closes.length - 1] > e10 && e10 > e30;
-    log('regime', bullish ? '✅ Market BULLISH — trading enabled' : `⚠ Market BEARISH (SPY EMA10:${e10.toFixed(2)} < EMA30:${e30.toFixed(2)}) — BUYs paused`);
-    return bullish;
+    const latest = closes[closes.length - 1];
+    // Loosened: only block if BOTH price below EMA10 AND EMA10 below EMA30 by >1%
+    const hardBearish = latest < e10 && (e10 - e30) / e30 > 0.01;
+    if (hardBearish) {
+      log('regime', `⚠ Market BEARISH — BUYs paused (SPY=$${latest.toFixed(2)} EMA10=$${e10.toFixed(2)} EMA30=$${e30.toFixed(2)})`);
+    } else {
+      log('regime', `✅ Market OK — trading enabled (SPY=$${latest.toFixed(2)})`);
+    }
+    return !hardBearish;
   } catch (e) { return true; }
 }
 
