@@ -210,6 +210,10 @@
     <div class="card">
       <div class="section-header"><div class="section-title">Strategy</div></div>
       <div class="setting-row">
+        <div class="setting-label">Starting Capital ($)</div>
+        <input type="number" class="setting-input" id="startingCapital" value="100000" min="100" step="100" onchange="startingCapital=null;saveSettings()">
+      </div>
+      <div class="setting-row">
         <div class="setting-label">Strategy</div>
         <select class="setting-select" id="strategy" onchange="saveSettings()">
           <option value="rsi_macd">RSI + MACD</option>
@@ -392,6 +396,7 @@ function loadSettings(){
     if(s.symbols) symbols = s.symbols;
     if(s.strategy) document.getElementById('strategy').value = s.strategy;
     if(s.discord)  document.getElementById('discordWebhook').value = s.discord;
+    if(s.startingCapital) document.getElementById('startingCapital').value = s.startingCapital;
     const ranges = {rsiPeriod:'',rsiOversold:'',rsiOverbought:'',scanInterval:'m',stopLoss:'%',takeProfit:'%',trailingStop:'%',maxDailyLoss:'%',maxPositions:'',maxPosPct:'%'};
     Object.entries(ranges).forEach(([id,sfx])=>{
       if(s[id] !== undefined){ document.getElementById(id).value=s[id]; document.getElementById(id+'V').textContent=s[id]+sfx; }
@@ -405,6 +410,7 @@ function loadSettings(){
 function saveSettings(){
   const s = {
     symbols,
+    startingCapital: +document.getElementById('startingCapital').value,
     strategy: document.getElementById('strategy').value,
     discord: document.getElementById('discordWebhook').value,
     rsiPeriod: +document.getElementById('rsiPeriod').value,
@@ -491,9 +497,10 @@ async function poll(){
   if(!portfolio||portfolio.length===0){ setOffline(); return; }
   const p = portfolio[0];
   const posData = positions||[];
-  updateKPIs(p, posData);
+  const tradeData = trades||[];
+  updateKPIs(p, posData, tradeData);
   updatePositions(posData);
-  updateTrades(trades||[]);
+  updateTrades(tradeData);
   updateLogs(logs||[]);
   setOnline();
   document.getElementById('syncInfo').textContent = 'Updated '+new Date().toLocaleTimeString();
@@ -501,26 +508,44 @@ async function poll(){
 
 // store starting capital from first poll
 let startingCapital = null;
-let lastPositions = [];
 
-function updateKPIs(p, positions){
+function getStartingCapital(){
+  // Try settings first, then fall back to 100000 (Alpaca paper default)
+  try {
+    const s = JSON.parse(localStorage.getItem('tc_settings')||'{}');
+    if(s.startingCapital) return +s.startingCapital;
+  } catch(e){}
+  return 100000;
+}
+
+function updateKPIs(p, positions, trades){
   const cash = +p.cash;
   const wins = p.total_wins, losses = p.total_losses, total = wins+losses;
 
-  // Calculate open position value from positions table (current_price * qty)
+  // Open position value = current price × qty (what positions are worth RIGHT NOW)
   const openValue = positions.reduce((acc, pos) => acc + (+pos.current_price * +pos.qty), 0);
   const totalValue = cash + openValue;
 
-  // Store starting capital on first load
-  if(startingCapital === null) startingCapital = +p.total_value || totalValue;
+  // Starting capital = what you funded the account with
+  if(startingCapital === null) startingCapital = getStartingCapital();
 
-  // Unrealized P&L = current value of open positions minus what we paid
-  const unrealizedPnl = positions.reduce((acc, pos) => acc + +pos.pnl, 0);
+  // Unrealized P&L = what open positions are worth vs what we paid for them
+  const unrealizedPnl = positions.reduce((acc, pos) => {
+    const cost = +pos.entry_price * +pos.qty;
+    const now  = +pos.current_price * +pos.qty;
+    return acc + (now - cost);
+  }, 0);
 
-  // Day P&L = realized closed trades today + unrealized on open positions
-  const dayPnl = +p.day_pnl + unrealizedPnl;
+  // Realized P&L today = sum of SELL trades today only (never BUY trades)
+  const todayStr = new Date().toLocaleDateString();
+  const realizedToday = (trades||[])
+    .filter(t => t.side === 'SELL' && t.pnl !== null && new Date(t.created_at).toLocaleDateString() === todayStr)
+    .reduce((acc, t) => acc + +t.pnl, 0);
 
-  // All time P&L = total portfolio vs starting capital
+  // True day P&L = realized closed trades today + unrealized on open positions
+  const dayPnl = realizedToday + unrealizedPnl;
+
+  // All time P&L = total value vs starting capital
   const allTimePnl = totalValue - startingCapital;
   const allTimePct = startingCapital > 0 ? ((allTimePnl / startingCapital) * 100).toFixed(2) : '0.00';
 
@@ -533,10 +558,9 @@ function updateKPIs(p, positions){
   pnlEl.textContent = `${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`;
   pnlEl.className = 'card-value '+(dayPnl>=0?'green':'red');
 
-  // Sub-label shows realized + unrealized breakdown
-  const realizedToday = +p.day_pnl;
+  // Breakdown label
   document.getElementById('tradeCount').textContent =
-    `Realized: ${realizedToday>=0?'+':''}$${realizedToday.toFixed(2)} | Unrealized: ${unrealizedPnl>=0?'+':''}$${unrealizedPnl.toFixed(2)}`;
+    `Realized: ${realizedToday>=0?'+':''}$${realizedToday.toFixed(2)} | Open: ${unrealizedPnl>=0?'+':''}$${unrealizedPnl.toFixed(2)}`;
 
   const wr = total>0?((wins/total)*100).toFixed(0)+'%':'—';
   document.getElementById('winRate').textContent = wr;
@@ -548,7 +572,6 @@ function updateKPIs(p, positions){
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
   if(p.session) document.getElementById('sessionBadge').textContent=p.session;
 
-  // Equity chart uses true total value
   equityHistory.push(+totalValue.toFixed(2));
   if(equityHistory.length>288) equityHistory.shift();
   drawChart();
