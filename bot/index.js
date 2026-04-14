@@ -95,20 +95,27 @@ async function sbFetch(path, method = 'GET', body = null) {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return null;
   try {
     const { default: fetch } = await import('node-fetch');
+    const headers = {
+      'apikey': CONFIG.supabaseKey,
+      'Authorization': `Bearer ${CONFIG.supabaseKey}`,
+      'Content-Type': 'application/json',
+    };
+    if (method === 'POST') headers['Prefer'] = 'resolution=merge-duplicates,return=minimal';
+    if (method === 'PATCH') headers['Prefer'] = 'return=minimal';
+    if (method === 'DELETE') headers['Prefer'] = 'return=minimal';
+
     const res = await fetch(`${CONFIG.supabaseUrl}/rest/v1/${path}`, {
       method,
-      headers: {
-        'apikey': CONFIG.supabaseKey,
-        'Authorization': `Bearer ${CONFIG.supabaseKey}`,
-        'Content-Type': 'application/json',
-        'Prefer': method === 'POST' ? 'resolution=merge-duplicates' : '',
-      },
+      headers,
       body: body ? JSON.stringify(body) : undefined,
     });
-    if (res.status === 204 || res.status === 200) {
+    // 200, 201, 204 are all success for Supabase REST
+    if (res.status >= 200 && res.status < 300) {
       const text = await res.text();
-      return text ? JSON.parse(text) : null;
+      return text ? JSON.parse(text) : { ok: true };
     }
+    const errText = await res.text();
+    log('error', `Supabase ${method} ${path} → ${res.status}: ${errText}`);
     return null;
   } catch (e) {
     log('error', `Supabase ${method} ${path}: ${e.message}`);
@@ -199,36 +206,59 @@ async function syncAll() {
   await Promise.all([syncPortfolio(), syncPositions()]);
 }
 
-// Sync current prices to Supabase every 60s even between scans
-// So the dashboard always shows live P&L
+// Sync live prices every 60s using Alpaca's own position data
+// Alpaca gives us current_price, unrealized_pl directly — most accurate source
 async function syncPricesOnly() {
+  if (!CONFIG.alpacaKey) return;
   if (Object.keys(positions).length === 0) return;
-  for (const [sym, pos] of Object.entries(positions)) {
-    try {
-      const bars = await fetchBars(sym, '5Min', 3);
-      if (!bars || bars.length === 0) continue;
-      const cur    = bars[bars.length - 1].c;
-      const qty    = pos.qtyRemaining || pos.qty;
-      const pnl    = (cur - pos.entryPrice) * qty;
-      const pnlPct = ((cur - pos.entryPrice) / pos.entryPrice) * 100;
-      // Update price in memory
+
+  try {
+    const alpacaPos = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
+    if (!Array.isArray(alpacaPos)) return;
+
+    for (const ap of alpacaPos) {
+      const sym         = ap.symbol;
+      const cur         = +ap.current_price;
+      const qty         = +ap.qty;
+      const entryPrice  = +ap.avg_entry_price;
+      const pnl         = +ap.unrealized_pl;
+      const pnlPct      = +ap.unrealized_plpc * 100;
+
+      // Update in-memory price history
       if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
       priceHistory5m[sym].push(cur);
       if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
-      // Push to Supabase
-      await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
+
+      // Update high water mark
+      if (positions[sym] && cur > positions[sym].highWater) {
+        positions[sym].highWater = cur;
+      }
+
+      // Push live price to Supabase via PATCH
+      const patchResult = await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
         current_price: +cur.toFixed(4),
         pnl:           +pnl.toFixed(2),
-        pnl_pct:       +pnlPct.toFixed(2),
-        high_water:    +Math.max(pos.highWater, cur).toFixed(4),
+        pnl_pct:       +pnlPct.toFixed(4),
+        high_water:    positions[sym] ? +positions[sym].highWater.toFixed(4) : +cur.toFixed(4),
         updated_at:    new Date().toISOString(),
       });
-      if (cur > pos.highWater) positions[sym].highWater = cur;
-    } catch (e) {
-      log('error', `Price sync failed for ${sym}: ${e.message}`);
+
+      log('price', `${sym} live price: $${cur.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
     }
+
+    // Also update portfolio cash in Supabase
+    const acct = await getAccount();
+    if (acct?.cash) {
+      await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+        cash:        +parseFloat(acct.cash).toFixed(2),
+        last_scan:   new Date().toISOString(),
+        updated_at:  new Date().toISOString(),
+      });
+    }
+
+  } catch (e) {
+    log('error', `syncPricesOnly failed: ${e.message}`);
   }
-  await syncPortfolio();
 }
 
 // ─────────────────────────────────────────────
