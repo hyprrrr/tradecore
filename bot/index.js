@@ -722,7 +722,7 @@ function checkCircuitBreaker() {
   const loss = (dailyStartPortfolio - portfolio) / dailyStartPortfolio;
   if (loss >= CONFIG.maxDailyLossPct) {
     circuitBreakerOn = true;
-    log('risk', `🔴 CIRCUIT BREAKER: Down ${(loss*100).toFixed(1)}% today — halting all trades`);
+    log('risk', `🔴 CIRCUIT BREAKER: Down ${(loss*100).toFixed(2)}% today — halting all trades`);
     sendDiscordAlert('circuit_breaker', 'ALL', 0, 0, -(dailyStartPortfolio - portfolio));
   }
   return circuitBreakerOn;
