@@ -368,36 +368,56 @@ const SB_URL_KEY = 'tc_sb_url', SB_KEY_KEY = 'tc_sb_key';
 function getSbUrl(){ return localStorage.getItem(SB_URL_KEY)||''; }
 function getSbKey(){ return localStorage.getItem(SB_KEY_KEY)||''; }
 
-function saveSupabaseConfig(){
-  const url = document.getElementById('sbUrlInput').value.trim().replace(/\/$/,'');
-  const key = document.getElementById('sbKeyInput').value.trim();
-  if(!url||!key){ alert('Enter both URL and key'); return; }
-  if(!url.includes('supabase.co')){ alert('URL should look like: https://xxxx.supabase.co'); return; }
-  localStorage.setItem(SB_URL_KEY, url);
-  localStorage.setItem(SB_KEY_KEY, key);
-  document.getElementById('setupBanner').style.display='none';
-  equityLoaded = false; // reset so equity reloads with new creds
-  showToast('✓ Connected — loading data…');
-  poll(); // immediate poll with new creds
-}
-
-if(!getSbUrl()||!getSbKey()){
-  document.getElementById('setupBanner').style.display='block';
-} else {
-  // Pre-fill inputs in case user wants to update
-  document.getElementById('sbUrlInput').value = getSbUrl();
-  document.getElementById('sbKeyInput').value = getSbKey();
-}
-
 async function sbGet(table, params=''){
   const url=getSbUrl(), key=getSbKey();
   if(!url||!key) return null;
   try{
     const res = await fetch(`${url}/rest/v1/${table}${params}`,{
-      headers:{'apikey':key,'Authorization':`Bearer ${key}`,'Content-Type':'application/json'}
+      headers:{
+        'apikey': key,
+        'Authorization': `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      }
     });
-    return res.ok ? res.json() : null;
-  }catch(e){ return null; }
+    if(!res.ok){
+      console.warn(`Supabase ${table} error:`, res.status, await res.text());
+      return null;
+    }
+    const text = await res.text();
+    return text ? JSON.parse(text) : [];
+  }catch(e){
+    console.warn('sbGet failed:', table, e.message);
+    return null;
+  }
+}
+
+function saveSupabaseConfig(){
+  const url = document.getElementById('sbUrlInput').value.trim().replace(/\/$/,'');
+  const key = document.getElementById('sbKeyInput').value.trim();
+  if(!url||!key){ alert('Enter both URL and key'); return; }
+  if(!url.includes('supabase')){ alert('URL should be your Supabase project URL'); return; }
+  localStorage.setItem(SB_URL_KEY, url);
+  localStorage.setItem(SB_KEY_KEY, key);
+  document.getElementById('setupBanner').style.display='none';
+  // Test connection immediately
+  testConnection();
+}
+
+async function testConnection(){
+  document.getElementById('statusText').textContent = 'TESTING…';
+  const result = await sbGet('tc_portfolio','?id=eq.1');
+  if(result !== null){
+    showToast('✓ Connected!');
+    equityLoaded = false;
+    poll();
+  } else {
+    document.getElementById('statusPill').className='status-pill offline';
+    document.getElementById('statusText').textContent = 'FAILED';
+    document.getElementById('syncInfo').textContent = '⚠ Check credentials & RLS settings';
+    showToast('✗ Connection failed — check console for details');
+    document.getElementById('setupBanner').style.display='block';
+  }
 }
 
 // ─── SETTINGS ───
@@ -885,13 +905,24 @@ function showToast(msg){ const t=document.getElementById('toast'); t.textContent
 // ─── START ───
 function startPolling(){
   poll();
-  setInterval(poll, 5000);          // refresh dashboard every 5 seconds
-  setInterval(updateSessionMap, 10000); // session map every 10 seconds
+  setInterval(poll, 5000);
+  setInterval(updateSessionMap, 10000);
 }
+
+// Init — runs after all functions are defined
 loadSettings();
-startPolling();
 updateSessionMap();
-window.addEventListener('resize',drawChart);
+window.addEventListener('resize', drawChart);
+
+// Show setup banner or auto-connect
+if(!getSbUrl() || !getSbKey()){
+  document.getElementById('setupBanner').style.display = 'block';
+} else {
+  // Pre-fill inputs
+  document.getElementById('sbUrlInput').value = getSbUrl();
+  document.getElementById('sbKeyInput').value = getSbKey();
+  startPolling();
+}
 </script>
 </body>
 </html>
