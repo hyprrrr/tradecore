@@ -244,10 +244,10 @@
         </div>
       </div>
       <div class="setting-row">
-        <div class="setting-label">Scan Interval (min)</div>
+        <div class="setting-label">Signal Scan Interval (seconds)</div>
         <div class="range-wrap">
-          <input type="range" id="scanInterval" min="1" max="30" value="5" oninput="rng(this,'scanIntervalV','m')">
-          <span class="range-val" id="scanIntervalV">5m</span>
+          <input type="range" id="scanInterval" min="10" max="300" value="30" oninput="rng(this,'scanIntervalV','s')">
+          <span class="range-val" id="scanIntervalV">30s</span>
         </div>
       </div>
       <button class="btn btn-primary btn-sm" style="width:100%;margin-top:4px" onclick="saveSettings()">💾 Save Strategy</button>
@@ -456,7 +456,7 @@ async function saveSettings(){
           rsi_period:          s.rsiPeriod,
           rsi_oversold:        s.rsiOversold,
           rsi_overbought:      s.rsiOverbought,
-          scan_interval:       s.scanInterval,
+          scan_interval:       s.scanInterval,   // stored as seconds
           stop_loss_pct:       s.stopLoss,
           take_profit_pct:     s.takeProfit,
           trailing_stop_pct:   s.trailingStop,
@@ -508,7 +508,7 @@ function updateRenderVars(){
     `RSI_PERIOD=${s.rsiPeriod||14}`,
     `RSI_OVERSOLD=${s.rsiOversold||32}`,
     `RSI_OVERBOUGHT=${s.rsiOverbought||68}`,
-    `SCAN_INTERVAL_MIN=${s.scanInterval||5}`,
+    `SCAN_INTERVAL_SEC=${s.scanInterval||30}`,
     `STOP_LOSS_PCT=${s.stopLoss||4}`,
     `TAKE_PROFIT_PCT=${s.takeProfit||8}`,
     `TRAILING_STOP_PCT=${s.trailingStop||3}`,
@@ -787,7 +787,11 @@ function setOffline(){ document.getElementById('statusPill').className='status-p
 function showToast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2500); }
 
 // ─── START ───
-function startPolling(){ poll(); setInterval(poll,15000); setInterval(updateSessionMap,30000); }
+function startPolling(){
+  poll();
+  setInterval(poll, 5000);          // refresh dashboard every 5 seconds
+  setInterval(updateSessionMap, 10000); // session map every 10 seconds
+}
 loadSettings();
 startPolling();
 updateSessionMap();
