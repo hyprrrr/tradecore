@@ -44,8 +44,8 @@ const CONFIG = {
 
   strategy:      process.env.STRATEGY      || 'rsi_macd',
   rsiPeriod:     +(process.env.RSI_PERIOD     || 14),
-  rsiOversold:   +(process.env.RSI_OVERSOLD   || 32),
-  rsiOverbought: +(process.env.RSI_OVERBOUGHT || 68),
+  rsiOversold:   +(process.env.RSI_OVERSOLD   || 35),
+  rsiOverbought: +(process.env.RSI_OVERBOUGHT || 65),
 
   startingCapital:  +(process.env.CAPITAL          || 10000),
   maxPositionPct:   +(process.env.MAX_POSITION_PCT  || 15) / 100,
@@ -79,7 +79,54 @@ const CONFIG = {
   supabaseKey: process.env.SUPABASE_ANON_KEY || '',
 };
 
-// Stocks that move together — avoid holding more than 1 from each group
+// ─────────────────────────────────────────────
+// DYNAMIC CONFIG — loaded from Supabase on startup + every scan
+// Secrets (API keys, webhook) stay in Render env vars only
+// Everything else can be changed from the dashboard
+// ─────────────────────────────────────────────
+async function loadRemoteConfig() {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return;
+  try {
+    const { default: fetch } = await import('node-fetch');
+    const res = await fetch(`${CONFIG.supabaseUrl}/rest/v1/tc_settings?id=eq.1`, {
+      headers: {
+        'apikey': CONFIG.supabaseKey,
+        'Authorization': `Bearer ${CONFIG.supabaseKey}`,
+      }
+    });
+    if (!res.ok) return;
+    const rows = await res.json();
+    if (!rows || rows.length === 0) return;
+    const s = rows[0];
+
+    // Apply remote settings over CONFIG — secrets never overwritten
+    if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase());
+    if (s.strategy)         CONFIG.strategy         = s.strategy;
+    if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
+    if (s.rsi_oversold)     CONFIG.rsiOversold      = +s.rsi_oversold;
+    if (s.rsi_overbought)   CONFIG.rsiOverbought    = +s.rsi_overbought;
+    if (s.scan_interval)    CONFIG.scanIntervalMin  = +s.scan_interval;
+    if (s.stop_loss_pct)    CONFIG.stopLossPct      = +s.stop_loss_pct / 100;
+    if (s.take_profit_pct)  CONFIG.takeProfitPct    = +s.take_profit_pct / 100;
+    if (s.trailing_stop_pct) CONFIG.trailingStopPct = +s.trailing_stop_pct / 100;
+    if (s.max_daily_loss)   CONFIG.maxDailyLossPct  = +s.max_daily_loss / 100;
+    if (s.max_positions)    CONFIG.maxOpenPositions = +s.max_positions;
+    if (s.max_position_pct) CONFIG.maxPositionPct   = +s.max_position_pct / 100;
+    if (s.tp1_pct)          CONFIG.tp1Pct           = +s.tp1_pct / 100;
+    if (s.tp2_pct)          CONFIG.tp2Pct           = +s.tp2_pct / 100;
+    if (s.tp3_pct)          CONFIG.tp3Pct           = +s.tp3_pct / 100;
+    if (s.break_even_at)    CONFIG.breakEvenAt      = +s.break_even_at / 100;
+    if (s.discord_webhook)  CONFIG.discordWebhook   = s.discord_webhook;
+    if (s.trend_filter      !== undefined) CONFIG.trendFilter       = !!s.trend_filter;
+    if (s.volume_filter     !== undefined) CONFIG.volumeFilter      = !!s.volume_filter;
+    if (s.regime_filter     !== undefined) CONFIG.regimeFilter      = !!s.regime_filter;
+    if (s.correlation_filter !== undefined) CONFIG.correlationFilter = !!s.correlation_filter;
+
+    log('sys', `Remote config loaded from Supabase — strategy:${CONFIG.strategy} symbols:${CONFIG.symbols.length} RSI:${CONFIG.rsiOversold}/${CONFIG.rsiOverbought}`);
+  } catch(e) {
+    log('warn', `Could not load remote config: ${e.message} — using defaults`);
+  }
+}
 const CORRELATION_GROUPS = [
   ['AAPL', 'MSFT', 'GOOGL', 'META', 'AMZN'],
   ['NVDA', 'AMD', 'INTC', 'QCOM'],
@@ -484,78 +531,146 @@ function bollingerBands(prices, period = 20, mult = 2) {
 function generateSignal(sym, bars5m, bars15m) {
   if (!bars5m || bars5m.length < 20) return { signal: 'HOLD', confidence: 0, reasons: ['Insufficient data'] };
 
-  const c5  = bars5m.map(b => b.c);
-  const c15 = bars15m?.length >= 20 ? bars15m.map(b => b.c) : null;
-  const vol = bars5m.map(b => b.v);
+  const c5   = bars5m.map(b => b.c);
+  const c15  = bars15m?.length >= 20 ? bars15m.map(b => b.c) : null;
+  const vol  = bars5m.map(b => b.v);
   const price = c5[c5.length - 1];
 
   let buy = 0, sell = 0;
   const reasons = [];
 
-  // RSI
+  // ── 1. RSI ──
   const r = rsi(c5, CONFIG.rsiPeriod);
-  if (r < CONFIG.rsiOversold)   { buy  += 25; reasons.push(`RSI oversold (${r.toFixed(1)})`);  }
-  else if (r > CONFIG.rsiOverbought) { sell += 25; reasons.push(`RSI overbought (${r.toFixed(1)})`); }
 
-  // MACD (EMA 8/21 cross)
+  // Hard gate: RSI must be clearly oversold/overbought — no trading in neutral zone
+  const rsiNeutral = r >= 40 && r <= 60;
+  if (rsiNeutral) {
+    return { signal: 'HOLD', confidence: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no edge, skipping`], rsi: r };
+  }
+
+  if (r < CONFIG.rsiOversold)        { buy  += 30; reasons.push(`RSI oversold (${r.toFixed(1)})`); }
+  else if (r > CONFIG.rsiOverbought) { sell += 30; reasons.push(`RSI overbought (${r.toFixed(1)})`); }
+  else if (r < 40)                   { buy  += 10; reasons.push(`RSI leaning oversold (${r.toFixed(1)})`); }
+  else if (r > 60)                   { sell += 10; reasons.push(`RSI leaning overbought (${r.toFixed(1)})`); }
+
+  // ── 2. MACD — only count crossovers, not just position ──
   const e8 = ema(c5, 8), e21 = ema(c5, 21);
   const pe8 = ema(c5.slice(0, -1), 8), pe21 = ema(c5.slice(0, -1), 21);
-  if (e8 > e21)  { buy  += 15; reasons.push('MACD bullish'); }
-  else           { sell += 15; reasons.push('MACD bearish'); }
-  if (pe8 < pe21 && e8 > e21) { buy  += 10; reasons.push('MACD bullish crossover ↑'); }
-  if (pe8 > pe21 && e8 < e21) { sell += 10; reasons.push('MACD bearish crossover ↓'); }
+  const macdDiff = Math.abs(e8 - e21) / e21; // how far apart are the EMAs?
 
-  // 200 EMA trend filter
+  // Only count MACD if EMAs have meaningful separation (not crossing in neutral)
+  if (macdDiff > 0.001) {
+    if (e8 > e21) { buy  += 15; reasons.push('MACD bullish'); }
+    else          { sell += 15; reasons.push('MACD bearish'); }
+  } else {
+    reasons.push('MACD neutral (EMAs too close)');
+  }
+
+  // Crossover bonus — strong signal
+  if (pe8 < pe21 && e8 > e21) { buy  += 15; reasons.push('MACD bullish crossover ↑'); }
+  if (pe8 > pe21 && e8 < e21) { sell += 15; reasons.push('MACD bearish crossover ↓'); }
+
+  // ── 3. 200 EMA trend filter — hard gate, not just points ──
   if (CONFIG.trendFilter && c5.length >= 40) {
     const e200 = ema(c5, Math.min(200, c5.length));
     if (price > e200) { buy  += 20; reasons.push('Above 200 EMA (uptrend)'); }
-    else              { sell += 20; reasons.push('Below 200 EMA (downtrend)'); }
-  }
-
-  // Volume
-  if (CONFIG.volumeFilter && vol.length >= 10) {
-    const avgVol = vol.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, vol.length);
-    const curVol = vol[vol.length - 1];
-    if (curVol > avgVol * 1.3) {
-      buy > sell ? buy += 15 : sell += 15;
-      reasons.push(`Volume surge (${(curVol / avgVol).toFixed(1)}x avg)`);
-    } else if (curVol < avgVol * 0.5) {
-      buy = Math.max(0, buy - 10); sell = Math.max(0, sell - 10);
-      reasons.push('Low volume — dampening');
+    else {
+      // Below 200 EMA — cancel any buy signal entirely
+      if (buy > 0) {
+        reasons.push('Below 200 EMA — BUY cancelled');
+        return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+      }
+      sell += 20; reasons.push('Below 200 EMA (downtrend)');
     }
   }
 
-  // 15min timeframe confirmation
+  // ── 4. Volume — must confirm direction ──
+  if (CONFIG.volumeFilter && vol.length >= 10) {
+    const avgVol = vol.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, vol.length);
+    const curVol = vol[vol.length - 1];
+    if (curVol > avgVol * 1.5) {
+      buy > sell ? buy += 20 : sell += 20;
+      reasons.push(`Strong volume (${(curVol/avgVol).toFixed(1)}x avg)`);
+    } else if (curVol < avgVol * 0.7) {
+      // Low volume = indecision, cancel signal
+      reasons.push('Low volume — indecision, skipping');
+      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+    } else {
+      reasons.push(`Normal volume (${(curVol/avgVol).toFixed(1)}x avg)`);
+    }
+  }
+
+  // ── 5. 15min timeframe — must agree or signal is cancelled ──
   if (c15) {
     const r15 = rsi(c15, CONFIG.rsiPeriod);
     const e8_15 = ema(c15, 8), e21_15 = ema(c15, 21);
-    if (r15 < 45 && e8_15 > e21_15) { buy  += 15; reasons.push('15min confirms bullish'); }
-    else if (r15 > 55 && e8_15 < e21_15) { sell += 15; reasons.push('15min confirms bearish'); }
-    else { buy = Math.max(0, buy - 5); sell = Math.max(0, sell - 5); reasons.push('15min neutral'); }
+    const tf15Bullish = r15 < 50 && e8_15 > e21_15;
+    const tf15Bearish = r15 > 50 && e8_15 < e21_15;
+
+    if (buy > sell && !tf15Bullish) {
+      reasons.push('15min disagrees with BUY — cancelled');
+      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+    }
+    if (sell > buy && !tf15Bearish) {
+      reasons.push('15min disagrees with SELL — cancelled');
+      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+    }
+    buy > sell
+      ? (buy += 15, reasons.push('15min confirms bullish'))
+      : (sell += 15, reasons.push('15min confirms bearish'));
   }
 
-  // Bollinger Bands
+  // ── 6. Bollinger Bands ──
   const bb = bollingerBands(c5);
   if (bb) {
-    if (price <= bb.lower) { buy  += 10; reasons.push('At lower Bollinger Band'); }
-    else if (price >= bb.upper) { sell += 10; reasons.push('At upper Bollinger Band'); }
+    if (price <= bb.lower)       { buy  += 15; reasons.push('At/below lower Bollinger Band'); }
+    else if (price >= bb.upper)  { sell += 15; reasons.push('At/above upper Bollinger Band'); }
+    else {
+      // Price in middle of bands = indecision zone
+      const midDist = Math.abs(price - bb.middle) / (bb.upper - bb.middle);
+      if (midDist < 0.3) {
+        reasons.push('Price in Bollinger Band middle — indecision');
+        return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+      }
+    }
   }
 
-  // VWAP
+  // ── 7. VWAP ──
   if (bars5m.length >= 5) {
     const vw = vwap(bars5m.slice(-20));
-    if (price > vw * 1.001) { buy  += 5; reasons.push(`Above VWAP ($${vw.toFixed(2)})`); }
-    else                    { sell += 5; reasons.push(`Below VWAP ($${vw.toFixed(2)})`); }
+    if (price > vw * 1.002)       { buy  += 10; reasons.push(`Above VWAP ($${vw.toFixed(2)})`); }
+    else if (price < vw * 0.998)  { sell += 10; reasons.push(`Below VWAP ($${vw.toFixed(2)})`); }
+    else {
+      reasons.push('Hugging VWAP — indecision');
+      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+    }
   }
 
+  // ── 8. Momentum check — price must be moving in signal direction ──
+  if (c5.length >= 5) {
+    const recentChange = (c5[c5.length-1] - c5[c5.length-5]) / c5[c5.length-5];
+    if (buy > sell && recentChange < -0.005) {
+      reasons.push('Price falling despite bullish signal — skipping');
+      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+    }
+    if (sell > buy && recentChange > 0.005) {
+      reasons.push('Price rising despite bearish signal — skipping');
+      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+    }
+  }
+
+  // ── Final threshold ──
   const total = buy + sell;
   const confidence = total > 0 ? Math.round(Math.max(buy, sell) / total * 100) : 0;
 
-  const minScore = +(process.env.MIN_SCORE || 45);
-  const minEdge  = +(process.env.MIN_EDGE  || 1.2);
+  // Require strong score AND clear edge
+  const minScore = +(process.env.MIN_SCORE || 60);
+  const minEdge  = +(process.env.MIN_EDGE  || 1.5);
 
   if (buy >= minScore && buy > sell * minEdge)  return { signal: 'BUY',  confidence, score: buy,  reasons, rsi: r };
   if (sell >= minScore && sell > buy * minEdge) return { signal: 'SELL', confidence, score: sell, reasons, rsi: r };
+
+  reasons.push(`Score insufficient (buy=${buy} sell=${sell} need ${minScore} with ${minEdge}x edge)`);
   return { signal: 'HOLD', confidence, reasons, rsi: r };
 }
 
@@ -874,6 +989,9 @@ async function runScan() {
 
   log('scan', `═══ ${session} — Scanning ${CONFIG.symbols.length} symbols ═══`);
   await syncLog('sys', `Scan started — ${session} — ${CONFIG.symbols.length} symbols`);
+
+  // Reload settings from dashboard on every scan — no Render redeploy needed
+  await loadRemoteConfig();
 
   // Always sync live Alpaca positions first — prevents duplicate buys after restarts
   await syncAlpacaPositions();
@@ -1218,8 +1336,8 @@ cron.schedule('5 16 * * 1-5', sendDailySummary, { timezone: 'America/New_York' }
 cron.schedule('55 8 * * 1-5', storePrevClose, { timezone: 'America/New_York' });
 
 // Run immediately on startup
-runScan();
-setTimeout(syncPricesOnly, 5000); // sync prices 5s after startup
+loadRemoteConfig().then(() => runScan());
+setTimeout(syncPricesOnly, 5000);
 
 // ─────────────────────────────────────────────
 // HEALTH ENDPOINT
