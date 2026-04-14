@@ -171,30 +171,41 @@ async function sbFetch(path, method = 'GET', body = null) {
 }
 
 async function syncPortfolio() {
-  // Get real cash from Alpaca account (most accurate source)
-  let cashValue = portfolio; // fallback to in-memory
+  // Get real values directly from Alpaca — most accurate source
+  let cashValue = portfolio;
+  let equityValue = portfolio;
+
   if (CONFIG.alpacaKey) {
     try {
       const acct = await getAccount();
-      if (acct?.cash) cashValue = +parseFloat(acct.cash).toFixed(2);
+      if (acct?.cash)         cashValue   = +parseFloat(acct.cash).toFixed(2);
+      if (acct?.equity)       equityValue = +parseFloat(acct.equity).toFixed(2);
+      if (acct?.last_equity)  CONFIG._lastEquity = +parseFloat(acct.last_equity).toFixed(2);
     } catch(e) {}
   }
 
-  // Realized P&L today = closed SELL trades only
-  const realizedDayPnl = trades
-    .filter(t => t.side === 'SELL' && t.pnl !== null && new Date(t.time).toDateString() === new Date().toDateString())
-    .reduce((acc, t) => acc + t.pnl, 0);
+  // Day P&L = today's equity vs yesterday's close (from Alpaca account)
+  const dayPnl = CONFIG._lastEquity
+    ? +(equityValue - CONFIG._lastEquity).toFixed(2)
+    : trades.filter(t => t.side==='SELL' && t.pnl !== null && new Date(t.time).toDateString() === new Date().toDateString())
+             .reduce((a,t) => a + t.pnl, 0);
 
   await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
-    cash:           +cashValue.toFixed(2),
-    total_value:    +cashValue.toFixed(2),
-    day_pnl:        +realizedDayPnl.toFixed(2),
-    total_wins:     totalWins,
-    total_losses:   totalLosses,
+    cash:            +cashValue.toFixed(2),
+    total_value:     +equityValue.toFixed(2),
+    day_pnl:         +dayPnl.toFixed(2),
+    total_wins:      totalWins,
+    total_losses:    totalLosses,
     circuit_breaker: circuitBreakerOn,
-    last_scan:      new Date().toISOString(),
-    session:        getCurrentSession(),
-    updated_at:     new Date().toISOString(),
+    last_scan:       new Date().toISOString(),
+    session:         getCurrentSession(),
+    updated_at:      new Date().toISOString(),
+  });
+
+  // Store equity snapshot for the chart (every sync)
+  await sbFetch('tc_equity', 'POST', {
+    value:      +equityValue.toFixed(2),
+    created_at: new Date().toISOString(),
   });
 }
 
@@ -458,15 +469,39 @@ async function alpacaFetch(url, opts = {}) {
 }
 
 async function fetchBars(symbol, timeframe, limit) {
+  // Try Alpaca first
   try {
-    const start = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const start = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
     const url = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${start}&limit=${limit}&feed=iex`;
     const data = await alpacaFetch(url);
-    return data.bars || null;
-  } catch (e) {
-    log('error', `fetchBars ${symbol} ${timeframe}: ${e.message}`);
-    return null;
-  }
+    if (data.bars && data.bars.length >= 5) return data.bars;
+  } catch (e) {}
+
+  // Fallback: Yahoo Finance (free, no key)
+  try {
+    const { default: fetch } = await import('node-fetch');
+    const interval = timeframe === '5Min' ? '5m' : timeframe === '15Min' ? '15m' : '1d';
+    const range    = timeframe === '1Day' ? '3mo' : '5d';
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${interval}&range=${range}`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) return null;
+    const timestamps = result.timestamp || [];
+    const q = result.indicators?.quote?.[0] || {};
+    const bars = timestamps.map((t, i) => ({
+      t: new Date(t * 1000).toISOString(),
+      o: q.open?.[i], h: q.high?.[i], l: q.low?.[i],
+      c: q.close?.[i], v: q.volume?.[i] || 0,
+    })).filter(b => b.c != null);
+    if (bars.length >= 5) {
+      log('data', `${symbol} using Yahoo Finance fallback (${bars.length} bars)`);
+      return bars;
+    }
+  } catch (e) {}
+
+  log('error', `fetchBars ${symbol} ${timeframe}: all sources failed`);
+  return null;
 }
 
 async function placeOrder(symbol, qty, side) {
@@ -523,6 +558,43 @@ function bollingerBands(prices, period = 20, mult = 2) {
   const mean = sl.reduce((a, b) => a + b, 0) / period;
   const std = Math.sqrt(sl.reduce((a, b) => a + (b - mean) ** 2, 0) / period);
   return { upper: mean + mult * std, middle: mean, lower: mean - mult * std };
+}
+
+// Stochastic RSI — %K and %D (more sensitive than plain RSI)
+function stochRSI(prices, rsiPeriod = 14, stochPeriod = 14) {
+  if (prices.length < rsiPeriod + stochPeriod) return { k: 50, d: 50 };
+  // Calculate RSI series
+  const rsiSeries = [];
+  for (let i = rsiPeriod; i <= prices.length; i++) {
+    rsiSeries.push(rsi(prices.slice(0, i), rsiPeriod));
+  }
+  const slice = rsiSeries.slice(-stochPeriod);
+  const minRsi = Math.min(...slice);
+  const maxRsi = Math.max(...slice);
+  const k = maxRsi === minRsi ? 50 : ((rsiSeries[rsiSeries.length - 1] - minRsi) / (maxRsi - minRsi)) * 100;
+  const d = rsiSeries.slice(-3).reduce((a, v, _, arr) => {
+    const s = arr.slice(-3); const mn = Math.min(...s); const mx = Math.max(...s);
+    return mx === mn ? 50 : ((v - mn) / (mx - mn)) * 100;
+  }, 50);
+  return { k, d };
+}
+
+// ADX — trend strength (>25 = trending, <20 = ranging)
+function adx(bars, period = 14) {
+  if (!bars || bars.length < period + 1) return { adx: 0, diPlus: 0, diMinus: 0 };
+  let trSum = 0, dmPlus = 0, dmMinus = 0;
+  for (let i = 1; i < bars.length; i++) {
+    const h = bars[i].h, l = bars[i].l, ph = bars[i-1].h, pl = bars[i-1].l, pc = bars[i-1].c;
+    const tr = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+    const upMove = h - ph, downMove = pl - l;
+    trSum += tr;
+    if (upMove > downMove && upMove > 0)   dmPlus  += upMove;
+    if (downMove > upMove && downMove > 0) dmMinus += downMove;
+  }
+  const diPlus  = trSum > 0 ? (dmPlus  / trSum) * 100 : 0;
+  const diMinus = trSum > 0 ? (dmMinus / trSum) * 100 : 0;
+  const dx = (diPlus + diMinus) > 0 ? Math.abs(diPlus - diMinus) / (diPlus + diMinus) * 100 : 0;
+  return { adx: dx, diPlus, diMinus };
 }
 
 // ─────────────────────────────────────────────
@@ -646,6 +718,25 @@ function generateSignal(sym, bars5m, bars15m) {
     }
   }
 
+  // ── 8. Stochastic RSI — early entry signals ──
+  const stoch = stochRSI(c5);
+  if (stoch.k < 20 && stoch.d < 20)       { buy  += 15; reasons.push(`StochRSI oversold (K:${stoch.k.toFixed(0)} D:${stoch.d.toFixed(0)})`); }
+  else if (stoch.k > 80 && stoch.d > 80)  { sell += 15; reasons.push(`StochRSI overbought (K:${stoch.k.toFixed(0)} D:${stoch.d.toFixed(0)})`); }
+  // Stoch K crossing D = signal confirmation
+  if (stoch.k > stoch.d && stoch.k < 50)  { buy  += 10; reasons.push('StochRSI bullish cross'); }
+  if (stoch.k < stoch.d && stoch.k > 50)  { sell += 10; reasons.push('StochRSI bearish cross'); }
+
+  // ── 9. ADX — only trade when trend is strong ──
+  const adxData = adx(bars5m);
+  if (adxData.adx < 20) {
+    reasons.push(`ADX ${adxData.adx.toFixed(0)} — ranging market, no trend`);
+    return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
+  }
+  if (adxData.adx > 25) {
+    if (adxData.diPlus > adxData.diMinus)  { buy  += 15; reasons.push(`ADX trending (${adxData.adx.toFixed(0)}) +DI>${adxData.diPlus.toFixed(0)}`); }
+    else                                    { sell += 15; reasons.push(`ADX trending (${adxData.adx.toFixed(0)}) -DI>${adxData.diMinus.toFixed(0)}`); }
+  }
+
   // ── 8. Momentum check — price must be moving in signal direction ──
   if (c5.length >= 5) {
     const recentChange = (c5[c5.length-1] - c5[c5.length-5]) / c5[c5.length-5];
@@ -722,7 +813,7 @@ function checkCircuitBreaker() {
   const loss = (dailyStartPortfolio - portfolio) / dailyStartPortfolio;
   if (loss >= CONFIG.maxDailyLossPct) {
     circuitBreakerOn = true;
-    log('risk', `🔴 CIRCUIT BREAKER: Down ${(loss*100).toFixed(2)}% today — halting all trades`);
+    log('risk', `🔴 CIRCUIT BREAKER: Down ${(loss*100).toFixed(1)}% today — halting all trades`);
     sendDiscordAlert('circuit_breaker', 'ALL', 0, 0, -(dailyStartPortfolio - portfolio));
   }
   return circuitBreakerOn;
@@ -748,48 +839,187 @@ function calcQty(symbol, price, bars) {
 // ─────────────────────────────────────────────
 // TRADE EXECUTION
 // ─────────────────────────────────────────────
-async function enterPosition(sym, price, sigInfo, bars) {
+
+// Short positions tracked separately (sym → { entryPrice, qty, ... })
+let shortPositions = {};
+
+async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   const isIntlETF = !!ETF_SESSIONS[sym];
   if (!isIntlETF && !isMarketOpen()) { log('warn', `🚫 Blocked ${sym} — market closed`); return; }
   if (checkCircuitBreaker()) return;
-  if (isCorrelated(sym))     return;
   if (hasLargeGap(sym, price)) return;
+
+  // Don't enter if already in position in same direction
+  if (direction === 'long'  && (positions[sym]      || alpacaPositions.has(sym)))      { log('warn', `${sym} already long`); return; }
+  if (direction === 'short' && (shortPositions[sym]  || alpacaShorts.has(sym)))         { log('warn', `${sym} already short`); return; }
+  if (direction === 'long'  && isCorrelated(sym)) return;
 
   const qty  = calcQty(sym, price, bars);
   const cost = qty * price;
-  if (qty < 1 || cost > portfolio) { log('warn', `Cannot buy ${sym}: need $${cost.toFixed(2)} have $${portfolio.toFixed(2)}`); return; }
+  if (qty < 1) { log('warn', `Cannot enter ${sym}: qty too small`); return; }
 
-  // ATR-based stop loss
-  const atrVal   = bars && bars.length >= 14 ? atr(bars, 14) : price * CONFIG.stopLossPct;
-  const atrStop  = price - (atrVal * CONFIG.atrStopMult);
-  const pctStop  = price * (1 - CONFIG.stopLossPct);
-  const stopPrice = Math.max(atrStop, pctStop);
+  const atrVal    = bars && bars.length >= 14 ? atr(bars, 14) : price * CONFIG.stopLossPct;
+  const srLevels  = calcSRLevels(bars || []);
 
-  // S/R levels for resistance exits
-  const srLevels = calcSRLevels(bars || []);
+  if (direction === 'long') {
+    if (cost > portfolio) { log('warn', `Not enough cash for ${sym}`); return; }
+    const atrStop  = price - (atrVal * CONFIG.atrStopMult);
+    const pctStop  = price * (1 - CONFIG.stopLossPct);
+    const stopPrice = Math.max(atrStop, pctStop);
 
-  if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
-    try { await placeOrder(sym, qty, 'buy'); }
-    catch (e) { log('error', `Order failed ${sym}: ${e.message}`); return; }
+    if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+      try { await placeOrder(sym, qty, 'buy'); }
+      catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
+    }
+    portfolio -= cost;
+    positions[sym] = {
+      entryPrice: price, qty, qtyRemaining: qty, cost,
+      entryTime: new Date(), highWater: price,
+      atrAtEntry: atrVal, stopPrice,
+      breakEvenSet: false, tp1Hit: false, tp2Hit: false,
+      srLevels, sigInfo, direction: 'long',
+    };
+    alpacaPositions.add(sym);
+    trades.push({ time: new Date(), sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
+    const stopPct = ((price - stopPrice) / price * 100).toFixed(2);
+    log('buy', `✅ LONG ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (-${stopPct}%) | conf=${sigInfo.confidence}%`);
+    await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal });
+    await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
+
+  } else {
+    // SHORT — borrow shares to sell, profit if price falls
+    // Stop loss ABOVE entry for shorts
+    const atrStop   = price + (atrVal * CONFIG.atrStopMult);
+    const pctStop   = price * (1 + CONFIG.stopLossPct);
+    const stopPrice = Math.min(atrStop, pctStop);
+
+    if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+      try { await placeOrder(sym, qty, 'sell'); } // Alpaca handles shorting automatically
+      catch (e) { log('error', `SHORT failed ${sym}: ${e.message}`); return; }
+    }
+    shortPositions[sym] = {
+      entryPrice: price, qty, qtyRemaining: qty,
+      entryTime: new Date(), lowWater: price, // track lowest price for trailing
+      atrAtEntry: atrVal, stopPrice,
+      breakEvenSet: false, tp1Hit: false, tp2Hit: false,
+      srLevels, sigInfo, direction: 'short',
+    };
+    alpacaShorts.add(sym);
+    trades.push({ time: new Date(), sym, side: 'SHORT', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
+    const stopPct = ((stopPrice - price) / price * 100).toFixed(2);
+    log('short', `🔴 SHORT ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (+${stopPct}%) | conf=${sigInfo.confidence}%`);
+    await sendDiscordAlert('short', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal });
+    await syncTrade({ sym, side: 'SHORT', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
   }
 
-  portfolio -= cost;
-  positions[sym] = {
-    entryPrice: price, qty, qtyRemaining: qty, cost,
-    entryTime: new Date(), highWater: price,
-    atrAtEntry: atrVal, stopPrice,
-    breakEvenSet: false, tp1Hit: false, tp2Hit: false,
-    srLevels, sigInfo,
-  };
-  alpacaPositions.add(sym); // prevent duplicate buys this scan
-  trades.push({ time: new Date(), sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
-
-  const stopPct = ((price - stopPrice) / price * 100).toFixed(2);
-  log('buy', `✅ BUY ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (-${stopPct}%) | ATR=${atrVal.toFixed(2)} | conf=${sigInfo.confidence}%`);
-  await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal });
-  await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
   await syncAll();
-  await syncLog('buy', `✅ BUY ${qty}x ${sym} @ $${price.toFixed(2)} SL=$${stopPrice.toFixed(2)} ATR=${atrVal.toFixed(2)} conf=${sigInfo.confidence}%`);
+  await syncLog(direction === 'long' ? 'buy' : 'sell', `${direction === 'long' ? '✅ LONG' : '🔴 SHORT'} ${qty}x ${sym} @ $${price.toFixed(2)} conf=${sigInfo.confidence}%`);
+}
+
+// Cover a short position (buy back the borrowed shares)
+async function coverShort(sym, price, reason) {
+  const pos = shortPositions[sym];
+  if (!pos) return;
+  const qty = pos.qtyRemaining || pos.qty;
+
+  if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+    try { await placeOrder(sym, qty, 'buy'); } // buy back to cover
+    catch (e) { log('error', `Cover failed ${sym}: ${e.message}`); return; }
+  }
+
+  // Short P&L = (entry - exit) × qty (profit when price drops)
+  const pnl = (pos.entryPrice - price) * qty;
+  portfolio += pnl; // add profit (or subtract loss)
+  pnl > 0 ? totalWins++ : totalLosses++;
+  delete shortPositions[sym];
+  alpacaShorts.delete(sym);
+
+  const icon = { STOP_LOSS:'🛑', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰' }[reason] || '📤';
+  log('short', `${icon} COVER ${qty}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
+  trades.push({ time: new Date(), sym, side: 'COVER', qty, price, pnl, reason });
+  await sendDiscordAlert('cover', sym, qty, price, pnl, reason);
+  await syncTrade({ sym, side: 'COVER', qty, price, pnl, reason });
+  await syncAll();
+  await syncLog('sell', `${icon} COVER ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
+}
+
+// Manage short positions — mirror of managePosition but inverted
+async function manageShort(sym, price, bars) {
+  const pos = shortPositions[sym];
+  if (!pos) return;
+
+  const chg      = (pos.entryPrice - price) / pos.entryPrice; // positive = profitable (price dropped)
+  const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
+
+  // Update low water mark (we want price to go DOWN)
+  if (price < pos.lowWater) shortPositions[sym].lowWater = price;
+
+  // Ratchet stop loss DOWN as price falls (lock in profits)
+  if (bars && bars.length >= 14) {
+    const curAtr = atr(bars, 14);
+    const newStop = price + (curAtr * CONFIG.atrStopMult);
+    if (newStop < shortPositions[sym].stopPrice) {
+      shortPositions[sym].stopPrice = newStop;
+      log('risk', `${sym} short stop ratcheted → $${newStop.toFixed(2)}`);
+    }
+  }
+
+  // Stop loss — price went UP (bad for short)
+  if (price >= pos.stopPrice) {
+    const stopType = pos.breakEvenSet ? 'BREAK_EVEN_STOP' : 'STOP_LOSS';
+    return coverShort(sym, price, stopType);
+  }
+
+  // Break-even: once down breakEvenAt%, move stop to entry
+  if (!pos.breakEvenSet && chg >= CONFIG.breakEvenAt) {
+    shortPositions[sym].stopPrice  = pos.entryPrice;
+    shortPositions[sym].breakEvenSet = true;
+    log('risk', `🔒 Short break-even: ${sym} SL → $${pos.entryPrice.toFixed(2)}`);
+  }
+
+  // TP1 — cover 33% at tp1Pct drop
+  if (!pos.tp1Hit && chg >= CONFIG.tp1Pct) {
+    const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.33));
+    shortPositions[sym].tp1Hit = true;
+    await coverPartialShort(sym, price, sell, 'TP1');
+    return;
+  }
+  // TP2 — cover 50% of remainder at tp2Pct
+  if (pos.tp1Hit && !pos.tp2Hit && chg >= CONFIG.tp2Pct) {
+    const sell = Math.max(1, Math.floor((shortPositions[sym]?.qtyRemaining || 1) * 0.5));
+    shortPositions[sym].tp2Hit = true;
+    await coverPartialShort(sym, price, sell, 'TP2');
+    return;
+  }
+  // TP3 — cover rest at tp3Pct
+  if (pos.tp1Hit && pos.tp2Hit && chg >= CONFIG.tp3Pct) {
+    return coverShort(sym, price, 'TAKE_PROFIT');
+  }
+
+  // Time stop
+  if (holdMins >= CONFIG.timeStopHours * 60 && Math.abs(chg) < CONFIG.timeStopMinPct) {
+    return coverShort(sym, price, 'TIME_STOP');
+  }
+
+  log('pos', `SHORT ${sym} ${chg>=0?'+':''}${(chg*100).toFixed(2)}% | SL=$${pos.stopPrice.toFixed(2)} | BE:${pos.breakEvenSet?'✅':'❌'}`);
+}
+
+async function coverPartialShort(sym, price, qty, reason) {
+  const pos = shortPositions[sym];
+  if (!pos || qty < 1) return;
+  if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+    try { await placeOrder(sym, qty, 'buy'); }
+    catch(e) { log('error', `Partial cover failed: ${e.message}`); return; }
+  }
+  const pnl = (pos.entryPrice - price) * qty;
+  portfolio += pnl;
+  shortPositions[sym].qtyRemaining -= qty;
+  pnl > 0 ? totalWins++ : totalLosses++;
+  if (shortPositions[sym].qtyRemaining <= 0) delete shortPositions[sym];
+  log('short', `🎯 PARTIAL COVER ${reason}: ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+  trades.push({ time: new Date(), sym, side: 'COVER', qty, price, pnl, reason });
+  await syncTrade({ sym, side: 'COVER', qty, price, pnl, reason });
+  await syncAll();
 }
 
 async function partialExit(sym, price, qtyToSell, reason) {
@@ -1026,12 +1256,22 @@ async function runScan() {
       priceHistory5m[sym]  = bars5m.map(b => b.c);
       priceHistory15m[sym] = bars15m?.map(b => b.c) || [];
 
-      // Manage open position first
+      // Manage open long position
       if (positions[sym]) {
         await managePosition(sym, price, bars5m);
         if (positions[sym]) {
           const pct = ((price - positions[sym].entryPrice) / positions[sym].entryPrice * 100).toFixed(2);
-          log('pos', `Holding ${positions[sym].qtyRemaining||positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${pct}%) ${sessionLabel}`);
+          log('pos', `LONG ${positions[sym].qtyRemaining||positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${pct}%) ${sessionLabel}`);
+        }
+        continue;
+      }
+
+      // Manage open short position
+      if (shortPositions[sym]) {
+        await manageShort(sym, price, bars5m);
+        if (shortPositions[sym]) {
+          const chg = ((shortPositions[sym].entryPrice - price) / shortPositions[sym].entryPrice * 100).toFixed(2);
+          log('pos', `SHORT ${shortPositions[sym].qtyRemaining}x ${sym} @ $${shortPositions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${chg}%)`);
         }
         continue;
       }
@@ -1041,27 +1281,26 @@ async function runScan() {
       const adjustedConfidence = Math.round(sig.confidence * sessionMult);
       const adjustedSig = { ...sig, confidence: adjustedConfidence };
 
-      if (sessionMult < 1.0) {
-        adjustedSig.reasons = [`Off-prime session (x${sessionMult} conf penalty)`, ...sig.reasons];
-      } else if (sessionMult > 1.0) {
-        adjustedSig.reasons = [`Prime session boost (x${sessionMult})`, ...sig.reasons];
-      }
+      if (sessionMult < 1.0) adjustedSig.reasons = [`Off-prime (x${sessionMult})`, ...sig.reasons];
+      else if (sessionMult > 1.0) adjustedSig.reasons = [`Prime boost (x${sessionMult})`, ...sig.reasons];
 
       log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)}) ${sessionLabel}`);
       await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)} ${sessionLabel}`);
 
-      if (adjustedSig.signal === 'BUY' && marketOk && Object.keys(positions).length < CONFIG.maxOpenPositions) {
-        // Double-check: never buy if we already have a position in this symbol
-        // This catches cases where Render restarted and positions{} was cleared
-        if (positions[sym]) {
-          log('warn', `${sym} already in positions{} — skipping duplicate buy`);
-          continue;
+      const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
+
+      // BUY long
+      if (adjustedSig.signal === 'BUY' && marketOk && totalOpen < CONFIG.maxOpenPositions) {
+        if (!positions[sym] && !alpacaPositions.has(sym)) {
+          await enterPosition(sym, price, adjustedSig, bars5m, 'long');
         }
-        if (alpacaPositions.has(sym)) {
-          log('warn', `${sym} already held in Alpaca account — skipping duplicate buy`);
-          continue;
+      }
+
+      // SHORT — only when market is bearish or stock is overbought+downtrending
+      if (adjustedSig.signal === 'SELL' && SHORTING_ENABLED && totalOpen < CONFIG.maxOpenPositions) {
+        if (!shortPositions[sym] && !alpacaShorts.has(sym)) {
+          await enterPosition(sym, price, adjustedSig, bars5m, 'short');
         }
-        await enterPosition(sym, price, adjustedSig, bars5m);
       }
     } catch (e) {
       log('error', `Scan error ${sym}: ${e.message}`);
@@ -1082,6 +1321,8 @@ async function runScan() {
 
 // Live Alpaca positions — refreshed every scan to prevent duplicate buys
 let alpacaPositions = new Set();
+let alpacaShorts    = new Set();
+const SHORTING_ENABLED = process.env.ENABLE_SHORTS !== 'false'; // default on
 
 async function syncAlpacaPositions() {
   if (!CONFIG.alpacaKey) return;
@@ -1217,7 +1458,7 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
   if (!CONFIG.discordWebhook) return;
   const { default: fetch } = await import('node-fetch');
 
-  const colorMap = { buy:0x7fff6e, partial:0x00e5ff, breakeven:0xffb547, circuit_breaker:0xff0000, sell:0x4da6ff, manual_close:0xb47fff };
+  const colorMap = { buy:0x7fff6e, short:0xff5f57, cover:0xb47fff, partial:0x00e5ff, breakeven:0xffb547, circuit_breaker:0xff0000, sell:0x4da6ff, manual_close:0xb47fff };
   if (type==='sell'||type==='manual_close'){
     if (['STOP_LOSS','BREAK_EVEN_STOP'].includes(reason)) colorMap.sell=0xff5f57;
     else if (reason==='TAKE_PROFIT') colorMap.sell=0x00e5ff;
@@ -1225,19 +1466,19 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
   }
 
   const iconMap = {
-    buy:'🟢', breakeven:'🔒', circuit_breaker:'🔴', manual_close:'🖐',
+    buy:'🟢', short:'🔴', cover:'🔵', breakeven:'🔒', circuit_breaker:'🔴', manual_close:'🖐',
     partial:{TP1:'🎯',TP2:'🎯🎯',TP3:'🎯🎯🎯'}[reason]||'🎯',
     sell:{STOP_LOSS:'🛑',BREAK_EVEN_STOP:'🔒',TAKE_PROFIT:'🎯',TRAILING_STOP:'📉',
           TIME_STOP:'⏰',VOL_SQUEEZE:'📊',RESISTANCE_EXIT:'🧱',SIGNAL:'🔵'}[reason]||'🔵',
   };
   const titleMap = {
-    buy:'BUY Signal Executed', breakeven:'Break-Even Stop Set 🔒',
+    buy:'LONG Position Entered', short:'SHORT Position Entered 🔴',
+    cover:'Short Covered', breakeven:'Break-Even Stop Set 🔒',
     circuit_breaker:'⛔ CIRCUIT BREAKER', partial:`Partial Exit — ${reason}`,
     manual_close:'🖐 Position Manually Closed',
     sell:{STOP_LOSS:'Stop Loss Hit',BREAK_EVEN_STOP:'Break-Even Stop Hit 🔒',
           TAKE_PROFIT:'Take Profit ✅',TRAILING_STOP:'Trailing Stop',
-          TIME_STOP:'⏰ Time Stop — Exiting Dead Trade',
-          VOL_SQUEEZE:'📊 Volatility Squeeze Exit',
+          TIME_STOP:'⏰ Time Stop',VOL_SQUEEZE:'📊 Vol Squeeze Exit',
           RESISTANCE_EXIT:'🧱 Resistance Exit',SIGNAL:'SELL Signal'}[reason]||'Exit',
   };
 
