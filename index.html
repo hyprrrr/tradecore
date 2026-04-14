@@ -407,7 +407,7 @@ function loadSettings(){
   updateRenderVars();
 }
 
-function saveSettings(){
+async function saveSettings(){
   const s = {
     symbols,
     startingCapital: +document.getElementById('startingCapital').value,
@@ -427,9 +427,61 @@ function saveSettings(){
     alertSell: document.getElementById('alertSell').checked,
     alertDaily: document.getElementById('alertDaily').checked,
   };
+
+  // Save to localStorage (for dashboard display)
   localStorage.setItem('tc_settings', JSON.stringify(s));
   updateRenderVars();
-  showToast('✓ Settings saved');
+
+  // Save to Supabase so the bot picks it up automatically
+  const sbUrl = getSbUrl(), sbKey = getSbKey();
+  if(sbUrl && sbKey){
+    try {
+      // DELETE then POST to upsert (Supabase REST upsert)
+      await fetch(`${sbUrl}/rest/v1/tc_settings?id=eq.1`, {
+        method: 'DELETE',
+        headers: { 'apikey': sbKey, 'Authorization': `Bearer ${sbKey}` }
+      });
+      const res = await fetch(`${sbUrl}/rest/v1/tc_settings`, {
+        method: 'POST',
+        headers: {
+          'apikey': sbKey,
+          'Authorization': `Bearer ${sbKey}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal',
+        },
+        body: JSON.stringify({
+          id: 1,
+          symbols:             s.symbols.join(','),
+          strategy:            s.strategy,
+          rsi_period:          s.rsiPeriod,
+          rsi_oversold:        s.rsiOversold,
+          rsi_overbought:      s.rsiOverbought,
+          scan_interval:       s.scanInterval,
+          stop_loss_pct:       s.stopLoss,
+          take_profit_pct:     s.takeProfit,
+          trailing_stop_pct:   s.trailingStop,
+          max_daily_loss:      s.maxDailyLoss,
+          max_positions:       s.maxPositions,
+          max_position_pct:    s.maxPosPct,
+          discord_webhook:     s.discord,
+          trend_filter:        true,
+          volume_filter:       true,
+          regime_filter:       true,
+          correlation_filter:  true,
+          updated_at:          new Date().toISOString(),
+        })
+      });
+      if(res.ok || res.status === 201) {
+        showToast('✓ Settings saved — bot will pick up on next scan');
+      } else {
+        showToast('✓ Saved locally (Supabase sync failed)');
+      }
+    } catch(e) {
+      showToast('✓ Saved locally');
+    }
+  } else {
+    showToast('✓ Settings saved locally');
+  }
 }
 
 function rng(el, valId, sfx){
