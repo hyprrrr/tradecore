@@ -1,5 +1,5 @@
 /**
- * TradeCore Pro Bot — Upgraded Engine v3
+ * TradeCore Pro Bot — Upgraded Engine v4
  *
  *  ✅ Real-time Alpaca market data
  *  ✅ 200 EMA trend filter
@@ -11,14 +11,18 @@
  *  ✅ Daily loss circuit breaker
  *  ✅ Gap filter
  *  ✅ Market hours enforcement
- *  ✅ Trailing stop loss
+ *  ✅ International ETF session awareness
  *  ✅ VWAP + Bollinger Bands
  *  ✅ Confidence scoring (60%+ required)
- *  ✅ International ETF session awareness
- *     - Asia session  (7 PM - 2 AM ET)  → EWJ, FXI, EWA, EWY
- *     - London session (3 AM - 9 AM ET) → EWU, EWG, EWZ
- *     - US open (9:30 AM - 4 PM ET)     → all symbols
- *     - ETFs boosted/dampened by their home market activity
+ *
+ *  🆕 ADVANCED EXIT ALGORITHMS v4:
+ *  ✅ ATR-based dynamic stop loss (adjusts to volatility)
+ *  ✅ Break-even stop (moves SL to entry once +2%)
+ *  ✅ 3-tier scaled take profit (33% at TP1, 33% at TP2, 34% at TP3)
+ *  ✅ Trailing stop on remaining position after partial exits
+ *  ✅ Time-based stop (exits flat trades after N hours)
+ *  ✅ Volatility squeeze exit (exits if ATR collapses while in trade)
+ *  ✅ Support/resistance exit (exits near key price levels)
  */
 
 'use strict';
@@ -51,6 +55,16 @@ const CONFIG = {
   trailingStop:     process.env.TRAILING_STOP       !== 'false',
   trailingStopPct:  +(process.env.TRAILING_STOP_PCT || 3)  / 100,
   maxDailyLossPct:  +(process.env.MAX_DAILY_LOSS    || 3)  / 100,
+
+  // Advanced exit config
+  breakEvenAt:       +(process.env.BREAK_EVEN_AT     || 2)  / 100, // move SL to entry once up X%
+  tp1Pct:            +(process.env.TP1_PCT           || 4)  / 100, // sell 33% here
+  tp2Pct:            +(process.env.TP2_PCT           || 8)  / 100, // sell 33% here
+  tp3Pct:            +(process.env.TP3_PCT           || 14) / 100, // sell final 34% here
+  timeStopHours:     +(process.env.TIME_STOP_HOURS   || 6),        // exit flat trade after N hours
+  timeStopMinPct:    +(process.env.TIME_STOP_MIN_PCT || 0.5) / 100,// only exit if gain < X%
+  atrStopMult:       +(process.env.ATR_STOP_MULT     || 2.0),      // SL = entry - (ATR * mult)
+  volSqueezePct:     +(process.env.VOL_SQUEEZE_PCT   || 50) / 100, // exit if ATR drops X% vs entry ATR
 
   trendFilter:       process.env.TREND_FILTER  !== 'false',
   volumeFilter:      process.env.VOLUME_FILTER !== 'false',
@@ -530,19 +544,24 @@ function calcQty(symbol, price, bars) {
 // TRADE EXECUTION
 // ─────────────────────────────────────────────
 async function enterPosition(sym, price, sigInfo, bars) {
-  // Final safety check — never place orders for US stocks outside market hours
   const isIntlETF = !!ETF_SESSIONS[sym];
-  if (!isIntlETF && !isMarketOpen()) {
-    log('warn', `🚫 Blocked order for ${sym} — US market is closed`);
-    return;
-  }
+  if (!isIntlETF && !isMarketOpen()) { log('warn', `🚫 Blocked ${sym} — market closed`); return; }
   if (checkCircuitBreaker()) return;
-  if (isCorrelated(sym))    return;
+  if (isCorrelated(sym))     return;
   if (hasLargeGap(sym, price)) return;
 
   const qty  = calcQty(sym, price, bars);
   const cost = qty * price;
-  if (qty < 1 || cost > portfolio) { log('warn', `Cannot buy ${sym}: qty=${qty} cost=$${cost.toFixed(2)} avail=$${portfolio.toFixed(2)}`); return; }
+  if (qty < 1 || cost > portfolio) { log('warn', `Cannot buy ${sym}: need $${cost.toFixed(2)} have $${portfolio.toFixed(2)}`); return; }
+
+  // ATR-based stop loss
+  const atrVal   = bars && bars.length >= 14 ? atr(bars, 14) : price * CONFIG.stopLossPct;
+  const atrStop  = price - (atrVal * CONFIG.atrStopMult);
+  const pctStop  = price * (1 - CONFIG.stopLossPct);
+  const stopPrice = Math.max(atrStop, pctStop);
+
+  // S/R levels for resistance exits
+  const srLevels = calcSRLevels(bars || []);
 
   if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
     try { await placeOrder(sym, qty, 'buy'); }
@@ -550,54 +569,203 @@ async function enterPosition(sym, price, sigInfo, bars) {
   }
 
   portfolio -= cost;
-  positions[sym] = { entryPrice: price, qty, cost, entryTime: new Date(), highWater: price, sigInfo };
+  positions[sym] = {
+    entryPrice: price, qty, qtyRemaining: qty, cost,
+    entryTime: new Date(), highWater: price,
+    atrAtEntry: atrVal, stopPrice,
+    breakEvenSet: false, tp1Hit: false, tp2Hit: false,
+    srLevels, sigInfo,
+  };
   trades.push({ time: new Date(), sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
 
-  log('buy', `✅ BUY ${qty}x ${sym} @ $${price.toFixed(2)} | conf=${sigInfo.confidence}% | cash=$${portfolio.toFixed(2)}`);
-  await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo);
+  const stopPct = ((price - stopPrice) / price * 100).toFixed(2);
+  log('buy', `✅ BUY ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (-${stopPct}%) | ATR=${atrVal.toFixed(2)} | conf=${sigInfo.confidence}%`);
+  await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal });
   await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
   await syncAll();
-  await syncLog('buy', `BUY ${qty}x ${sym} @ $${price.toFixed(2)} conf=${sigInfo.confidence}%`);
+  await syncLog('buy', `✅ BUY ${qty}x ${sym} @ $${price.toFixed(2)} SL=$${stopPrice.toFixed(2)} ATR=${atrVal.toFixed(2)} conf=${sigInfo.confidence}%`);
+}
+
+async function partialExit(sym, price, qtyToSell, reason) {
+  const pos = positions[sym];
+  if (!pos || qtyToSell < 1) return;
+  if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+    try { await placeOrder(sym, qtyToSell, 'sell'); }
+    catch (e) { log('error', `Partial sell failed ${sym}: ${e.message}`); return; }
+  }
+  const avgCost = pos.cost / (pos.qtyRemaining || pos.qty);
+  const pnl = qtyToSell * price - qtyToSell * avgCost;
+  portfolio += qtyToSell * price;
+  positions[sym].qtyRemaining -= qtyToSell;
+  positions[sym].cost = positions[sym].qtyRemaining * avgCost;
+  pnl > 0 ? totalWins++ : totalLosses++;
+
+  const icons = { TP1: '🎯', TP2: '🎯🎯', TP3: '🎯🎯🎯' };
+  const icon = icons[reason] || '🎯';
+  log('sell', `${icon} PARTIAL ${reason}: ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} | Remaining: ${positions[sym].qtyRemaining}`);
+  trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
+  await sendDiscordAlert('partial', sym, qtyToSell, price, pnl, reason);
+  await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
+  await syncLog('sell', `${icon} PARTIAL ${reason} ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+
+  if (positions[sym].qtyRemaining <= 0) { delete positions[sym]; }
+  await syncAll();
 }
 
 async function exitPosition(sym, price, reason) {
   const pos = positions[sym];
   if (!pos) return;
-
+  const qtyToSell = pos.qtyRemaining || pos.qty;
   if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
-    try { await placeOrder(sym, pos.qty, 'sell'); }
+    try { await placeOrder(sym, qtyToSell, 'sell'); }
     catch (e) { log('error', `Sell failed ${sym}: ${e.message}`); return; }
   }
-
-  const pnl = pos.qty * price - pos.cost;
-  portfolio += pos.qty * price;
+  const avgCost = pos.cost / qtyToSell;
+  const pnl = qtyToSell * price - qtyToSell * avgCost;
+  portfolio += qtyToSell * price;
   pnl > 0 ? totalWins++ : totalLosses++;
   delete positions[sym];
 
-  trades.push({ time: new Date(), sym, side: 'SELL', qty: pos.qty, price, pnl, reason });
-  const icon = { STOP_LOSS: '🛑', TAKE_PROFIT: '🎯', TRAILING_STOP: '📉', SIGNAL: '📤' }[reason] || '📤';
-  log('sell', `${icon} SELL ${pos.qty}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${reason})`);
-  await sendDiscordAlert('sell', sym, pos.qty, price, pnl, reason);
-  await syncTrade({ sym, side: 'SELL', qty: pos.qty, price, pnl, reason });
+  trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
+  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱' }[reason] || '📤';
+  log('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
+  await sendDiscordAlert('sell', sym, qtyToSell, price, pnl, reason);
+  await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
   await syncAll();
-  await syncLog('sell', `${icon} SELL ${pos.qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${reason})`);
+  await syncLog('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
 }
 
-async function managePosition(sym, price) {
+// ─────────────────────────────────────────────
+// SUPPORT / RESISTANCE
+// ─────────────────────────────────────────────
+function calcSRLevels(bars) {
+  if (!bars || bars.length < 10) return [];
+  const levels = [];
+  for (let i = 2; i < bars.length - 2; i++) {
+    const b = bars[i];
+    if (b.h > bars[i-1].h && b.h > bars[i-2].h && b.h > bars[i+1].h && b.h > bars[i+2].h)
+      levels.push({ price: b.h, type: 'resistance' });
+    if (b.l < bars[i-1].l && b.l < bars[i-2].l && b.l < bars[i+1].l && b.l < bars[i+2].l)
+      levels.push({ price: b.l, type: 'support' });
+  }
+  return levels.slice(-10);
+}
+
+function nearResistance(price, srLevels) {
+  if (!srLevels || !srLevels.length) return false;
+  return srLevels.some(l => l.type === 'resistance' && l.price > price && Math.abs((l.price - price) / price) < 0.003);
+}
+
+// ─────────────────────────────────────────────
+// ADVANCED POSITION MANAGEMENT
+// ─────────────────────────────────────────────
+async function managePosition(sym, price, bars) {
   const pos = positions[sym];
   if (!pos) return;
+
+  const chg      = (price - pos.entryPrice) / pos.entryPrice;
+  const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
+
+  // Update high water mark
   if (price > pos.highWater) positions[sym].highWater = price;
 
-  // Trailing stop
-  if (CONFIG.trailingStop && pos.highWater > pos.entryPrice) {
-    if ((pos.highWater - price) / pos.highWater >= CONFIG.trailingStopPct) {
-      log('risk', `Trailing stop: ${sym} hw=$${pos.highWater.toFixed(2)} cur=$${price.toFixed(2)}`);
+  // ── 1. Ratchet ATR stop upward as price rises ──
+  if (bars && bars.length >= 14) {
+    const curAtr = atr(bars, 14);
+    const newStop = price - (curAtr * CONFIG.atrStopMult);
+    if (newStop > positions[sym].stopPrice) {
+      positions[sym].stopPrice = newStop;
+      log('risk', `${sym} ATR stop ratcheted → $${newStop.toFixed(2)}`);
+    }
+  }
+
+  // ── 2. Hard stop loss ──
+  if (price <= pos.stopPrice) {
+    const reason = pos.breakEvenSet ? 'BREAK_EVEN_STOP' : 'STOP_LOSS';
+    log('risk', `${sym} stop hit @ $${price.toFixed(2)} (stop=$${pos.stopPrice.toFixed(2)}) → ${reason}`);
+    return exitPosition(sym, price, reason);
+  }
+
+  // ── 3. Break-even: move SL to entry once up breakEvenAt% ──
+  if (!pos.breakEvenSet && chg >= CONFIG.breakEvenAt) {
+    positions[sym].stopPrice   = pos.entryPrice;
+    positions[sym].breakEvenSet = true;
+    log('risk', `🔒 Break-even set: ${sym} SL → $${pos.entryPrice.toFixed(2)} (can't lose now)`);
+    await syncLog('sys', `🔒 Break-even locked for ${sym} @ $${pos.entryPrice.toFixed(2)}`);
+    await sendDiscordAlert('breakeven', sym, pos.qtyRemaining, price, undefined, 'BREAK_EVEN_SET');
+  }
+
+  // ── 4. TP1 — sell 33% at tp1Pct ──
+  if (!pos.tp1Hit && chg >= CONFIG.tp1Pct) {
+    const sell = Math.max(1, Math.floor((pos.qtyRemaining) * 0.33));
+    positions[sym].tp1Hit = true;
+    log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}%: selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
+    await partialExit(sym, price, sell, 'TP1');
+    if (!positions[sym]) return;
+    positions[sym].stopPrice = Math.max(pos.stopPrice, pos.entryPrice); // lock to BE after TP1
+    return;
+  }
+
+  // ── 5. TP2 — sell 50% of remainder (≈33% of original) at tp2Pct ──
+  if (pos.tp1Hit && !pos.tp2Hit && chg >= CONFIG.tp2Pct) {
+    const sell = Math.max(1, Math.floor(positions[sym].qtyRemaining * 0.5));
+    positions[sym].tp2Hit = true;
+    log('sell', `🎯🎯 TP2 +${(chg*100).toFixed(1)}%: selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
+    await partialExit(sym, price, sell, 'TP2');
+    if (!positions[sym]) return;
+    positions[sym].stopPrice = Math.max(positions[sym].stopPrice, price * 0.98); // tight 2% trail on runner
+    return;
+  }
+
+  // ── 6. TP3 — exit final runner at tp3Pct ──
+  if (pos.tp1Hit && pos.tp2Hit && chg >= CONFIG.tp3Pct) {
+    log('sell', `🎯🎯🎯 TP3 +${(chg*100).toFixed(1)}%: final exit ${sym} @ $${price.toFixed(2)}`);
+    return exitPosition(sym, price, 'TAKE_PROFIT');
+  }
+
+  // ── 7. Trailing stop on runner after partial exits ──
+  if (CONFIG.trailingStop && (pos.tp1Hit || pos.tp2Hit)) {
+    const trailPct = pos.tp2Hit ? 0.02 : CONFIG.trailingStopPct;
+    if ((pos.highWater - price) / pos.highWater >= trailPct) {
+      log('risk', `📉 Trail stop on runner: ${sym} hw=$${pos.highWater.toFixed(2)} → $${price.toFixed(2)}`);
       return exitPosition(sym, price, 'TRAILING_STOP');
     }
   }
-  const chg = (price - pos.entryPrice) / pos.entryPrice;
-  if (chg <= -CONFIG.stopLossPct)    return exitPosition(sym, price, 'STOP_LOSS');
-  if (chg >= CONFIG.takeProfitPct)   return exitPosition(sym, price, 'TAKE_PROFIT');
+
+  // ── 8. Standard trailing stop (no TPs hit yet) ──
+  if (CONFIG.trailingStop && !pos.tp1Hit && pos.highWater > pos.entryPrice * (1 + CONFIG.breakEvenAt)) {
+    if ((pos.highWater - price) / pos.highWater >= CONFIG.trailingStopPct) {
+      log('risk', `📉 Trail stop: ${sym} hw=$${pos.highWater.toFixed(2)} → $${price.toFixed(2)}`);
+      return exitPosition(sym, price, 'TRAILING_STOP');
+    }
+  }
+
+  // ── 9. Resistance exit ──
+  if (nearResistance(price, pos.srLevels) && chg > 0) {
+    log('sell', `🧱 Resistance exit: ${sym} approaching resistance @ $${price.toFixed(2)}`);
+    return exitPosition(sym, price, 'RESISTANCE_EXIT');
+  }
+
+  // ── 10. Time stop — exit dead money ──
+  if (holdMins >= CONFIG.timeStopHours * 60 && Math.abs(chg) < CONFIG.timeStopMinPct) {
+    log('sell', `⏰ Time stop: ${sym} held ${(holdMins/60).toFixed(1)}h, only ${(chg*100).toFixed(2)}% move`);
+    return exitPosition(sym, price, 'TIME_STOP');
+  }
+
+  // ── 11. Volatility squeeze — momentum dead ──
+  if (bars && bars.length >= 14 && pos.atrAtEntry > 0) {
+    const curAtr  = atr(bars, 14);
+    const atrDrop = (pos.atrAtEntry - curAtr) / pos.atrAtEntry;
+    if (atrDrop >= CONFIG.volSqueezePct && chg > 0.01) {
+      log('sell', `📊 Vol squeeze: ${sym} ATR fell ${(atrDrop*100).toFixed(0)}% — locking profit`);
+      return exitPosition(sym, price, 'VOL_SQUEEZE');
+    }
+  }
+
+  // Log status
+  const tpNext = !pos.tp1Hit ? `TP1@+${(CONFIG.tp1Pct*100).toFixed(0)}%` : !pos.tp2Hit ? `TP2@+${(CONFIG.tp2Pct*100).toFixed(0)}%` : `TP3@+${(CONFIG.tp3Pct*100).toFixed(0)}%`;
+  const stopDist = ((price - pos.stopPrice) / price * 100).toFixed(2);
+  log('pos', `${sym} ${chg>=0?'+':''}${(chg*100).toFixed(2)}% | SL=$${pos.stopPrice.toFixed(2)}(${stopDist}% away) | ${tpNext} | BE:${pos.breakEvenSet?'✅':'❌'} TP1:${pos.tp1Hit?'✅':'❌'} TP2:${pos.tp2Hit?'✅':'❌'}`);
 }
 
 // ─────────────────────────────────────────────
@@ -647,10 +815,10 @@ async function runScan() {
 
       // Manage open position first
       if (positions[sym]) {
-        await managePosition(sym, price);
+        await managePosition(sym, price, bars5m);
         if (positions[sym]) {
           const pct = ((price - positions[sym].entryPrice) / positions[sym].entryPrice * 100).toFixed(2);
-          log('pos', `Holding ${positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${pct}%) ${sessionLabel}`);
+          log('pos', `Holding ${positions[sym].qtyRemaining||positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${pct}%) ${sessionLabel}`);
         }
         continue;
       }
@@ -701,54 +869,61 @@ async function storePrevClose() {
 // ─────────────────────────────────────────────
 // DISCORD ALERTS
 // ─────────────────────────────────────────────
-async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo) {
+async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, extra) {
   if (!CONFIG.discordWebhook) return;
   const { default: fetch } = await import('node-fetch');
 
-  const colors = { buy: 0x7fff6e, sell: 0x4da6ff, circuit_breaker: 0xff0000 };
-  if (type === 'sell') {
-    if (reason === 'STOP_LOSS')     colors.sell = 0xff5f57;
-    if (reason === 'TAKE_PROFIT')   colors.sell = 0x00e5ff;
-    if (reason === 'TRAILING_STOP') colors.sell = 0xffb547;
+  const colorMap = { buy:0x7fff6e, partial:0x00e5ff, breakeven:0xffb547, circuit_breaker:0xff0000, sell:0x4da6ff };
+  if (type==='sell'){
+    if (['STOP_LOSS','BREAK_EVEN_STOP'].includes(reason)) colorMap.sell=0xff5f57;
+    else if (reason==='TAKE_PROFIT') colorMap.sell=0x00e5ff;
+    else if (reason==='TRAILING_STOP') colorMap.sell=0xffb547;
   }
 
-  const icons = {
-    buy: '🟢', circuit_breaker: '🔴',
-    sell: { STOP_LOSS: '🛑', TAKE_PROFIT: '🎯', TRAILING_STOP: '📉', SIGNAL: '🔵' }[reason] || '🔵',
+  const iconMap = {
+    buy:'🟢', breakeven:'🔒', circuit_breaker:'🔴',
+    partial:{TP1:'🎯',TP2:'🎯🎯',TP3:'🎯🎯🎯'}[reason]||'🎯',
+    sell:{STOP_LOSS:'🛑',BREAK_EVEN_STOP:'🔒',TAKE_PROFIT:'🎯',TRAILING_STOP:'📉',
+          TIME_STOP:'⏰',VOL_SQUEEZE:'📊',RESISTANCE_EXIT:'🧱',SIGNAL:'🔵'}[reason]||'🔵',
   };
-  const titles = {
-    buy: 'BUY Signal Executed',
-    circuit_breaker: '⛔ CIRCUIT BREAKER — Trading Halted',
-    sell: { STOP_LOSS: 'Stop Loss Hit', TAKE_PROFIT: 'Take Profit Hit ✅', TRAILING_STOP: 'Trailing Stop Hit', SIGNAL: 'SELL Signal' }[reason] || 'SELL',
+  const titleMap = {
+    buy:'BUY Signal Executed', breakeven:'Break-Even Stop Set 🔒',
+    circuit_breaker:'⛔ CIRCUIT BREAKER', partial:`Partial Exit — ${reason}`,
+    sell:{STOP_LOSS:'Stop Loss Hit',BREAK_EVEN_STOP:'Break-Even Stop Hit 🔒',
+          TAKE_PROFIT:'Take Profit ✅',TRAILING_STOP:'Trailing Stop',
+          TIME_STOP:'⏰ Time Stop — Exiting Dead Trade',
+          VOL_SQUEEZE:'📊 Volatility Squeeze Exit',
+          RESISTANCE_EXIT:'🧱 Resistance Exit',SIGNAL:'SELL Signal'}[reason]||'Exit',
   };
 
   const fields = [
-    sym !== 'ALL' ? { name: 'Symbol',    value: sym,             inline: true } : null,
-    qty  > 0      ? { name: 'Shares',    value: String(qty),     inline: true } : null,
-    price > 0     ? { name: 'Price',     value: `$${price.toFixed(2)}`, inline: true } : null,
-    pnl  !== undefined ? { name: 'P&L', value: `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`, inline: true } : null,
-    { name: 'Portfolio', value: `$${portfolio.toFixed(2)}`, inline: true },
-    { name: 'W / L',     value: `${totalWins} / ${totalLosses}`, inline: true },
-    { name: 'Mode',      value: CONFIG.mode === 'alpaca' ? (CONFIG.alpacaPaper ? '📄 Paper' : '💰 LIVE') : '🔵 Sim', inline: true },
+    sym!=='ALL' ? {name:'Symbol',value:sym,inline:true} : null,
+    qty>0       ? {name:'Shares',value:String(qty),inline:true} : null,
+    price>0     ? {name:'Price',value:`$${price.toFixed(2)}`,inline:true} : null,
+    pnl!==undefined ? {name:'P&L',value:`${pnl>=0?'+':''}$${pnl.toFixed(2)}`,inline:true} : null,
+    extra?.stopPrice ? {name:'Stop Loss',value:`$${extra.stopPrice.toFixed(2)}`,inline:true} : null,
+    extra?.atrVal    ? {name:'ATR',value:extra.atrVal.toFixed(2),inline:true} : null,
+    {name:'Portfolio',value:`$${portfolio.toFixed(2)}`,inline:true},
+    {name:'W / L',value:`${totalWins} / ${totalLosses}`,inline:true},
+    {name:'Mode',value:CONFIG.alpacaPaper?'📄 Paper':'💰 LIVE',inline:true},
   ].filter(Boolean);
 
-  if (type === 'buy' && sigInfo?.reasons?.length) {
-    fields.push({ name: `Confidence: ${sigInfo.confidence}%`, value: sigInfo.reasons.slice(0, 5).join('\n'), inline: false });
+  if (type==='buy' && sigInfo?.reasons?.length) {
+    fields.push({name:`Confidence: ${sigInfo.confidence}%`,value:sigInfo.reasons.slice(0,5).join('\n'),inline:false});
   }
 
   try {
     await fetch(CONFIG.discordWebhook, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ embeds: [{
-        title: `${icons[type]} TradeCore Pro — ${titles[type]}`,
-        color: type === 'buy' ? colors.buy : type === 'sell' ? colors.sell : colors.circuit_breaker,
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({embeds:[{
+        title:`${iconMap[type]||'📤'} TradeCore Pro — ${titleMap[type]||type}`,
+        color: colorMap[type]||0x4da6ff,
         fields,
-        footer: { text: `TradeCore Pro | ${CONFIG.strategy.toUpperCase()} | ${CONFIG.alpacaPaper ? 'Paper' : 'Live'}` },
+        footer:{text:`TradeCore Pro | ${CONFIG.strategy.toUpperCase()} | ${CONFIG.alpacaPaper?'Paper':'Live'}`},
         timestamp: new Date().toISOString(),
       }]}),
     });
-  } catch (e) { log('error', `Discord failed: ${e.message}`); }
+  } catch(e){ log('error',`Discord failed: ${e.message}`); }
 }
 
 async function sendDailySummary() {
