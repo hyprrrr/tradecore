@@ -117,17 +117,16 @@ async function sbFetch(path, method = 'GET', body = null) {
 }
 
 async function syncPortfolio() {
-  const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
-    return acc + (cur - pos.entryPrice) * pos.qty;
-  }, 0);
-  const totalValue = portfolio + openPnl;
-  const dayPnl = totalValue - dailyStartPortfolio;
+  // Only store realized P&L in day_pnl — unrealized is calculated from positions table
+  const realizedDayPnl = trades
+    .filter(t => t.pnl !== null && new Date(t.time).toDateString() === new Date().toDateString())
+    .reduce((acc, t) => acc + t.pnl, 0);
 
+  // total_value = cash only (positions stored separately)
   await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
     cash: +portfolio.toFixed(2),
-    total_value: +totalValue.toFixed(2),
-    day_pnl: +dayPnl.toFixed(2),
+    total_value: +portfolio.toFixed(2),
+    day_pnl: +realizedDayPnl.toFixed(2),
     total_wins: totalWins,
     total_losses: totalLosses,
     circuit_breaker: circuitBreakerOn,
