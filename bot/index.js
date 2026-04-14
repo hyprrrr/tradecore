@@ -414,7 +414,11 @@ function getETTime() {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
 }
 
+// Set BYPASS_HOURS=true in Render to test the bot outside market hours
+const BYPASS_HOURS = process.env.BYPASS_HOURS === 'true';
+
 function isMarketOpen() {
+  if (BYPASS_HOURS) return true; // testing mode
   const et = getETTime();
   const day = et.getDay();
   const mins = et.getHours() * 60 + et.getMinutes();
@@ -422,11 +426,13 @@ function isMarketOpen() {
 }
 
 function isWeekday() {
+  if (BYPASS_HOURS) return true; // testing mode
   const day = getETTime().getDay();
   return day >= 1 && day <= 5;
 }
 
 function isPreMarket() {
+  if (BYPASS_HOURS) return false;
   const et = getETTime();
   const mins = et.getHours() * 60 + et.getMinutes();
   return et.getDay() >= 1 && et.getDay() <= 5 && mins >= 240 && mins < 570;
@@ -436,15 +442,15 @@ function isPreMarket() {
  * For international ETFs we scan whenever their home market is open.
  * For regular US stocks (AAPL, TSLA, MSFT etc.) we STRICTLY enforce
  * US market hours — no scanning, no orders outside 9:31-3:55 ET.
+ * Set BYPASS_HOURS=true to override for testing.
  */
 function shouldScanSymbol(symbol) {
+  if (BYPASS_HOURS) return true; // testing mode — scan everything
   if (!isWeekday()) return false;
   const isIntlETF = !!ETF_SESSIONS[symbol];
   if (!isIntlETF) {
-    // Hard block — regular US stocks only trade during market hours
     return isMarketOpen();
   }
-  // International ETF — always scan on weekdays (with session multiplier applied)
   return true;
 }
 
@@ -1561,6 +1567,7 @@ log('sys', '   TradeCore Pro — Upgraded Engine v4     ');
 log('sys', '   + 10s scan + live dashboard refresh    ');
 log('sys', '══════════════════════════════════════════');
 log('sys', `Mode: ${CONFIG.mode.toUpperCase()} | Paper: ${CONFIG.alpacaPaper} | Strategy: ${CONFIG.strategy}`);
+if (BYPASS_HOURS) log('sys', '⚠️  BYPASS_HOURS=true — trading outside market hours (TEST MODE)');
 log('sys', `Symbols: ${CONFIG.symbols.join(', ')}`);
 log('sys', `Risk: SL=${CONFIG.stopLossPct*100}% TP=${CONFIG.takeProfitPct*100}% Trailing=${CONFIG.trailingStop} MaxDailyLoss=${CONFIG.maxDailyLossPct*100}%`);
 log('sys', `Filters: Trend=${CONFIG.trendFilter} Volume=${CONFIG.volumeFilter} Regime=${CONFIG.regimeFilter} Corr=${CONFIG.correlationFilter}`);
