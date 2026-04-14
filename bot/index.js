@@ -609,9 +609,9 @@ function adx(bars, period = 14) {
 function generateSignal(sym, bars5m, bars15m) {
   if (!bars5m || bars5m.length < 20) return { signal: 'HOLD', confidence: 0, reasons: ['Insufficient data'] };
 
-  const c5   = bars5m.map(b => b.c);
-  const c15  = bars15m?.length >= 20 ? bars15m.map(b => b.c) : null;
-  const vol  = bars5m.map(b => b.v);
+  const c5    = bars5m.map(b => b.c);
+  const c15   = bars15m?.length >= 20 ? bars15m.map(b => b.c) : null;
+  const vol   = bars5m.map(b => b.v);
   const price = c5[c5.length - 1];
 
   let buy = 0, sell = 0;
@@ -619,155 +619,116 @@ function generateSignal(sym, bars5m, bars15m) {
 
   // ── 1. RSI ──
   const r = rsi(c5, CONFIG.rsiPeriod);
-
-  // Hard gate: RSI must be clearly oversold/overbought — no trading in neutral zone
-  const rsiNeutral = r >= 40 && r <= 60;
-  if (rsiNeutral) {
-    return { signal: 'HOLD', confidence: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no edge, skipping`], rsi: r };
+  if      (r < CONFIG.rsiOversold)   { buy  += 30; reasons.push(`RSI oversold (${r.toFixed(1)})`); }
+  else if (r > CONFIG.rsiOverbought) { sell += 30; reasons.push(`RSI overbought (${r.toFixed(1)})`); }
+  else if (r < 40)                   { buy  += 15; reasons.push(`RSI leaning oversold (${r.toFixed(1)})`); }
+  else if (r > 60)                   { sell += 15; reasons.push(`RSI leaning overbought (${r.toFixed(1)})`); }
+  else {
+    // RSI truly neutral (40-60) — dampen but don't kill
+    buy  = Math.max(0, buy  - 10);
+    sell = Math.max(0, sell - 10);
+    reasons.push(`RSI neutral (${r.toFixed(1)}) — dampening`);
   }
 
-  if (r < CONFIG.rsiOversold)        { buy  += 30; reasons.push(`RSI oversold (${r.toFixed(1)})`); }
-  else if (r > CONFIG.rsiOverbought) { sell += 30; reasons.push(`RSI overbought (${r.toFixed(1)})`); }
-  else if (r < 40)                   { buy  += 10; reasons.push(`RSI leaning oversold (${r.toFixed(1)})`); }
-  else if (r > 60)                   { sell += 10; reasons.push(`RSI leaning overbought (${r.toFixed(1)})`); }
-
-  // ── 2. MACD — only count crossovers, not just position ──
+  // ── 2. MACD ──
   const e8 = ema(c5, 8), e21 = ema(c5, 21);
   const pe8 = ema(c5.slice(0, -1), 8), pe21 = ema(c5.slice(0, -1), 21);
-  const macdDiff = Math.abs(e8 - e21) / e21; // how far apart are the EMAs?
-
-  // Only count MACD if EMAs have meaningful separation (not crossing in neutral)
+  const macdDiff = Math.abs(e8 - e21) / (e21 || 1);
   if (macdDiff > 0.001) {
     if (e8 > e21) { buy  += 15; reasons.push('MACD bullish'); }
     else          { sell += 15; reasons.push('MACD bearish'); }
-  } else {
-    reasons.push('MACD neutral (EMAs too close)');
   }
-
-  // Crossover bonus — strong signal
   if (pe8 < pe21 && e8 > e21) { buy  += 15; reasons.push('MACD bullish crossover ↑'); }
   if (pe8 > pe21 && e8 < e21) { sell += 15; reasons.push('MACD bearish crossover ↓'); }
 
-  // ── 3. 200 EMA trend filter — hard gate, not just points ──
-  if (CONFIG.trendFilter && c5.length >= 40) {
+  // ── 3. 200 EMA trend filter ──
+  if (CONFIG.trendFilter && c5.length >= 30) {
     const e200 = ema(c5, Math.min(200, c5.length));
     if (price > e200) { buy  += 20; reasons.push('Above 200 EMA (uptrend)'); }
-    else {
-      // Below 200 EMA — cancel any buy signal entirely
-      if (buy > 0) {
-        reasons.push('Below 200 EMA — BUY cancelled');
-        return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-      }
-      sell += 20; reasons.push('Below 200 EMA (downtrend)');
-    }
+    else              { sell += 20; buy = Math.max(0, buy - 15); reasons.push('Below 200 EMA (downtrend)'); }
   }
 
-  // ── 4. Volume — must confirm direction ──
+  // ── 4. Volume ──
   if (CONFIG.volumeFilter && vol.length >= 10) {
     const avgVol = vol.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, vol.length);
     const curVol = vol[vol.length - 1];
-    if (curVol > avgVol * 1.5) {
-      buy > sell ? buy += 20 : sell += 20;
-      reasons.push(`Strong volume (${(curVol/avgVol).toFixed(1)}x avg)`);
-    } else if (curVol < avgVol * 0.7) {
-      // Low volume = indecision, cancel signal
-      reasons.push('Low volume — indecision, skipping');
-      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-    } else {
-      reasons.push(`Normal volume (${(curVol/avgVol).toFixed(1)}x avg)`);
-    }
+    if (curVol > avgVol * 1.5)      { buy > sell ? buy += 20 : sell += 20; reasons.push(`Strong volume (${(curVol/avgVol).toFixed(1)}x)`); }
+    else if (curVol < avgVol * 0.5) { buy = Math.max(0, buy-10); sell = Math.max(0, sell-10); reasons.push('Low volume — dampening'); }
+    else                            { reasons.push(`Normal volume (${(curVol/avgVol).toFixed(1)}x)`); }
   }
 
-  // ── 5. 15min timeframe — must agree or signal is cancelled ──
+  // ── 5. 15min timeframe ──
   if (c15) {
     const r15 = rsi(c15, CONFIG.rsiPeriod);
     const e8_15 = ema(c15, 8), e21_15 = ema(c15, 21);
-    const tf15Bullish = r15 < 50 && e8_15 > e21_15;
-    const tf15Bearish = r15 > 50 && e8_15 < e21_15;
-
-    if (buy > sell && !tf15Bullish) {
-      reasons.push('15min disagrees with BUY — cancelled');
-      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-    }
-    if (sell > buy && !tf15Bearish) {
-      reasons.push('15min disagrees with SELL — cancelled');
-      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-    }
-    buy > sell
-      ? (buy += 15, reasons.push('15min confirms bullish'))
-      : (sell += 15, reasons.push('15min confirms bearish'));
+    if      (r15 < 50 && e8_15 > e21_15) { buy  += 15; reasons.push('15min confirms bullish'); }
+    else if (r15 > 50 && e8_15 < e21_15) { sell += 15; reasons.push('15min confirms bearish'); }
+    else { buy = Math.max(0, buy-5); sell = Math.max(0, sell-5); reasons.push('15min neutral'); }
   }
 
   // ── 6. Bollinger Bands ──
   const bb = bollingerBands(c5);
   if (bb) {
-    if (price <= bb.lower)       { buy  += 15; reasons.push('At/below lower Bollinger Band'); }
-    else if (price >= bb.upper)  { sell += 15; reasons.push('At/above upper Bollinger Band'); }
+    if      (price <= bb.lower) { buy  += 15; reasons.push('At lower Bollinger Band'); }
+    else if (price >= bb.upper) { sell += 15; reasons.push('At upper Bollinger Band'); }
     else {
-      // Price in middle of bands = indecision zone
-      const midDist = Math.abs(price - bb.middle) / (bb.upper - bb.middle);
-      if (midDist < 0.3) {
-        reasons.push('Price in Bollinger Band middle — indecision');
-        return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-      }
+      // In middle — dampen slightly, not kill
+      const midDist = Math.abs(price - bb.middle) / ((bb.upper - bb.lower) / 2 || 1);
+      if (midDist < 0.3) { buy = Math.max(0, buy-8); sell = Math.max(0, sell-8); reasons.push('Near BB midline — slight dampening'); }
+      else { reasons.push('Between BB bands'); }
     }
   }
 
   // ── 7. VWAP ──
   if (bars5m.length >= 5) {
     const vw = vwap(bars5m.slice(-20));
-    if (price > vw * 1.002)       { buy  += 10; reasons.push(`Above VWAP ($${vw.toFixed(2)})`); }
-    else if (price < vw * 0.998)  { sell += 10; reasons.push(`Below VWAP ($${vw.toFixed(2)})`); }
-    else {
-      reasons.push('Hugging VWAP — indecision');
-      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-    }
+    if      (price > vw * 1.002) { buy  += 10; reasons.push(`Above VWAP ($${vw.toFixed(2)})`); }
+    else if (price < vw * 0.998) { sell += 10; reasons.push(`Below VWAP ($${vw.toFixed(2)})`); }
+    else { reasons.push(`Near VWAP ($${vw.toFixed(2)}) — neutral`); }
   }
 
-  // ── 8. Stochastic RSI — early entry signals ──
+  // ── 8. Stochastic RSI ──
   const stoch = stochRSI(c5);
-  if (stoch.k < 20 && stoch.d < 20)       { buy  += 15; reasons.push(`StochRSI oversold (K:${stoch.k.toFixed(0)} D:${stoch.d.toFixed(0)})`); }
-  else if (stoch.k > 80 && stoch.d > 80)  { sell += 15; reasons.push(`StochRSI overbought (K:${stoch.k.toFixed(0)} D:${stoch.d.toFixed(0)})`); }
-  // Stoch K crossing D = signal confirmation
-  if (stoch.k > stoch.d && stoch.k < 50)  { buy  += 10; reasons.push('StochRSI bullish cross'); }
-  if (stoch.k < stoch.d && stoch.k > 50)  { sell += 10; reasons.push('StochRSI bearish cross'); }
+  if      (stoch.k < 20 && stoch.d < 20) { buy  += 15; reasons.push(`StochRSI oversold (K:${stoch.k.toFixed(0)})`); }
+  else if (stoch.k > 80 && stoch.d > 80) { sell += 15; reasons.push(`StochRSI overbought (K:${stoch.k.toFixed(0)})`); }
+  if (stoch.k > stoch.d && stoch.k < 50) { buy  += 10; reasons.push('StochRSI bullish cross'); }
+  if (stoch.k < stoch.d && stoch.k > 50) { sell += 10; reasons.push('StochRSI bearish cross'); }
 
-  // ── 9. ADX — only trade when trend is strong ──
-  const adxData = adx(bars5m);
-  if (adxData.adx < 20) {
-    reasons.push(`ADX ${adxData.adx.toFixed(0)} — ranging market, no trend`);
-    return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-  }
-  if (adxData.adx > 25) {
-    if (adxData.diPlus > adxData.diMinus)  { buy  += 15; reasons.push(`ADX trending (${adxData.adx.toFixed(0)}) +DI>${adxData.diPlus.toFixed(0)}`); }
-    else                                    { sell += 15; reasons.push(`ADX trending (${adxData.adx.toFixed(0)}) -DI>${adxData.diMinus.toFixed(0)}`); }
+  // ── 9. ADX — trend strength (only if enough data, don't kill on low ADX) ──
+  if (bars5m.length >= 20) {
+    const adxData = adx(bars5m);
+    if (adxData.adx > 0) { // only score if ADX computed successfully
+      if (adxData.adx < 20) {
+        // Ranging — dampen both sides, don't kill
+        buy  = Math.max(0, buy  - 15);
+        sell = Math.max(0, sell - 15);
+        reasons.push(`ADX ${adxData.adx.toFixed(0)} — ranging, dampening`);
+      } else if (adxData.adx > 25) {
+        if (adxData.diPlus > adxData.diMinus) { buy  += 15; reasons.push(`ADX trending up (${adxData.adx.toFixed(0)})`); }
+        else                                   { sell += 15; reasons.push(`ADX trending down (${adxData.adx.toFixed(0)})`); }
+      }
+    }
   }
 
-  // ── 8. Momentum check — price must be moving in signal direction ──
+  // ── 10. Momentum ──
   if (c5.length >= 5) {
-    const recentChange = (c5[c5.length-1] - c5[c5.length-5]) / c5[c5.length-5];
-    if (buy > sell && recentChange < -0.005) {
-      reasons.push('Price falling despite bullish signal — skipping');
-      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-    }
-    if (sell > buy && recentChange > 0.005) {
-      reasons.push('Price rising despite bearish signal — skipping');
-      return { signal: 'HOLD', confidence: 0, reasons, rsi: r };
-    }
+    const rc = (c5[c5.length-1] - c5[c5.length-5]) / c5[c5.length-5];
+    if      (rc >  0.003 && buy  > sell) { buy  += 10; reasons.push(`Momentum up (${(rc*100).toFixed(2)}%)`); }
+    else if (rc < -0.003 && sell > buy)  { sell += 10; reasons.push(`Momentum down (${(rc*100).toFixed(2)}%)`); }
+    else if (rc < -0.003 && buy  > sell) { buy  = Math.max(0, buy-10);  reasons.push('Price falling vs bullish signal'); }
+    else if (rc >  0.003 && sell > buy)  { sell = Math.max(0, sell-10); reasons.push('Price rising vs bearish signal'); }
   }
 
   // ── Final threshold ──
   const total = buy + sell;
   const confidence = total > 0 ? Math.round(Math.max(buy, sell) / total * 100) : 0;
+  const minScore = +(process.env.MIN_SCORE || 55);
+  const minEdge  = +(process.env.MIN_EDGE  || 1.4);
 
-  // Require strong score AND clear edge
-  const minScore = +(process.env.MIN_SCORE || 60);
-  const minEdge  = +(process.env.MIN_EDGE  || 1.5);
+  if (buy  >= minScore && buy  > sell * minEdge) return { signal: 'BUY',  confidence, score: buy,  reasons, rsi: r };
+  if (sell >= minScore && sell > buy  * minEdge) return { signal: 'SELL', confidence, score: sell, reasons, rsi: r };
 
-  if (buy >= minScore && buy > sell * minEdge)  return { signal: 'BUY',  confidence, score: buy,  reasons, rsi: r };
-  if (sell >= minScore && sell > buy * minEdge) return { signal: 'SELL', confidence, score: sell, reasons, rsi: r };
-
-  reasons.push(`Score insufficient (buy=${buy} sell=${sell} need ${minScore} with ${minEdge}x edge)`);
+  reasons.push(`No edge (buy=${buy} sell=${sell} need ${minScore} score + ${minEdge}x edge)`);
   return { signal: 'HOLD', confidence, reasons, rsi: r };
 }
 
@@ -1290,7 +1251,7 @@ async function runScan() {
       if (sessionMult < 1.0) adjustedSig.reasons = [`Off-prime (x${sessionMult})`, ...sig.reasons];
       else if (sessionMult > 1.0) adjustedSig.reasons = [`Prime boost (x${sessionMult})`, ...sig.reasons];
 
-      log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)}) ${sessionLabel}`);
+      log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)} score:${sig.score||0}) ${sessionLabel}`);
       await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)} ${sessionLabel}`);
 
       const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
