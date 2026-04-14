@@ -208,8 +208,101 @@
     </div>
   </div>
 
+  <!-- Mode Control -->
+  <div class="card" style="margin-bottom:20px;border-color:rgba(0,229,255,0.3)">
+    <div class="section-header">
+      <div class="section-title">Trading Mode</div>
+      <span class="sync-info" id="modeStatusText">Changes apply on next bot scan</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+
+      <div id="swingCard" style="border-radius:10px;padding:16px;border:2px solid var(--border);transition:all .3s;cursor:pointer" onclick="document.getElementById('swingEnabled').click()">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <div style="font-size:15px;font-weight:800">📈 Swing Trading</div>
+          <label class="toggle" onclick="event.stopPropagation()">
+            <input type="checkbox" id="swingEnabled" checked onchange="onModeChange()">
+            <span class="slider-tog"></span>
+          </label>
+        </div>
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);line-height:1.9">
+          Holds: Hours → Days<br>Targets: +4% → +14%<br>Bars: 5min + 15min<br>Risk: 1% per trade (ATR)
+        </div>
+      </div>
+
+      <div id="scalpCard" style="border-radius:10px;padding:16px;border:2px solid var(--border);transition:all .3s;cursor:pointer" onclick="document.getElementById('scalpEnabled').click()">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <div style="font-size:15px;font-weight:800">⚡ Scalp Mode</div>
+          <label class="toggle" onclick="event.stopPropagation()">
+            <input type="checkbox" id="scalpEnabled" onchange="onModeChange()">
+            <span class="slider-tog"></span>
+          </label>
+        </div>
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);line-height:1.9">
+          Holds: Seconds → 8min<br>Targets: +0.2% → +0.5%<br>Bars: 1min precision<br>Scan: every 5 seconds
+        </div>
+      </div>
+
+    </div>
+
+    <div id="scalpSettings" style="display:none;margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+      <div style="font-size:11px;font-weight:700;letter-spacing:2px;color:var(--accent);margin-bottom:12px">⚡ SCALP SETTINGS</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="setting-row">
+          <div class="setting-label">Take Profit %</div>
+          <div class="range-wrap">
+            <input type="range" id="scalpTp" min="0.1" max="1.0" step="0.05" value="0.4" oninput="rng(this,'scalpTpV','%')">
+            <span class="range-val" id="scalpTpV">0.4%</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">Stop Loss %</div>
+          <div class="range-wrap">
+            <input type="range" id="scalpSl" min="0.05" max="0.5" step="0.05" value="0.2" oninput="rng(this,'scalpSlV','%')">
+            <span class="range-val" id="scalpSlV">0.2%</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">Max Hold (minutes)</div>
+          <div class="range-wrap">
+            <input type="range" id="scalpHold" min="1" max="30" value="8" oninput="rng(this,'scalpHoldV','m')">
+            <span class="range-val" id="scalpHoldV">8m</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">Max Concurrent</div>
+          <div class="range-wrap">
+            <input type="range" id="scalpMax" min="1" max="5" value="2" oninput="rng(this,'scalpMaxV','')">
+            <span class="range-val" id="scalpMaxV">2</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">Position Size %</div>
+          <div class="range-wrap">
+            <input type="range" id="scalpPosPct" min="5" max="50" value="20" oninput="rng(this,'scalpPosPctV','%')">
+            <span class="range-val" id="scalpPosPctV">20%</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">Min Signal Score</div>
+          <div class="range-wrap">
+            <input type="range" id="scalpMinScore" min="50" max="90" value="70" oninput="rng(this,'scalpMinScoreV','')">
+            <span class="range-val" id="scalpMinScoreV">70</span>
+          </div>
+        </div>
+      </div>
+      <div class="setting-row" style="margin-top:10px">
+        <div class="setting-label">Scalp Symbols</div>
+        <input type="text" class="setting-input" id="scalpSymbols" value="SPY,QQQ,AAPL,TSLA,NVDA" placeholder="SPY,QQQ,AAPL,TSLA,NVDA">
+      </div>
+    </div>
+
+    <button class="btn btn-primary btn-sm" style="width:100%;margin-top:16px" onclick="saveSettings()">💾 Save & Apply</button>
+    <p style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:8px;line-height:1.6;text-align:center">
+      ✅ No Render redeploy needed — bot picks up changes on its next scan
+    </p>
+  </div>
+
   <!-- Settings -->
-  <div class="grid-3">
 
     <!-- Strategy -->
     <div class="card">
@@ -430,35 +523,64 @@ function loadSettings(){
     if(s.strategy) document.getElementById('strategy').value = s.strategy;
     if(s.discord)  document.getElementById('discordWebhook').value = s.discord;
     if(s.startingCapital) document.getElementById('startingCapital').value = s.startingCapital;
-    const ranges = {rsiPeriod:'',rsiOversold:'',rsiOverbought:'',scanInterval:'m',stopLoss:'%',takeProfit:'%',trailingStop:'%',maxDailyLoss:'%',maxPositions:'',maxPosPct:'%'};
+
+    // Mode toggles
+    if(s.swingEnabled !== undefined) document.getElementById('swingEnabled').checked = s.swingEnabled;
+    if(s.scalpEnabled !== undefined) document.getElementById('scalpEnabled').checked = s.scalpEnabled;
+
+    // Scalp settings
+    if(s.scalpTp       !== undefined) { document.getElementById('scalpTp').value = s.scalpTp; document.getElementById('scalpTpV').textContent = s.scalpTp+'%'; }
+    if(s.scalpSl       !== undefined) { document.getElementById('scalpSl').value = s.scalpSl; document.getElementById('scalpSlV').textContent = s.scalpSl+'%'; }
+    if(s.scalpHold     !== undefined) { document.getElementById('scalpHold').value = s.scalpHold; document.getElementById('scalpHoldV').textContent = s.scalpHold+'m'; }
+    if(s.scalpMax      !== undefined) { document.getElementById('scalpMax').value = s.scalpMax; document.getElementById('scalpMaxV').textContent = s.scalpMax; }
+    if(s.scalpPosPct   !== undefined) { document.getElementById('scalpPosPct').value = s.scalpPosPct; document.getElementById('scalpPosPctV').textContent = s.scalpPosPct+'%'; }
+    if(s.scalpMinScore !== undefined) { document.getElementById('scalpMinScore').value = s.scalpMinScore; document.getElementById('scalpMinScoreV').textContent = s.scalpMinScore; }
+    if(s.scalpSymbols) document.getElementById('scalpSymbols').value = s.scalpSymbols;
+
+    const ranges = {rsiPeriod:'',rsiOversold:'',rsiOverbought:'',scanInterval:'s',stopLoss:'%',takeProfit:'%',trailingStop:'%',maxDailyLoss:'%',maxPositions:'',maxPosPct:'%'};
     Object.entries(ranges).forEach(([id,sfx])=>{
-      if(s[id] !== undefined){ document.getElementById(id).value=s[id]; document.getElementById(id+'V').textContent=s[id]+sfx; }
+      if(s[id] !== undefined){
+        const el = document.getElementById(id);
+        if(el){ el.value=s[id]; document.getElementById(id+'V').textContent=s[id]+sfx; }
+      }
     });
     ['alertBuy','alertSell','alertDaily'].forEach(id=>{ if(s[id]!==undefined) document.getElementById(id).checked=s[id]; });
-  }catch(e){}
+  }catch(e){ console.warn('loadSettings error:', e); }
   renderSymbolTags();
   updateRenderVars();
+  onModeChange(); // apply visual state
 }
 
 async function saveSettings(){
   const s = {
     symbols,
     startingCapital: +document.getElementById('startingCapital').value,
-    strategy: document.getElementById('strategy').value,
-    discord: document.getElementById('discordWebhook').value,
+    strategy:  document.getElementById('strategy').value,
+    discord:   document.getElementById('discordWebhook').value,
     rsiPeriod: +document.getElementById('rsiPeriod').value,
-    rsiOversold: +document.getElementById('rsiOversold').value,
+    rsiOversold:   +document.getElementById('rsiOversold').value,
     rsiOverbought: +document.getElementById('rsiOverbought').value,
-    scanInterval: +document.getElementById('scanInterval').value,
-    stopLoss: +document.getElementById('stopLoss').value,
-    takeProfit: +document.getElementById('takeProfit').value,
-    trailingStop: +document.getElementById('trailingStop').value,
-    maxDailyLoss: +document.getElementById('maxDailyLoss').value,
-    maxPositions: +document.getElementById('maxPositions').value,
-    maxPosPct: +document.getElementById('maxPosPct').value,
-    alertBuy: document.getElementById('alertBuy').checked,
+    scanInterval:  +document.getElementById('scanInterval').value,
+    stopLoss:    +document.getElementById('stopLoss').value,
+    takeProfit:  +document.getElementById('takeProfit').value,
+    trailingStop:+document.getElementById('trailingStop').value,
+    maxDailyLoss:+document.getElementById('maxDailyLoss').value,
+    maxPositions:+document.getElementById('maxPositions').value,
+    maxPosPct:   +document.getElementById('maxPosPct').value,
+    alertBuy:  document.getElementById('alertBuy').checked,
     alertSell: document.getElementById('alertSell').checked,
-    alertDaily: document.getElementById('alertDaily').checked,
+    alertDaily:document.getElementById('alertDaily').checked,
+    // Mode flags
+    swingEnabled: document.getElementById('swingEnabled').checked,
+    scalpEnabled: document.getElementById('scalpEnabled').checked,
+    // Scalp settings
+    scalpTp:       +document.getElementById('scalpTp').value,
+    scalpSl:       +document.getElementById('scalpSl').value,
+    scalpHold:     +document.getElementById('scalpHold').value,
+    scalpMax:      +document.getElementById('scalpMax').value,
+    scalpPosPct:   +document.getElementById('scalpPosPct').value,
+    scalpMinScore: +document.getElementById('scalpMinScore').value,
+    scalpSymbols:  document.getElementById('scalpSymbols').value,
   };
 
   // Save to localStorage (for dashboard display)
@@ -501,6 +623,17 @@ async function saveSettings(){
           volume_filter:       true,
           regime_filter:       true,
           correlation_filter:  true,
+          // Mode flags
+          swing_enabled:       s.swingEnabled,
+          scalp_mode:          s.scalpEnabled,
+          // Scalp settings
+          scalp_tp_pct:        s.scalpTp,
+          scalp_sl_pct:        s.scalpSl,
+          scalp_max_hold_mins: s.scalpHold,
+          scalp_max_positions: s.scalpMax,
+          scalp_position_pct:  s.scalpPosPct,
+          scalp_min_score:     s.scalpMinScore,
+          scalp_symbols:       s.scalpSymbols,
           updated_at:          new Date().toISOString(),
         })
       });
@@ -515,6 +648,31 @@ async function saveSettings(){
   } else {
     showToast('✓ Settings saved locally');
   }
+}
+
+function onModeChange(){
+  const swingOn = document.getElementById('swingEnabled').checked;
+  const scalpOn = document.getElementById('scalpEnabled').checked;
+
+  // Update card visual state
+  const swingCard = document.getElementById('swingCard');
+  const scalpCard = document.getElementById('scalpCard');
+  swingCard.style.borderColor = swingOn ? 'var(--accent2)' : 'var(--border)';
+  swingCard.style.background  = swingOn ? 'rgba(127,255,110,0.05)' : '';
+  scalpCard.style.borderColor = scalpOn ? 'var(--accent)' : 'var(--border)';
+  scalpCard.style.background  = scalpOn ? 'rgba(0,229,255,0.05)' : '';
+
+  // Show/hide scalp settings
+  document.getElementById('scalpSettings').style.display = scalpOn ? 'block' : 'none';
+
+  // Status label
+  const modes = [];
+  if (swingOn) modes.push('📈 Swing');
+  if (scalpOn) modes.push('⚡ Scalp');
+  document.getElementById('modeStatusText').textContent =
+    modes.length ? `Active: ${modes.join(' + ')} — saves on next button click` : '⚠ No mode active — bot will idle';
+
+  saveSettings();
 }
 
 function rng(el, valId, sfx){
@@ -734,7 +892,13 @@ function updateTrades(trades){
 
     // Side badge
     let badge;
-    if      (t.side==='BUY')   badge='<span class="badge badge-buy">🟢 LONG</span>';
+    if      (t.side==='BUY'||t.side==='SCALP_BUY')   badge='<span class="badge badge-buy">🟢 LONG</span>';
+    else if (t.side==='SCALP_SHORT') badge='<span class="badge" style="background:rgba(255,95,87,0.15);color:var(--accent3);border:1px solid rgba(255,95,87,0.3)">⚡🔴 SCALP</span>';
+    else if (t.side==='SCALP_EXIT') {
+      const scalpColor = t.pnl > 0 ? '127,255,110' : '255,95,87';
+      const scalpIcon  = { SCALP_TP:'🎯', SCALP_SL:'🛑', SCALP_TRAIL:'📉', SCALP_TIME:'⏰', SCALP_REVERSE:'↩️' }[t.reason] || '📤';
+      badge=`<span class="badge" style="background:rgba(${scalpColor},0.15);color:rgba(${scalpColor},1);border:1px solid rgba(${scalpColor},0.3)">⚡${scalpIcon}</span>`;
+    }
     else if (t.side==='SHORT') badge='<span class="badge" style="background:rgba(255,95,87,0.15);color:var(--accent3);border:1px solid rgba(255,95,87,0.3)">🔴 SHORT</span>';
     else if (t.side==='COVER') badge='<span class="badge" style="background:rgba(180,127,255,0.15);color:#b47fff;border:1px solid rgba(180,127,255,0.3)">🔵 COVER</span>';
     else if (t.reason==='MANUAL_CLOSE') badge='<span class="badge" style="background:rgba(180,127,255,0.15);color:#b47fff;border:1px solid rgba(180,127,255,0.3)">🖐 MANUAL</span>';
