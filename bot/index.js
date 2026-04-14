@@ -105,7 +105,7 @@ async function loadRemoteConfig() {
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
     if (s.rsi_oversold)     CONFIG.rsiOversold      = +s.rsi_oversold;
     if (s.rsi_overbought)   CONFIG.rsiOverbought    = +s.rsi_overbought;
-    if (s.scan_interval)    CONFIG.scanIntervalMin  = +s.scan_interval;
+    if (s.scan_interval)    CONFIG.scanIntervalSec  = +s.scan_interval; // seconds
     if (s.stop_loss_pct)    CONFIG.stopLossPct      = +s.stop_loss_pct / 100;
     if (s.take_profit_pct)  CONFIG.takeProfitPct    = +s.take_profit_pct / 100;
     if (s.trailing_stop_pct) CONFIG.trailingStopPct = +s.trailing_stop_pct / 100;
@@ -1316,27 +1316,64 @@ async function sendDailySummary() {
 // STARTUP + SCHEDULER
 // ─────────────────────────────────────────────
 log('sys', '══════════════════════════════════════════');
-log('sys', '   TradeCore Pro — Upgraded Engine v3     ');
-log('sys', '   + International ETF Session Awareness  ');
+log('sys', '   TradeCore Pro — Upgraded Engine v4     ');
+log('sys', '   + 10s scan + live dashboard refresh    ');
 log('sys', '══════════════════════════════════════════');
 log('sys', `Mode: ${CONFIG.mode.toUpperCase()} | Paper: ${CONFIG.alpacaPaper} | Strategy: ${CONFIG.strategy}`);
 log('sys', `Symbols: ${CONFIG.symbols.join(', ')}`);
-log('sys', `Intl ETFs: ${Object.keys(ETF_SESSIONS).filter(s => !['SPY','QQQ'].includes(s)).join(', ')}`);
 log('sys', `Risk: SL=${CONFIG.stopLossPct*100}% TP=${CONFIG.takeProfitPct*100}% Trailing=${CONFIG.trailingStop} MaxDailyLoss=${CONFIG.maxDailyLossPct*100}%`);
 log('sys', `Filters: Trend=${CONFIG.trendFilter} Volume=${CONFIG.volumeFilter} Regime=${CONFIG.regimeFilter} Corr=${CONFIG.correlationFilter}`);
 log('sys', `Current session: ${getCurrentSession()}`);
 
-// Scan every N minutes
-cron.schedule(`*/${CONFIG.scanIntervalMin} * * * *`, runScan);
-// Sync live prices to dashboard every 60 seconds (between scans)
-cron.schedule('* * * * *', syncPricesOnly);
-// End of day summary at 4:05 PM ET
-cron.schedule('5 16 * * 1-5', sendDailySummary, { timezone: 'America/New_York' });
-// Pre-market: store prev day close at 8:55 AM ET for gap detection
-cron.schedule('55 8 * * 1-5', storePrevClose, { timezone: 'America/New_York' });
+// ── Scan interval ──
+// Use setInterval so we can do sub-minute scans (cron only supports 1min minimum)
+// Rate limit guard: Alpaca free tier = ~200 req/min
+// Each scan = ~2 requests per symbol (5min bars + 15min bars) + ~3 account calls
+// 15 symbols × 2 = 30 req + 3 = 33 req per scan
+// At 10s intervals = 6 scans/min = 198 req/min — right at the limit
+// So we stagger: full signal scan every 30s, price-only update every 10s
+let scanInProgress = false;
+let lastFullScan = 0;
+const FULL_SCAN_INTERVAL_MS = Math.max(
+  +(process.env.SCAN_INTERVAL_SEC || 30) * 1000,
+  10000 // never faster than 10s
+);
+const PRICE_SYNC_INTERVAL_MS = 10000; // price updates every 10s
 
-// Run immediately on startup
-loadRemoteConfig().then(() => runScan());
+log('sys', `Full scan every ${FULL_SCAN_INTERVAL_MS/1000}s | Price sync every ${PRICE_SYNC_INTERVAL_MS/1000}s`);
+
+async function tick() {
+  if (scanInProgress) return; // prevent overlapping scans
+  scanInProgress = true;
+  try {
+    const now = Date.now();
+    if (now - lastFullScan >= FULL_SCAN_INTERVAL_MS) {
+      // Full signal scan
+      lastFullScan = now;
+      await runScan();
+    } else {
+      // Price-only update between full scans
+      await syncPricesOnly();
+    }
+  } catch(e) {
+    log('error', `Tick error: ${e.message}`);
+  } finally {
+    scanInProgress = false;
+  }
+}
+
+// Main tick every 10 seconds
+setInterval(tick, PRICE_SYNC_INTERVAL_MS);
+
+// Daily tasks (cron still handles these fine)
+cron.schedule('5 16 * * 1-5', sendDailySummary, { timezone: 'America/New_York' });
+cron.schedule('55 8 * * 1-5', storePrevClose,   { timezone: 'America/New_York' });
+
+// Startup
+loadRemoteConfig().then(() => {
+  runScan();
+  lastFullScan = Date.now();
+});
 setTimeout(syncPricesOnly, 5000);
 
 // ─────────────────────────────────────────────
