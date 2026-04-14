@@ -613,6 +613,7 @@ async function runScan() {
   }
 
   log('scan', `═══ ${session} — Scanning ${CONFIG.symbols.length} symbols ═══`);
+  await syncLog('sys', `Scan started — ${session} — ${CONFIG.symbols.length} symbols`);
 
   // Market regime only matters during US hours
   const marketOk = isMarketOpen() ? await getMarketRegime() : true;
@@ -666,6 +667,7 @@ async function runScan() {
       }
 
       log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)}) ${sessionLabel}`);
+      await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)} ${sessionLabel}`);
 
       if (adjustedSig.signal === 'BUY' && marketOk && Object.keys(positions).length < CONFIG.maxOpenPositions) {
         await enterPosition(sym, price, adjustedSig, bars5m);
@@ -683,6 +685,7 @@ async function runScan() {
   const total = portfolio + openPnl;
   const dayPnl = total - dailyStartPortfolio;
   log('info', `${session} | Total=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
+  await syncLog('sys', `Scan complete | Portfolio=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
   await syncAll();
 }
 
