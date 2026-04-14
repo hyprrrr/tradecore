@@ -490,29 +490,53 @@ async function poll(){
 
   if(!portfolio||portfolio.length===0){ setOffline(); return; }
   const p = portfolio[0];
-  updateKPIs(p);
-  updatePositions(positions||[]);
+  const posData = positions||[];
+  updateKPIs(p, posData);
+  updatePositions(posData);
   updateTrades(trades||[]);
   updateLogs(logs||[]);
   setOnline();
   document.getElementById('syncInfo').textContent = 'Updated '+new Date().toLocaleTimeString();
 }
 
-function updateKPIs(p){
-  const val = +p.total_value, dayPnl = +p.day_pnl;
-  const wins = p.total_wins, losses = p.total_losses, total = wins+losses;
-  const change = val - 10000;
-  const pct = ((change/10000)*100).toFixed(2);
+// store starting capital from first poll
+let startingCapital = null;
+let lastPositions = [];
 
-  document.getElementById('portfolioVal').textContent = '$'+val.toFixed(2);
+function updateKPIs(p, positions){
+  const cash = +p.cash;
+  const wins = p.total_wins, losses = p.total_losses, total = wins+losses;
+
+  // Calculate open position value from positions table (current_price * qty)
+  const openValue = positions.reduce((acc, pos) => acc + (+pos.current_price * +pos.qty), 0);
+  const totalValue = cash + openValue;
+
+  // Store starting capital on first load
+  if(startingCapital === null) startingCapital = +p.total_value || totalValue;
+
+  // Unrealized P&L = current value of open positions minus what we paid
+  const unrealizedPnl = positions.reduce((acc, pos) => acc + +pos.pnl, 0);
+
+  // Day P&L = realized closed trades today + unrealized on open positions
+  const dayPnl = +p.day_pnl + unrealizedPnl;
+
+  // All time P&L = total portfolio vs starting capital
+  const allTimePnl = totalValue - startingCapital;
+  const allTimePct = startingCapital > 0 ? ((allTimePnl / startingCapital) * 100).toFixed(2) : '0.00';
+
+  document.getElementById('portfolioVal').textContent = '$' + totalValue.toFixed(2);
   const chEl = document.getElementById('portfolioChange');
-  chEl.textContent = `${change>=0?'+':''}$${change.toFixed(2)} (${pct}%) all time`;
-  chEl.className = 'card-sub '+(change>=0?'green':'red');
+  chEl.textContent = `${allTimePnl>=0?'+':''}$${allTimePnl.toFixed(2)} (${allTimePct}%) all time`;
+  chEl.className = 'card-sub '+(allTimePnl>=0?'green':'red');
 
   const pnlEl = document.getElementById('todayPnl');
   pnlEl.textContent = `${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`;
   pnlEl.className = 'card-value '+(dayPnl>=0?'green':'red');
-  document.getElementById('tradeCount').textContent = `${total} total trades`;
+
+  // Sub-label shows realized + unrealized breakdown
+  const realizedToday = +p.day_pnl;
+  document.getElementById('tradeCount').textContent =
+    `Realized: ${realizedToday>=0?'+':''}$${realizedToday.toFixed(2)} | Unrealized: ${unrealizedPnl>=0?'+':''}$${unrealizedPnl.toFixed(2)}`;
 
   const wr = total>0?((wins/total)*100).toFixed(0)+'%':'—';
   document.getElementById('winRate').textContent = wr;
@@ -524,7 +548,8 @@ function updateKPIs(p){
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
   if(p.session) document.getElementById('sessionBadge').textContent=p.session;
 
-  equityHistory.push(val);
+  // Equity chart uses true total value
+  equityHistory.push(+totalValue.toFixed(2));
   if(equityHistory.length>288) equityHistory.shift();
   drawChart();
 }
@@ -534,18 +559,43 @@ function updatePositions(positions){
   const el = document.getElementById('positionsList');
   if(positions.length===0){ el.innerHTML='<div class="empty-state">No open positions.<br>Bot is scanning…</div>'; return; }
   el.innerHTML = positions.map(p=>{
-    const pnl=+p.pnl, pct=+p.pnl_pct, conf=p.confidence||0;
-    const region = ETF_REGION[p.symbol]||'US Stock';
+    const entryPrice   = +p.entry_price;
+    const currentPrice = +p.current_price;
+    const qty          = +p.qty;
+    const cost         = entryPrice * qty;
+    const liveValue    = currentPrice * qty;
+    const unrealPnl    = liveValue - cost;   // true unrealized P&L
+    const unrealPct    = ((unrealPnl / cost) * 100);
+    const conf         = p.confidence || 0;
+    const region       = ETF_REGION[p.symbol] || 'US Stock';
+    const pnlColor     = unrealPnl >= 0 ? 'var(--accent2)' : 'var(--accent3)';
+    const holdMins     = p.entry_time ? Math.round((Date.now() - new Date(p.entry_time).getTime()) / 60000) : 0;
+    const holdStr      = holdMins < 60 ? `${holdMins}m` : `${(holdMins/60).toFixed(1)}h`;
+
     return `<div class="position-row">
-      <div>
-        <div class="pos-sym">${p.symbol}</div>
-        <div class="pos-meta">${p.qty}× @ $${(+p.entry_price).toFixed(2)} | ${region}</div>
-        <div class="conf-bar"><div class="conf-bar-fill" style="width:${conf}%"></div></div>
+      <div style="flex:1">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="pos-sym">${p.symbol}</div>
+          <span style="font-family:'Space Mono',monospace;font-size:10px;background:rgba(0,229,255,0.1);border:1px solid rgba(0,229,255,0.2);padding:1px 6px;border-radius:4px;color:var(--accent)">${region}</span>
+        </div>
+        <div class="pos-meta" style="margin-top:4px">
+          ${qty} shares · Entry $${entryPrice.toFixed(2)} · Now $${currentPrice.toFixed(2)} · Held ${holdStr}
+        </div>
+        <div style="margin-top:6px;display:flex;align-items:center;gap:8px">
+          <div class="conf-bar" style="width:60px"><div class="conf-bar-fill" style="width:${conf}%"></div></div>
+          <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">conf ${conf}%</span>
+        </div>
       </div>
-      <div style="text-align:right">
-        <div class="pos-pnl ${pnl>=0?'green':'red'}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</div>
-        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">${pct>=0?'+':''}${pct.toFixed(2)}% | conf ${conf}%</div>
-        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">Now: $${(+p.current_price).toFixed(2)}</div>
+      <div style="text-align:right;margin-left:12px">
+        <div style="font-family:'Space Mono',monospace;font-size:18px;font-weight:700;color:${pnlColor}">
+          ${unrealPnl>=0?'+':''}$${unrealPnl.toFixed(2)}
+        </div>
+        <div style="font-family:'Space Mono',monospace;font-size:11px;color:${pnlColor};margin-top:2px">
+          ${unrealPct>=0?'+':''}${unrealPct.toFixed(2)}%
+        </div>
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:2px">
+          Value: $${liveValue.toFixed(2)}
+        </div>
       </div>
     </div>`;
   }).join('');
