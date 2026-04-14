@@ -137,27 +137,39 @@ async function syncPortfolio() {
 }
 
 async function syncPositions() {
-  // Delete all then reinsert current positions
-  await sbFetch('tc_positions', 'DELETE', undefined);
-  // Supabase REST delete needs a filter — use neq on a dummy field
-  await sbFetch('tc_positions?symbol=neq.___NONE___', 'DELETE');
+  // Step 1: get all symbols currently tracked in Supabase
+  const existing = await sbFetch('tc_positions', 'GET');
+  const existingSyms = new Set((existing || []).map(p => p.symbol));
 
+  // Step 2: delete any symbols no longer in positions{}
+  const currentSyms = new Set(Object.keys(positions));
+  for (const sym of existingSyms) {
+    if (!currentSyms.has(sym)) {
+      await sbFetch(`tc_positions?symbol=eq.${sym}`, 'DELETE');
+    }
+  }
+
+  // Step 3: upsert each current position with latest price
   for (const [sym, pos] of Object.entries(positions)) {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
-    const pnl = (cur - pos.entryPrice) * pos.qty;
-    const pnlPct = ((cur - pos.entryPrice) / pos.entryPrice) * 100;
+    const cur     = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const qty     = pos.qtyRemaining || pos.qty;
+    const cost    = pos.entryPrice * qty;
+    const pnl     = (cur - pos.entryPrice) * qty;
+    const pnlPct  = ((cur - pos.entryPrice) / pos.entryPrice) * 100;
+
+    await sbFetch('tc_positions?symbol=eq.' + sym, 'DELETE');
     await sbFetch('tc_positions', 'POST', {
-      symbol: sym,
-      entry_price: +pos.entryPrice.toFixed(4),
-      qty: pos.qty,
-      cost: +pos.cost.toFixed(2),
+      symbol:        sym,
+      entry_price:   +pos.entryPrice.toFixed(4),
+      qty,
+      cost:          +cost.toFixed(2),
       current_price: +cur.toFixed(4),
-      pnl: +pnl.toFixed(2),
-      pnl_pct: +pnlPct.toFixed(2),
-      entry_time: pos.entryTime.toISOString(),
-      high_water: +pos.highWater.toFixed(4),
-      confidence: pos.sigInfo?.confidence || 0,
-      updated_at: new Date().toISOString(),
+      pnl:           +pnl.toFixed(2),
+      pnl_pct:       +pnlPct.toFixed(2),
+      entry_time:    new Date(pos.entryTime).toISOString(),
+      high_water:    +pos.highWater.toFixed(4),
+      confidence:    pos.sigInfo?.confidence || 0,
+      updated_at:    new Date().toISOString(),
     });
   }
 }
@@ -185,6 +197,38 @@ async function syncLog(type, msg) {
 
 async function syncAll() {
   await Promise.all([syncPortfolio(), syncPositions()]);
+}
+
+// Sync current prices to Supabase every 60s even between scans
+// So the dashboard always shows live P&L
+async function syncPricesOnly() {
+  if (Object.keys(positions).length === 0) return;
+  for (const [sym, pos] of Object.entries(positions)) {
+    try {
+      const bars = await fetchBars(sym, '5Min', 3);
+      if (!bars || bars.length === 0) continue;
+      const cur    = bars[bars.length - 1].c;
+      const qty    = pos.qtyRemaining || pos.qty;
+      const pnl    = (cur - pos.entryPrice) * qty;
+      const pnlPct = ((cur - pos.entryPrice) / pos.entryPrice) * 100;
+      // Update price in memory
+      if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
+      priceHistory5m[sym].push(cur);
+      if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
+      // Push to Supabase
+      await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
+        current_price: +cur.toFixed(4),
+        pnl:           +pnl.toFixed(2),
+        pnl_pct:       +pnlPct.toFixed(2),
+        high_water:    +Math.max(pos.highWater, cur).toFixed(4),
+        updated_at:    new Date().toISOString(),
+      });
+      if (cur > pos.highWater) positions[sym].highWater = cur;
+    } catch (e) {
+      log('error', `Price sync failed for ${sym}: ${e.message}`);
+    }
+  }
+  await syncPortfolio();
 }
 
 // ─────────────────────────────────────────────
@@ -1045,6 +1089,8 @@ log('sys', `Current session: ${getCurrentSession()}`);
 
 // Scan every N minutes
 cron.schedule(`*/${CONFIG.scanIntervalMin} * * * *`, runScan);
+// Sync live prices to dashboard every 60 seconds (between scans)
+cron.schedule('* * * * *', syncPricesOnly);
 // End of day summary at 4:05 PM ET
 cron.schedule('5 16 * * 1-5', sendDailySummary, { timezone: 'America/New_York' });
 // Pre-market: store prev day close at 8:55 AM ET for gap detection
