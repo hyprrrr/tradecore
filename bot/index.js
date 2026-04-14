@@ -74,6 +74,18 @@ const CONFIG = {
 
   scanIntervalMin: +(process.env.SCAN_INTERVAL_MIN || 5),
 
+  // ── Mode controls (overridden by dashboard via Supabase) ──
+  swingEnabled:        process.env.SWING_ENABLED !== 'false', // default on
+  scalpMode:           process.env.SCALP_MODE === 'true',
+  scalpSymbols:        (process.env.SCALP_SYMBOLS || 'SPY,QQQ,AAPL,TSLA,NVDA').split(',').map(s => s.trim().toUpperCase()),
+  scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.4)  / 100, // take profit at +0.4%
+  scalpSlPct:          +(process.env.SCALP_SL_PCT        || 0.2)  / 100, // stop loss at -0.2%
+  scalpMaxHoldMins:    +(process.env.SCALP_MAX_HOLD_MINS || 8),           // exit if held > 8 minutes
+  scalpMaxPositions:   +(process.env.SCALP_MAX_POSITIONS || 2),           // max concurrent scalp positions
+  scalpPositionPct:    +(process.env.SCALP_POSITION_PCT  || 20)  / 100,  // 20% of portfolio per scalp
+  scalpMinScore:       +(process.env.SCALP_MIN_SCORE     || 70),          // higher confidence required
+  scalpTrailingPct:    +(process.env.SCALP_TRAILING_PCT  || 0.15) / 100, // tight trailing stop 0.15%
+
   // Supabase
   supabaseUrl: process.env.SUPABASE_URL || '',
   supabaseKey: process.env.SUPABASE_ANON_KEY || '',
@@ -122,7 +134,23 @@ async function loadRemoteConfig() {
     if (s.regime_filter     !== undefined) CONFIG.regimeFilter      = !!s.regime_filter;
     if (s.correlation_filter !== undefined) CONFIG.correlationFilter = !!s.correlation_filter;
 
-    log('sys', `Remote config loaded from Supabase — strategy:${CONFIG.strategy} symbols:${CONFIG.symbols.length} RSI:${CONFIG.rsiOversold}/${CONFIG.rsiOverbought}`);
+    // Mode flags — controlled from dashboard
+    if (s.swing_enabled !== undefined) CONFIG.swingEnabled = !!s.swing_enabled;
+    if (s.scalp_mode    !== undefined) CONFIG.scalpMode    = !!s.scalp_mode;
+
+    // Scalp settings
+    if (s.scalp_tp_pct)        CONFIG.scalpTpPct        = +s.scalp_tp_pct        / 100;
+    if (s.scalp_sl_pct)        CONFIG.scalpSlPct        = +s.scalp_sl_pct        / 100;
+    if (s.scalp_max_hold_mins) CONFIG.scalpMaxHoldMins  = +s.scalp_max_hold_mins;
+    if (s.scalp_max_positions) CONFIG.scalpMaxPositions = +s.scalp_max_positions;
+    if (s.scalp_position_pct)  CONFIG.scalpPositionPct  = +s.scalp_position_pct  / 100;
+    if (s.scalp_min_score)     CONFIG.scalpMinScore     = +s.scalp_min_score;
+    if (s.scalp_symbols)       CONFIG.scalpSymbols      = s.scalp_symbols.split(',').map(x => x.trim().toUpperCase());
+
+    const modes = [];
+    if (CONFIG.swingEnabled !== false) modes.push('Swing');
+    if (CONFIG.scalpMode)              modes.push('Scalp⚡');
+    log('sys', `Remote config loaded — Modes: ${modes.join('+')||'none'} | Symbols: ${CONFIG.symbols.length} | RSI: ${CONFIG.rsiOversold}/${CONFIG.rsiOverbought}`);
   } catch(e) {
     log('warn', `Could not load remote config: ${e.message} — using defaults`);
   }
@@ -409,6 +437,13 @@ let totalLosses         = 0;
 let dailyStartPortfolio = CONFIG.startingCapital;
 let circuitBreakerOn    = false;
 let lastScanTime        = null;
+
+// Scalp-specific state
+let scalpPositions      = {};   // { SYM: { entryPrice, qty, entryTime, stopPrice, tpPrice, highWater, direction } }
+let scalpWins           = 0;
+let scalpLosses         = 0;
+let lastScalpScan       = 0;
+const SCALP_SCAN_INTERVAL_MS = 5000; // scalp scans every 5 seconds
 
 // ─────────────────────────────────────────────
 // LOGGING
@@ -1210,11 +1245,18 @@ async function runScan() {
     return;
   }
 
+  // Reload settings from dashboard on every scan
+  await loadRemoteConfig();
+
+  // If swing mode is disabled, skip signal scanning (scalp still runs separately)
+  if (CONFIG.swingEnabled === false) {
+    log('scan', '📈 Swing trading DISABLED from dashboard — skipping swing scan');
+    await syncAll();
+    return;
+  }
+
   log('scan', `═══ ${session} — Scanning ${CONFIG.symbols.length} symbols ═══`);
   await syncLog('sys', `Scan started — ${session} — ${CONFIG.symbols.length} symbols`);
-
-  // Reload settings from dashboard on every scan — no Render redeploy needed
-  await loadRemoteConfig();
 
   // Always sync live Alpaca positions first — prevents duplicate buys after restarts
   await syncAlpacaPositions();
@@ -1451,15 +1493,22 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
   if (!CONFIG.discordWebhook) return;
   const { default: fetch } = await import('node-fetch');
 
-  const colorMap = { buy:0x7fff6e, short:0xff5f57, cover:0xb47fff, partial:0x00e5ff, breakeven:0xffb547, circuit_breaker:0xff0000, sell:0x4da6ff, manual_close:0xb47fff };
+  const colorMap = { buy:0x7fff6e, short:0xff5f57, cover:0xb47fff, partial:0x00e5ff, breakeven:0xffb547, circuit_breaker:0xff0000, sell:0x4da6ff, manual_close:0xb47fff, scalp_entry:0x00e5ff, scalp_exit:0xffb547 };
   if (type==='sell'||type==='manual_close'){
     if (['STOP_LOSS','BREAK_EVEN_STOP'].includes(reason)) colorMap.sell=0xff5f57;
     else if (reason==='TAKE_PROFIT') colorMap.sell=0x00e5ff;
     else if (reason==='TRAILING_STOP') colorMap.sell=0xffb547;
   }
+  if (type==='scalp_exit'){
+    if (reason==='SCALP_SL')    colorMap.scalp_exit=0xff5f57;
+    if (reason==='SCALP_TP')    colorMap.scalp_exit=0x7fff6e;
+    if (reason==='SCALP_TRAIL') colorMap.scalp_exit=0x00e5ff;
+  }
 
   const iconMap = {
     buy:'🟢', short:'🔴', cover:'🔵', breakeven:'🔒', circuit_breaker:'🔴', manual_close:'🖐',
+    scalp_entry: reason === 'long' ? '⚡🟢' : '⚡🔴',
+    scalp_exit:  { SCALP_TP:'⚡🎯', SCALP_SL:'⚡🛑', SCALP_TRAIL:'⚡📉', SCALP_TIME:'⚡⏰', SCALP_REVERSE:'⚡↩️' }[reason] || '⚡📤',
     partial:{TP1:'🎯',TP2:'🎯🎯',TP3:'🎯🎯🎯'}[reason]||'🎯',
     sell:{STOP_LOSS:'🛑',BREAK_EVEN_STOP:'🔒',TAKE_PROFIT:'🎯',TRAILING_STOP:'📉',
           TIME_STOP:'⏰',VOL_SQUEEZE:'📊',RESISTANCE_EXIT:'🧱',SIGNAL:'🔵'}[reason]||'🔵',
@@ -1469,6 +1518,8 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
     cover:'Short Covered', breakeven:'Break-Even Stop Set 🔒',
     circuit_breaker:'⛔ CIRCUIT BREAKER', partial:`Partial Exit — ${reason}`,
     manual_close:'🖐 Position Manually Closed',
+    scalp_entry: `⚡ Scalp ${(reason||'long').toUpperCase()} Entry`,
+    scalp_exit:  { SCALP_TP:'⚡🎯 Scalp Take Profit', SCALP_SL:'⚡🛑 Scalp Stop Loss', SCALP_TRAIL:'⚡📉 Scalp Trailing Stop', SCALP_TIME:'⚡⏰ Scalp Time Stop', SCALP_REVERSE:'⚡↩️ Scalp Signal Reversal' }[reason] || '⚡ Scalp Exit',
     sell:{STOP_LOSS:'Stop Loss Hit',BREAK_EVEN_STOP:'Break-Even Stop Hit 🔒',
           TAKE_PROFIT:'Take Profit ✅',TRAILING_STOP:'Trailing Stop',
           TIME_STOP:'⏰ Time Stop',VOL_SQUEEZE:'📊 Vol Squeeze Exit',
@@ -1547,8 +1598,429 @@ async function sendDailySummary() {
   log('sys', `Daily reset complete. New baseline: $${realDailyStartEquity.toFixed(2)}`);
 }
 
-// ─────────────────────────────────────────────
-// STARTUP + SCHEDULER
+// ═══════════════════════════════════════════════════════════════════
+// SCALPING ENGINE
+// ═══════════════════════════════════════════════════════════════════
+//
+// Scalping targets small, fast moves — 0.2-0.5% — in and out quickly.
+// Uses 1-minute bars for precision, requires strong confluence of:
+//   - Price action (candle structure)
+//   - Momentum (VWAP, EMA9, EMA21)
+//   - Volume (must be above average — confirms intent)
+//   - Microstructure (bid/ask spread, candle wicks)
+//   - Regime (only scalp when SPY is not in a sharp downtrend)
+// Exits are managed every 5 seconds, never holds more than 8 minutes.
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Fetch 1-minute bars for scalping precision
+ */
+async function fetchScalpBars(symbol, limit = 30) {
+  try {
+    const start = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // last 2 hours
+    const url   = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=1Min&start=${start}&limit=${limit}&feed=iex`;
+    const data  = await alpacaFetch(url);
+    if (data.bars && data.bars.length >= 10) return data.bars;
+  } catch(e) {}
+
+  // Yahoo Finance fallback (1m bars, last 1 day)
+  try {
+    const { default: fetch } = await import('node-fetch');
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
+    const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) return null;
+    const timestamps = result.timestamp || [];
+    const q = result.indicators?.quote?.[0] || {};
+    const bars = timestamps.map((t, i) => ({
+      t: new Date(t * 1000).toISOString(),
+      o: q.open?.[i], h: q.high?.[i], l: q.low?.[i],
+      c: q.close?.[i], v: q.volume?.[i] || 0,
+    })).filter(b => b.c != null && b.h != null).slice(-limit);
+    if (bars.length >= 10) return bars;
+  } catch(e) {}
+
+  return null;
+}
+
+/**
+ * Fetch latest trade price (most current — better than bar close for scalping)
+ */
+async function fetchLatestTrade(symbol) {
+  try {
+    const data = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/trades/latest?feed=iex`);
+    return data?.trade?.p || null;
+  } catch(e) { return null; }
+}
+
+/**
+ * Scalp signal generator — uses 1-minute precision
+ *
+ * Scoring system (max ~130 points, need 70 to fire):
+ *   Momentum  : EMA9 vs EMA21, price vs VWAP, candle body direction
+ *   Pressure  : Volume spike, consecutive bullish/bearish candles
+ *   Structure : Higher highs/lower lows, candle wicks (rejection)
+ *   Volatility: ATR expanding (means a move is starting)
+ */
+function generateScalpSignal(sym, bars1m) {
+  if (!bars1m || bars1m.length < 15) {
+    return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Need 15+ 1m bars'] };
+  }
+
+  const closes  = bars1m.map(b => b.c);
+  const highs   = bars1m.map(b => b.h);
+  const lows    = bars1m.map(b => b.l);
+  const opens   = bars1m.map(b => b.o);
+  const volumes = bars1m.map(b => b.v);
+  const price   = closes[closes.length - 1];
+  const prev    = closes[closes.length - 2];
+  const pprev   = closes[closes.length - 3];
+
+  let buy = 0, sell = 0;
+  const reasons = [];
+
+  // ── 1. EMA 9 / 21 — primary trend on 1m ──
+  const e9  = ema(closes, 9);
+  const e21 = ema(closes, 21);
+  const pe9  = ema(closes.slice(0, -1), 9);
+  const pe21 = ema(closes.slice(0, -1), 21);
+
+  if (e9 > e21)  { buy  += 20; reasons.push(`EMA9 > EMA21 (${e9.toFixed(2)} > ${e21.toFixed(2)})`); }
+  else           { sell += 20; reasons.push(`EMA9 < EMA21 (${e9.toFixed(2)} < ${e21.toFixed(2)})`); }
+
+  // EMA crossover on 1m = strong immediate signal
+  if (pe9 <= pe21 && e9 > e21) { buy  += 20; reasons.push('🔀 EMA9/21 bullish cross on 1m'); }
+  if (pe9 >= pe21 && e9 < e21) { sell += 20; reasons.push('🔀 EMA9/21 bearish cross on 1m'); }
+
+  // ── 2. VWAP — most important intraday level ──
+  const vw = vwap(bars1m);
+  const vwapDist = (price - vw) / vw;
+
+  if (vwapDist > 0.001) {
+    buy  += 15;
+    reasons.push(`Above VWAP by ${(vwapDist*100).toFixed(2)}% ($${vw.toFixed(2)})`);
+  } else if (vwapDist < -0.001) {
+    sell += 15;
+    reasons.push(`Below VWAP by ${(Math.abs(vwapDist)*100).toFixed(2)}% ($${vw.toFixed(2)})`);
+  } else {
+    // Sitting exactly on VWAP — wait for a break
+    reasons.push(`At VWAP ($${vw.toFixed(2)}) — waiting for break`);
+    return { signal: 'HOLD', confidence: 0, score: 0, reasons };
+  }
+
+  // ── 3. Price momentum — last 3 candles ──
+  const last3Bull = price > prev && prev > pprev;
+  const last3Bear = price < prev && prev < pprev;
+
+  if (last3Bull) { buy  += 15; reasons.push('3 consecutive bullish closes'); }
+  if (last3Bear) { sell += 15; reasons.push('3 consecutive bearish closes'); }
+
+  // ── 4. Current candle body direction and size ──
+  const lastBar   = bars1m[bars1m.length - 1];
+  const body      = Math.abs(lastBar.c - lastBar.o);
+  const range     = lastBar.h - lastBar.l;
+  const bodyRatio = range > 0 ? body / range : 0;
+
+  // Strong body (>60% of range) = conviction
+  if (bodyRatio > 0.6) {
+    if (lastBar.c > lastBar.o) { buy  += 10; reasons.push(`Strong bull candle (body ${(bodyRatio*100).toFixed(0)}%)`); }
+    else                       { sell += 10; reasons.push(`Strong bear candle (body ${(bodyRatio*100).toFixed(0)}%)`); }
+  }
+
+  // ── 5. Wick rejection — pin bars show reversal or continuation ──
+  const upperWick = lastBar.h - Math.max(lastBar.c, lastBar.o);
+  const lowerWick = Math.min(lastBar.c, lastBar.o) - lastBar.l;
+
+  // Long lower wick (buyers rejected the lows) = bullish
+  if (lowerWick > body * 1.5 && lowerWick > 0.01) {
+    buy  += 10;
+    reasons.push(`Lower wick rejection (${(lowerWick/price*100).toFixed(2)}%)`);
+  }
+  // Long upper wick (sellers rejected the highs) = bearish
+  if (upperWick > body * 1.5 && upperWick > 0.01) {
+    sell += 10;
+    reasons.push(`Upper wick rejection (${(upperWick/price*100).toFixed(2)}%)`);
+  }
+
+  // ── 6. Volume confirmation — must be above 1.2x average ──
+  const avgVol = volumes.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, volumes.length);
+  const curVol = volumes[volumes.length - 1];
+  const volRatio = avgVol > 0 ? curVol / avgVol : 1;
+
+  if (volRatio >= 1.5) {
+    // High volume — strongly confirms whichever direction
+    buy > sell ? buy += 20 : sell += 20;
+    reasons.push(`Volume ${volRatio.toFixed(1)}x avg — strong confirmation`);
+  } else if (volRatio >= 1.2) {
+    buy > sell ? buy += 10 : sell += 10;
+    reasons.push(`Volume ${volRatio.toFixed(1)}x avg — moderate confirmation`);
+  } else if (volRatio < 0.7) {
+    // Low volume scalp = dangerous, likely to reverse
+    reasons.push(`⚠ Low volume (${volRatio.toFixed(1)}x) — scalp rejected`);
+    return { signal: 'HOLD', confidence: 0, score: 0, reasons };
+  }
+
+  // ── 7. ATR expansion — volatility must be alive for scalping ──
+  const atrVal = atr(bars1m, 10);
+  const atrPct = price > 0 ? (atrVal / price) * 100 : 0;
+
+  if (atrPct < 0.05) {
+    // Market is frozen — spread will eat any gain
+    reasons.push(`⚠ ATR too low (${atrPct.toFixed(3)}%) — market frozen`);
+    return { signal: 'HOLD', confidence: 0, score: 0, reasons };
+  }
+  if (atrPct > 0.08) {
+    buy > sell ? buy += 10 : sell += 10;
+    reasons.push(`ATR ${atrPct.toFixed(3)}% — good volatility`);
+  }
+
+  // ── 8. Higher highs / lower lows structure ──
+  const recentHighs = highs.slice(-5);
+  const recentLows  = lows.slice(-5);
+  const higherHighs = recentHighs[4] > recentHighs[3] && recentHighs[3] > recentHighs[2];
+  const lowerLows   = recentLows[4]  < recentLows[3]  && recentLows[3]  < recentLows[2];
+
+  if (higherHighs && buy > sell)  { buy  += 10; reasons.push('Structure: higher highs forming'); }
+  if (lowerLows   && sell > buy)  { sell += 10; reasons.push('Structure: lower lows forming'); }
+
+  // ── 9. RSI on 1m — only for extreme readings ──
+  const r1m = rsi(closes, 9); // shorter period for 1m scalping
+  if (r1m < 25)      { buy  += 10; reasons.push(`1m RSI oversold (${r1m.toFixed(0)})`); }
+  else if (r1m > 75) { sell += 10; reasons.push(`1m RSI overbought (${r1m.toFixed(0)})`); }
+
+  // ── Final score ──
+  const total      = buy + sell;
+  const confidence = total > 0 ? Math.round(Math.max(buy, sell) / total * 100) : 0;
+  const minScore   = CONFIG.scalpMinScore;
+
+  if (buy >= minScore && buy > sell * 1.5)  {
+    return { signal: 'BUY',  confidence, score: buy,  reasons, atr: atrVal, vwap: vw, rsi: r1m };
+  }
+  if (sell >= minScore && sell > buy * 1.5) {
+    return { signal: 'SELL', confidence, score: sell, reasons, atr: atrVal, vwap: vw, rsi: r1m };
+  }
+
+  reasons.push(`Score insufficient (buy=${buy} sell=${sell} need ${minScore})`);
+  return { signal: 'HOLD', confidence, score: Math.max(buy, sell), reasons, atr: atrVal, vwap: vw };
+}
+
+/**
+ * Enter a scalp position (long or short)
+ */
+async function enterScalp(sym, price, sigInfo, direction = 'long') {
+  if (checkCircuitBreaker()) return;
+  if (!isMarketOpen()) { log('scalp', `Scalp blocked — market closed`); return; }
+  if (scalpPositions[sym]) { log('scalp', `Already in scalp position for ${sym}`); return; }
+  if (Object.keys(scalpPositions).length >= CONFIG.scalpMaxPositions) {
+    log('scalp', `Max scalp positions (${CONFIG.scalpMaxPositions}) reached`);
+    return;
+  }
+
+  // Position sizing — flat % of portfolio, no ATR sizing for scalps (moves too small)
+  const budget = portfolio * CONFIG.scalpPositionPct;
+  const qty    = Math.floor(budget / price);
+  if (qty < 1) { log('scalp', `Scalp ${sym}: qty too small (budget=$${budget.toFixed(2)} price=$${price.toFixed(2)})`); return; }
+
+  const cost = qty * price;
+  if (cost > portfolio) { log('scalp', `Scalp ${sym}: insufficient cash`); return; }
+
+  // Tight stops — scalping lives and dies by discipline
+  const atrVal   = sigInfo.atr || price * 0.002;
+  const slOffset = Math.max(atrVal * 0.5, price * CONFIG.scalpSlPct);
+  const tpOffset = Math.max(atrVal * 1.0, price * CONFIG.scalpTpPct);
+
+  const stopPrice = direction === 'long'  ? price - slOffset : price + slOffset;
+  const tpPrice   = direction === 'long'  ? price + tpOffset : price - tpOffset;
+
+  // Place order
+  const side = direction === 'long' ? 'buy' : 'sell';
+  if (CONFIG.alpacaKey && CONFIG.mode === 'alpaca') {
+    try { await placeOrder(sym, qty, side); }
+    catch(e) { log('error', `Scalp order failed ${sym}: ${e.message}`); return; }
+  }
+
+  portfolio -= direction === 'long' ? cost : 0;
+
+  scalpPositions[sym] = {
+    entryPrice: price, qty, cost,
+    direction,
+    entryTime:  new Date(),
+    highWater:  price,
+    lowWater:   price,
+    stopPrice,
+    tpPrice,
+    atrAtEntry: atrVal,
+    trailingActive: false,
+    sigInfo,
+  };
+
+  const slPct = ((Math.abs(price - stopPrice) / price) * 100).toFixed(2);
+  const tpPct = ((Math.abs(tpPrice - price)   / price) * 100).toFixed(2);
+  log('scalp', `⚡ ${direction.toUpperCase()} SCALP ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)}(-${slPct}%) TP=$${tpPrice.toFixed(2)}(+${tpPct}%) | conf=${sigInfo.confidence}%`);
+
+  trades.push({ time: new Date(), sym, side: direction === 'long' ? 'SCALP_BUY' : 'SCALP_SHORT', qty, price, pnl: null, reason: 'SCALP', confidence: sigInfo.confidence });
+  await syncTrade({ sym, side: direction === 'long' ? 'SCALP_BUY' : 'SCALP_SHORT', qty, price, pnl: null, reason: 'SCALP', confidence: sigInfo.confidence });
+  await sendDiscordAlert('scalp_entry', sym, qty, price, undefined, direction, sigInfo, { stopPrice, tpPrice, atrVal });
+  await syncLog('buy', `⚡ SCALP ${direction.toUpperCase()} ${qty}x ${sym} @ $${price.toFixed(2)} SL=$${stopPrice.toFixed(2)} TP=$${tpPrice.toFixed(2)} conf=${sigInfo.confidence}%`);
+}
+
+/**
+ * Exit a scalp position with reason
+ */
+async function exitScalp(sym, price, reason) {
+  const pos = scalpPositions[sym];
+  if (!pos) return;
+
+  const { qty, entryPrice, direction } = pos;
+  const side = direction === 'long' ? 'sell' : 'buy';
+
+  if (CONFIG.alpacaKey && CONFIG.mode === 'alpaca') {
+    try { await placeOrder(sym, qty, side); }
+    catch(e) { log('error', `Scalp exit failed ${sym}: ${e.message}`); return; }
+  }
+
+  const pnl = direction === 'long'
+    ? (price - entryPrice) * qty
+    : (entryPrice - price) * qty;
+
+  portfolio += direction === 'long' ? qty * price : pnl;
+  pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++);
+
+  delete scalpPositions[sym];
+
+  const holdSecs = Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 1000);
+  const icons = { SCALP_TP:'🎯', SCALP_SL:'🛑', SCALP_TRAIL:'📉', SCALP_TIME:'⏰', SCALP_REVERSE:'↩️', SCALP_MANUAL:'🖐' };
+  const icon  = icons[reason] || '📤';
+  log('scalp', `${icon} SCALP EXIT ${qty}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} | Held: ${holdSecs}s | (${reason})`);
+
+  trades.push({ time: new Date(), sym, side: 'SCALP_EXIT', qty, price, pnl, reason });
+  await syncTrade({ sym, side: 'SCALP_EXIT', qty, price, pnl, reason });
+  await sendDiscordAlert('scalp_exit', sym, qty, price, pnl, reason, pos.sigInfo);
+  await syncLog('sell', `${icon} SCALP EXIT ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason}) ${holdSecs}s`);
+  await syncAll();
+}
+
+/**
+ * Manage all open scalp positions — called every 5 seconds
+ * Precision exit logic: TP, SL, trailing, time stop, signal reversal
+ */
+async function manageScalpPositions() {
+  if (Object.keys(scalpPositions).length === 0) return;
+
+  for (const [sym, pos] of Object.entries(scalpPositions)) {
+    // Get latest price — use trade price for max precision
+    let price = await fetchLatestTrade(sym);
+    if (!price) {
+      // Fallback to last bar close
+      const bars = await fetchScalpBars(sym, 3);
+      price = bars ? bars[bars.length - 1].c : null;
+    }
+    if (!price) continue;
+
+    const { direction, entryPrice, stopPrice, tpPrice, highWater, lowWater } = pos;
+    const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
+
+    // Update high/low water marks
+    if (direction === 'long'  && price > pos.highWater) scalpPositions[sym].highWater = price;
+    if (direction === 'short' && price < pos.lowWater)  scalpPositions[sym].lowWater  = price;
+
+    // ── 1. Take profit ──
+    const hitTP = direction === 'long' ? price >= tpPrice : price <= tpPrice;
+    if (hitTP) { await exitScalp(sym, price, 'SCALP_TP'); continue; }
+
+    // ── 2. Stop loss ──
+    const hitSL = direction === 'long' ? price <= stopPrice : price >= stopPrice;
+    if (hitSL) { await exitScalp(sym, price, 'SCALP_SL'); continue; }
+
+    // ── 3. Trailing stop — activates once 50% of TP distance is covered ──
+    const tpDist  = Math.abs(tpPrice - entryPrice);
+    const moved   = direction === 'long' ? price - entryPrice : entryPrice - price;
+    if (moved >= tpDist * 0.5) {
+      if (!scalpPositions[sym].trailingActive) {
+        scalpPositions[sym].trailingActive = true;
+        log('scalp', `${sym} trailing stop activated`);
+      }
+      // Trail at CONFIG.scalpTrailingPct below/above the high/low water
+      const trail = direction === 'long'
+        ? scalpPositions[sym].highWater * (1 - CONFIG.scalpTrailingPct)
+        : scalpPositions[sym].lowWater  * (1 + CONFIG.scalpTrailingPct);
+      // Ratchet the stop — only moves in favor, never against
+      if (direction === 'long'  && trail > scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trail;
+      if (direction === 'short' && trail < scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trail;
+    }
+
+    // ── 4. Time stop — scalps must not sit idle ──
+    if (holdMins >= CONFIG.scalpMaxHoldMins) {
+      log('scalp', `⏰ Scalp time stop: ${sym} held ${holdMins.toFixed(1)}m`);
+      await exitScalp(sym, price, 'SCALP_TIME');
+      continue;
+    }
+
+    // ── 5. Signal reversal — exit if 1m signal flips strongly against us ──
+    const bars1m = await fetchScalpBars(sym, 20);
+    if (bars1m) {
+      const sig = generateScalpSignal(sym, bars1m);
+      const reversed = (direction === 'long'  && sig.signal === 'SELL' && sig.score >= CONFIG.scalpMinScore)
+                    || (direction === 'short' && sig.signal === 'BUY'  && sig.score >= CONFIG.scalpMinScore);
+      if (reversed) {
+        log('scalp', `↩️ Signal reversal: ${sym} ${direction} → exiting`);
+        await exitScalp(sym, price, 'SCALP_REVERSE');
+        continue;
+      }
+    }
+
+    // Log current scalp status
+    const pnlNow = direction === 'long' ? (price - entryPrice) * pos.qty : (entryPrice - price) * pos.qty;
+    log('scalp', `${sym} ${direction.toUpperCase()} ${pos.qty}x @ $${entryPrice.toFixed(2)} → $${price.toFixed(2)} | P&L: ${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)} | ${holdMins.toFixed(1)}m | SL=$${pos.stopPrice.toFixed(2)} TP=$${tpPrice.toFixed(2)}`);
+  }
+}
+
+/**
+ * Scalp scan — runs every 5 seconds on SCALP_SYMBOLS only
+ */
+async function runScalpScan() {
+  if (!CONFIG.scalpMode) return;
+  if (!isMarketOpen()) return;
+  if (checkCircuitBreaker()) return;
+
+  // First manage existing positions (most important)
+  await manageScalpPositions();
+
+  // Check if we have room for new positions
+  const openScalps = Object.keys(scalpPositions).length;
+  if (openScalps >= CONFIG.scalpMaxPositions) return;
+
+  // Scan scalp symbols for entries
+  for (const sym of CONFIG.scalpSymbols) {
+    if (scalpPositions[sym]) continue; // already in position
+    if (positions[sym] || shortPositions[sym]) continue; // don't scalp what we're swinging
+
+    try {
+      const bars1m = await fetchScalpBars(sym, 30);
+      if (!bars1m || bars1m.length < 15) continue;
+
+      const sig = generateScalpSignal(sym, bars1m);
+      const price = bars1m[bars1m.length - 1].c;
+
+      if (sig.score > 0) {
+        log('scalp', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (score:${sig.score} conf:${sig.confidence}%)`);
+      }
+
+      if (sig.signal === 'BUY') {
+        await enterScalp(sym, price, sig, 'long');
+      } else if (sig.signal === 'SELL' && SHORTING_ENABLED) {
+        await enterScalp(sym, price, sig, 'short');
+      }
+    } catch(e) {
+      log('error', `Scalp scan error ${sym}: ${e.message}`);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// END SCALPING ENGINE
+// ═══════════════════════════════════════════════════════════════════
 // ─────────────────────────────────────────────
 log('sys', '══════════════════════════════════════════');
 log('sys', '   TradeCore Pro — Upgraded Engine v4     ');
@@ -1556,6 +2028,7 @@ log('sys', '   + 10s scan + live dashboard refresh    ');
 log('sys', '══════════════════════════════════════════');
 log('sys', `Mode: ${CONFIG.mode.toUpperCase()} | Paper: ${CONFIG.alpacaPaper} | Strategy: ${CONFIG.strategy}`);
 if (BYPASS_HOURS) log('sys', '⚠️  BYPASS_HOURS=true — trading outside market hours (TEST MODE)');
+if (CONFIG.scalpMode) log('sys', `⚡ SCALP MODE ACTIVE — symbols: ${CONFIG.scalpSymbols.join(',')} | TP:${CONFIG.scalpTpPct*100}% SL:${CONFIG.scalpSlPct*100}% MaxHold:${CONFIG.scalpMaxHoldMins}m`);
 log('sys', `Symbols: ${CONFIG.symbols.join(', ')}`);
 log('sys', `Risk: SL=${CONFIG.stopLossPct*100}% TP=${CONFIG.takeProfitPct*100}% Trailing=${CONFIG.trailingStop} MaxDailyLoss=${CONFIG.maxDailyLossPct*100}%`);
 log('sys', `Filters: Trend=${CONFIG.trendFilter} Volume=${CONFIG.volumeFilter} Regime=${CONFIG.regimeFilter} Corr=${CONFIG.correlationFilter}`);
@@ -1579,12 +2052,19 @@ const PRICE_SYNC_INTERVAL_MS = 10000; // price updates every 10s
 log('sys', `Full scan every ${FULL_SCAN_INTERVAL_MS/1000}s | Price sync every ${PRICE_SYNC_INTERVAL_MS/1000}s`);
 
 async function tick() {
-  if (scanInProgress) return; // prevent overlapping scans
+  if (scanInProgress) return;
   scanInProgress = true;
   try {
     const now = Date.now();
+
+    // Scalp scan — runs every 5s independently of full scan
+    if (CONFIG.scalpMode && (now - lastScalpScan >= SCALP_SCAN_INTERVAL_MS)) {
+      lastScalpScan = now;
+      await runScalpScan();
+    }
+
+    // Full swing scan
     if (now - lastFullScan >= FULL_SCAN_INTERVAL_MS) {
-      // Full signal scan
       lastFullScan = now;
       await runScan();
     } else {
@@ -1638,6 +2118,10 @@ http.createServer((req, res) => {
     open_pnl: +openPnl.toFixed(2),
     total_value: +(portfolio + openPnl).toFixed(2),
     open_positions: Object.keys(positions).length,
+    scalp_positions: Object.keys(scalpPositions).length,
+    scalp_mode: CONFIG.scalpMode,
+    scalp_wins: scalpWins,
+    scalp_losses: scalpLosses,
     wins: totalWins, losses: totalLosses,
     win_rate: (totalWins + totalLosses) > 0 ? ((totalWins / (totalWins + totalLosses)) * 100).toFixed(1) + '%' : 'N/A',
     circuit_breaker: circuitBreakerOn,
