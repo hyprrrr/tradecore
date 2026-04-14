@@ -123,6 +123,7 @@
       <div class="dot"></div><span id="statusText">CONNECTING</span>
     </div>
     <span class="sync-info" id="syncInfo">—</span>
+    <button class="btn btn-ghost btn-sm" onclick="document.getElementById('setupBanner').style.display='block';window.scrollTo(0,0)" title="Re-enter Supabase credentials">⚙️</button>
   </div>
 </header>
 
@@ -130,11 +131,15 @@
 
   <!-- Setup Banner -->
   <div class="setup-banner" id="setupBanner">
-    <h3>⚙️ Connect to your live bot</h3>
-    <p>Enter your Supabase credentials once — saved in your browser.</p>
+    <h3>⚙️ Connect to Supabase</h3>
+    <p>Enter your Supabase credentials — saved in your browser. Find them at supabase.com → Settings → API.</p>
     <input type="text" id="sbUrlInput" placeholder="https://felavhxfmieoclvtmcth.supabase.co">
-    <input type="text" id="sbKeyInput" placeholder="anon key (eyJ…)" style="margin-top:8px">
-    <br><button class="btn btn-primary btn-sm" style="margin-top:12px" onclick="saveSupabaseConfig()">💾 Connect Dashboard</button>
+    <input type="text" id="sbKeyInput" placeholder="anon/publishable key (sb_publishable_… or eyJ…)" style="margin-top:8px">
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn btn-primary btn-sm" onclick="saveSupabaseConfig()">💾 Connect</button>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('setupBanner').style.display='none'">✕ Close</button>
+      <button class="btn btn-ghost btn-sm" onclick="localStorage.removeItem('tc_sb_url');localStorage.removeItem('tc_sb_key');document.getElementById('sbUrlInput').value='';document.getElementById('sbKeyInput').value='';showToast('Credentials cleared')">🗑 Clear Saved</button>
+    </div>
   </div>
 
   <!-- KPIs -->
@@ -367,14 +372,22 @@ function saveSupabaseConfig(){
   const url = document.getElementById('sbUrlInput').value.trim().replace(/\/$/,'');
   const key = document.getElementById('sbKeyInput').value.trim();
   if(!url||!key){ alert('Enter both URL and key'); return; }
+  if(!url.includes('supabase.co')){ alert('URL should look like: https://xxxx.supabase.co'); return; }
   localStorage.setItem(SB_URL_KEY, url);
   localStorage.setItem(SB_KEY_KEY, key);
   document.getElementById('setupBanner').style.display='none';
-  showToast('✓ Connected to Supabase');
-  startPolling();
+  equityLoaded = false; // reset so equity reloads with new creds
+  showToast('✓ Connected — loading data…');
+  poll(); // immediate poll with new creds
 }
 
-if(!getSbUrl()||!getSbKey()) document.getElementById('setupBanner').style.display='block';
+if(!getSbUrl()||!getSbKey()){
+  document.getElementById('setupBanner').style.display='block';
+} else {
+  // Pre-fill inputs in case user wants to update
+  document.getElementById('sbUrlInput').value = getSbUrl();
+  document.getElementById('sbKeyInput').value = getSbKey();
+}
 
 async function sbGet(table, params=''){
   const url=getSbUrl(), key=getSbKey();
@@ -539,30 +552,34 @@ async function testDiscord(){
 let equityHistory=[], equityLoaded=false, lastTradeIds=new Set(), lastLogIds=new Set(), chartCtx=null;
 
 async function poll(){
-  const [portfolio, positions, trades, logs, equity] = await Promise.all([
+  // Core tables — these must exist
+  const [portfolio, positions, trades, logs] = await Promise.all([
     sbGet('tc_portfolio','?id=eq.1'),
     sbGet('tc_positions','?order=updated_at.desc'),
     sbGet('tc_trades','?order=created_at.desc&limit=60'),
     sbGet('tc_logs','?order=created_at.desc&limit=100'),
-    // Load equity history once on first poll
-    equityLoaded ? Promise.resolve(null) : sbGet('tc_equity','?order=created_at.asc&limit=500'),
   ]);
 
   if(!portfolio||portfolio.length===0){ setOffline(); return; }
 
-  // Load historical equity on first poll
-  if(!equityLoaded && equity && equity.length > 0){
-    equityHistory = equity.map(e => +e.value);
+  // Equity history — optional, won't crash if table missing
+  if(!equityLoaded){
+    try {
+      const eq = await sbGet('tc_equity','?order=created_at.asc&limit=500');
+      if(eq && Array.isArray(eq) && eq.length > 0){
+        equityHistory = eq.map(e=>+e.value).filter(v=>!isNaN(v)&&v>0);
+      }
+    } catch(e){ /* table doesn't exist yet — fine */ }
     equityLoaded = true;
   }
 
-  const p = portfolio[0];
-  const posData = positions||[];
-  const tradeData = trades||[];
+  const p         = portfolio[0];
+  const posData   = positions  || [];
+  const tradeData = trades     || [];
   updateKPIs(p, posData, tradeData);
   updatePositions(posData);
   updateTrades(tradeData);
-  updateLogs(logs||[]);
+  updateLogs(logs || []);
   setOnline();
   document.getElementById('syncInfo').textContent = 'Updated '+new Date().toLocaleTimeString();
 }
@@ -846,8 +863,21 @@ function updateSessionMap(){
 }
 
 // ─── STATUS ───
-function setOnline(){ document.getElementById('statusPill').className='status-pill live'; document.getElementById('statusText').textContent='LIVE'; }
-function setOffline(){ document.getElementById('statusPill').className='status-pill offline'; document.getElementById('statusText').textContent='OFFLINE'; if(!getSbUrl()) document.getElementById('setupBanner').style.display='block'; }
+function setOnline(){
+  document.getElementById('statusPill').className='status-pill live';
+  document.getElementById('statusText').textContent='LIVE';
+}
+function setOffline(){
+  document.getElementById('statusPill').className='status-pill offline';
+  document.getElementById('statusText').textContent='OFFLINE';
+  // Only show setup banner if no credentials stored
+  if(!getSbUrl()||!getSbKey()){
+    document.getElementById('setupBanner').style.display='block';
+  } else {
+    // Creds exist but can't connect — show reconnect option
+    document.getElementById('syncInfo').textContent='⚠ Cannot reach Supabase — retrying…';
+  }
+}
 
 // ─── TOAST ───
 function showToast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2500); }
