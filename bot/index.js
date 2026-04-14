@@ -995,11 +995,55 @@ async function syncAlpacaPositions() {
     log('error', `Failed to sync Alpaca positions: ${e.message}`);
   }
 }
+
+async function storePrevClose() {
   for (const sym of CONFIG.symbols) {
     try {
       const bars = await fetchBars(sym, '1Day', 2);
       if (bars?.length >= 1) prevDayClose[sym] = bars[bars.length - 1].c;
     } catch (e) {}
+  }
+}
+
+// Sync live prices every 60s using Alpaca positions API
+async function syncPricesOnly() {
+  if (!CONFIG.alpacaKey) return;
+  try {
+    const alpacaPos = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
+    if (!Array.isArray(alpacaPos) || alpacaPos.length === 0) return;
+
+    for (const ap of alpacaPos) {
+      const sym    = ap.symbol;
+      const cur    = +ap.current_price;
+      const pnl    = +ap.unrealized_pl;
+      const pnlPct = +ap.unrealized_plpc * 100;
+
+      // Update in-memory
+      if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
+      priceHistory5m[sym].push(cur);
+      if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
+      if (positions[sym] && cur > positions[sym].highWater) positions[sym].highWater = cur;
+
+      // Push to Supabase
+      await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
+        current_price: +cur.toFixed(4),
+        pnl:           +pnl.toFixed(2),
+        pnl_pct:       +pnlPct.toFixed(4),
+        updated_at:    new Date().toISOString(),
+      });
+      log('price', `${sym} $${cur.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
+    }
+
+    // Update cash from Alpaca account
+    const acct = await getAccount();
+    if (acct?.cash) {
+      await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+        cash:       +parseFloat(acct.cash).toFixed(2),
+        updated_at: new Date().toISOString(),
+      });
+    }
+  } catch (e) {
+    log('error', `syncPricesOnly: ${e.message}`);
   }
 }
 
@@ -1128,6 +1172,7 @@ cron.schedule('55 8 * * 1-5', storePrevClose, { timezone: 'America/New_York' });
 
 // Run immediately on startup
 runScan();
+setTimeout(syncPricesOnly, 5000); // sync prices 5s after startup
 
 // ─────────────────────────────────────────────
 // HEALTH ENDPOINT
