@@ -536,17 +536,26 @@ async function testDiscord(){
 }
 
 // ─── POLL ───
-let equityHistory=[], lastTradeIds=new Set(), lastLogIds=new Set(), chartCtx=null;
+let equityHistory=[], equityLoaded=false, lastTradeIds=new Set(), lastLogIds=new Set(), chartCtx=null;
 
 async function poll(){
-  const [portfolio, positions, trades, logs] = await Promise.all([
+  const [portfolio, positions, trades, logs, equity] = await Promise.all([
     sbGet('tc_portfolio','?id=eq.1'),
     sbGet('tc_positions','?order=updated_at.desc'),
     sbGet('tc_trades','?order=created_at.desc&limit=60'),
     sbGet('tc_logs','?order=created_at.desc&limit=100'),
+    // Load equity history once on first poll
+    equityLoaded ? Promise.resolve(null) : sbGet('tc_equity','?order=created_at.asc&limit=500'),
   ]);
 
   if(!portfolio||portfolio.length===0){ setOffline(); return; }
+
+  // Load historical equity on first poll
+  if(!equityLoaded && equity && equity.length > 0){
+    equityHistory = equity.map(e => +e.value);
+    equityLoaded = true;
+  }
+
   const p = portfolio[0];
   const posData = positions||[];
   const tradeData = trades||[];
@@ -569,42 +578,24 @@ function getStartingCapital(){
 
 // Don't lock startingCapital — recalculate all time P&L fresh every poll
 function updateKPIs(p, positions, trades){
-  const cash     = +p.cash;
-  const wins     = p.total_wins, losses = p.total_losses, total = wins+losses;
-  const startCap = getStartingCapital();
+  const cash      = +p.cash;
+  const equity    = +p.total_value; // Alpaca's real equity value
+  const wins      = +p.total_wins, losses = +p.total_losses, total = wins+losses;
+  const startCap  = getStartingCapital();
+  const dayPnl    = +p.day_pnl; // from Alpaca: today's equity - yesterday's equity
 
-  // Sanity check — if cash looks wrong (e.g. mid-sync), skip this update
-  if (isNaN(cash) || cash <= 0 || cash > startCap * 3) return;
+  // Sanity checks
+  if(isNaN(equity) || equity <= 0 || equity > startCap * 5) return;
+  if(isNaN(dayPnl) || Math.abs(dayPnl) > startCap) return;
 
-  // Total value = cash (what's not deployed) + current market value of open positions
-  // current market value = entry_price * qty + unrealized_pnl
-  const openMarketValue = positions.reduce((acc, pos) => {
-    const qty          = +pos.qty;
-    const entryPrice   = +pos.entry_price;
-    const unrealPnl    = +pos.pnl; // from Alpaca: unrealized_pl
-    const marketValue  = entryPrice * qty + unrealPnl;
-    return acc + marketValue;
-  }, 0);
-
-  const totalValue = cash + openMarketValue;
-
-  // Sanity check total value
-  if (totalValue > startCap * 3 || totalValue < 0) return;
-
-  // Unrealized P&L = sum of Alpaca's unrealized_pl per position
-  const unrealizedPnl = positions.reduce((acc, pos) => acc + +pos.pnl, 0);
-
-  // Realized today = SELL trades only (BUY trades have null pnl)
-  const todayStr = new Date().toLocaleDateString();
-  const realizedToday = (trades||[])
-    .filter(t => t.side === 'SELL' && t.pnl !== null && new Date(t.created_at).toLocaleDateString() === todayStr)
-    .reduce((acc, t) => acc + +t.pnl, 0);
-
-  const dayPnl     = realizedToday + unrealizedPnl;
-  const allTimePnl = totalValue - startCap;
+  // All time P&L
+  const allTimePnl = equity - startCap;
   const allTimePct = ((allTimePnl / startCap) * 100).toFixed(2);
 
-  document.getElementById('portfolioVal').textContent = '$' + totalValue.toFixed(2);
+  // Unrealized from positions
+  const unrealized = positions.reduce((acc, pos) => acc + +pos.pnl, 0);
+
+  document.getElementById('portfolioVal').textContent = '$' + equity.toFixed(2);
   const chEl = document.getElementById('portfolioChange');
   chEl.textContent = `${allTimePnl>=0?'+':''}$${allTimePnl.toFixed(2)} (${allTimePct}%) all time`;
   chEl.className = 'card-sub '+(allTimePnl>=0?'green':'red');
@@ -613,8 +604,10 @@ function updateKPIs(p, positions, trades){
   pnlEl.textContent = `${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`;
   pnlEl.className = 'card-value '+(dayPnl>=0?'green':'red');
 
+  // Realized = day P&L minus unrealized
+  const realizedToday = dayPnl - unrealized;
   document.getElementById('tradeCount').textContent =
-    `Realized: ${realizedToday>=0?'+':''}$${realizedToday.toFixed(2)} | Open: ${unrealizedPnl>=0?'+':''}$${unrealizedPnl.toFixed(2)}`;
+    `Realized: ${realizedToday>=0?'+':''}$${realizedToday.toFixed(2)} | Open: ${unrealized>=0?'+':''}$${unrealized.toFixed(2)}`;
 
   const wr = total>0?((wins/total)*100).toFixed(0)+'%':'—';
   document.getElementById('winRate').textContent = wr;
@@ -626,12 +619,14 @@ function updateKPIs(p, positions, trades){
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
   if(p.session) document.getElementById('sessionBadge').textContent=p.session;
 
-  // Only add to equity history if value is reasonable (no spikes)
-  const lastVal = equityHistory[equityHistory.length - 1] || startCap;
-  const changePct = Math.abs((totalValue - lastVal) / lastVal);
-  if(changePct < 0.05) { // ignore >5% single-poll swings (data glitch)
-    equityHistory.push(+totalValue.toFixed(2));
-    if(equityHistory.length > 288) equityHistory.shift();
+  // Equity chart — append new value if changed
+  const lastVal = equityHistory[equityHistory.length - 1];
+  if(!lastVal || Math.abs(equity - lastVal) > 0.01) {
+    // Sanity check: ignore >5% single-poll swings
+    if(!lastVal || Math.abs((equity - lastVal) / lastVal) < 0.05) {
+      equityHistory.push(+equity.toFixed(2));
+      if(equityHistory.length > 1000) equityHistory.shift();
+    }
   }
   drawChart();
 }
@@ -639,44 +634,51 @@ function updateKPIs(p, positions, trades){
 function updatePositions(positions){
   document.getElementById('openPositions').textContent = positions.length;
   const el = document.getElementById('positionsList');
-  if(positions.length===0){ el.innerHTML='<div class="empty-state">No open positions.<br>Bot is scanning…</div>'; return; }
+  if(positions.length===0){
+    el.innerHTML='<div class="empty-state">No open positions.<br>Bot is scanning…</div>';
+    return;
+  }
   el.innerHTML = positions.map(p=>{
     const entryPrice   = +p.entry_price;
     const currentPrice = +p.current_price;
     const qty          = +p.qty;
-    const cost         = entryPrice * qty;
-    const liveValue    = currentPrice * qty;
-    const unrealPnl    = liveValue - cost;   // true unrealized P&L
-    const unrealPct    = ((unrealPnl / cost) * 100);
+    const pnl          = +p.pnl; // Alpaca's unrealized_pl (already correct for shorts too)
+    const pnlPct       = +p.pnl_pct;
     const conf         = p.confidence || 0;
     const region       = ETF_REGION[p.symbol] || 'US Stock';
-    const pnlColor     = unrealPnl >= 0 ? 'var(--accent2)' : 'var(--accent3)';
-    const holdMins     = p.entry_time ? Math.round((Date.now() - new Date(p.entry_time).getTime()) / 60000) : 0;
+    const isShort      = qty < 0 || p.side === 'SHORT';
+    const absQty       = Math.abs(qty);
+    const pnlColor     = pnl >= 0 ? 'var(--accent2)' : 'var(--accent3)';
+    const holdMins     = p.entry_time ? Math.round((Date.now()-new Date(p.entry_time).getTime())/60000) : 0;
     const holdStr      = holdMins < 60 ? `${holdMins}m` : `${(holdMins/60).toFixed(1)}h`;
+    const dirBadge     = isShort
+      ? `<span style="font-family:'Space Mono',monospace;font-size:9px;background:rgba(255,95,87,0.15);border:1px solid rgba(255,95,87,0.3);padding:1px 6px;border-radius:4px;color:var(--accent3)">SHORT</span>`
+      : `<span style="font-family:'Space Mono',monospace;font-size:9px;background:rgba(127,255,110,0.1);border:1px solid rgba(127,255,110,0.2);padding:1px 6px;border-radius:4px;color:var(--accent2)">LONG</span>`;
 
     return `<div class="position-row">
       <div style="flex:1">
-        <div style="display:flex;align-items:center;gap:8px">
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           <div class="pos-sym">${p.symbol}</div>
-          <span style="font-family:'Space Mono',monospace;font-size:10px;background:rgba(0,229,255,0.1);border:1px solid rgba(0,229,255,0.2);padding:1px 6px;border-radius:4px;color:var(--accent)">${region}</span>
+          ${dirBadge}
+          <span style="font-family:'Space Mono',monospace;font-size:9px;background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.15);padding:1px 6px;border-radius:4px;color:var(--accent)">${region}</span>
         </div>
         <div class="pos-meta" style="margin-top:4px">
-          ${qty} shares · Entry $${entryPrice.toFixed(2)} · Now $${currentPrice.toFixed(2)} · Held ${holdStr}
+          ${absQty} shares · Entry $${entryPrice.toFixed(2)} · Now $${currentPrice.toFixed(2)} · ${holdStr}
         </div>
-        <div style="margin-top:6px;display:flex;align-items:center;gap:8px">
-          <div class="conf-bar" style="width:60px"><div class="conf-bar-fill" style="width:${conf}%"></div></div>
+        <div style="margin-top:5px;display:flex;align-items:center;gap:8px">
+          <div class="conf-bar" style="width:60px"><div class="conf-bar-fill" style="width:${conf}%;background:${conf>70?'var(--accent2)':conf>50?'var(--warn)':'var(--accent3)'}"></div></div>
           <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">conf ${conf}%</span>
         </div>
       </div>
       <div style="text-align:right;margin-left:12px">
-        <div style="font-family:'Space Mono',monospace;font-size:18px;font-weight:700;color:${pnlColor}">
-          ${unrealPnl>=0?'+':''}$${unrealPnl.toFixed(2)}
+        <div style="font-family:'Space Mono',monospace;font-size:20px;font-weight:700;color:${pnlColor}">
+          ${pnl>=0?'+':''}$${pnl.toFixed(2)}
         </div>
         <div style="font-family:'Space Mono',monospace;font-size:11px;color:${pnlColor};margin-top:2px">
-          ${unrealPct>=0?'+':''}${unrealPct.toFixed(2)}%
+          ${pnlPct>=0?'+':''}${(+pnlPct).toFixed(2)}%
         </div>
         <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-top:2px">
-          Value: $${liveValue.toFixed(2)}
+          Mkt val: $${(currentPrice*absQty).toFixed(2)}
         </div>
       </div>
     </div>`;
@@ -690,22 +692,30 @@ function updateTrades(trades){
   const tbody = document.getElementById('tradesTbody');
   if(trades.length===0){ tbody.innerHTML='<tr><td colspan="8" class="empty-state">No trades yet</td></tr>'; return; }
   tbody.innerHTML = trades.map(t=>{
-    const pnl = t.pnl!==null?`${t.pnl>=0?'+':''}$${(+t.pnl).toFixed(2)}`:'—';
-    const pnlClass = t.pnl===null?'':(t.pnl>=0?'green':'red');
-    const badge = t.side==='BUY'?'<span class="badge badge-buy">BUY</span>'
-      :t.reason==='TAKE_PROFIT'?'<span class="badge badge-tp">TP</span>'
-      :t.reason==='STOP_LOSS'?'<span class="badge badge-sl">SL</span>'
-      :t.reason==='MANUAL_CLOSE'?'<span class="badge" style="background:rgba(180,127,255,0.15);color:#b47fff;border:1px solid rgba(180,127,255,0.3)">🖐 MANUAL</span>'
-      :'<span class="badge badge-sell">SELL</span>';
-    const icon={STOP_LOSS:'🛑',TAKE_PROFIT:'🎯',TRAILING_STOP:'📉',SIGNAL:'📤',MANUAL_CLOSE:'🖐',TIME_STOP:'⏰',VOL_SQUEEZE:'📊',RESISTANCE_EXIT:'🧱'}[t.reason]||'';
+    const pnl      = t.pnl!==null ? `${+t.pnl>=0?'+':''}$${(+t.pnl).toFixed(2)}` : '—';
+    const pnlClass = t.pnl===null ? '' : (+t.pnl>=0?'green':'red');
+
+    // Side badge
+    let badge;
+    if      (t.side==='BUY')   badge='<span class="badge badge-buy">🟢 LONG</span>';
+    else if (t.side==='SHORT') badge='<span class="badge" style="background:rgba(255,95,87,0.15);color:var(--accent3);border:1px solid rgba(255,95,87,0.3)">🔴 SHORT</span>';
+    else if (t.side==='COVER') badge='<span class="badge" style="background:rgba(180,127,255,0.15);color:#b47fff;border:1px solid rgba(180,127,255,0.3)">🔵 COVER</span>';
+    else if (t.reason==='MANUAL_CLOSE') badge='<span class="badge" style="background:rgba(180,127,255,0.15);color:#b47fff;border:1px solid rgba(180,127,255,0.3)">🖐 MANUAL</span>';
+    else if (t.reason==='TAKE_PROFIT')  badge='<span class="badge badge-tp">🎯 TP</span>';
+    else if (t.reason==='STOP_LOSS')    badge='<span class="badge badge-sl">🛑 SL</span>';
+    else if (t.reason==='TRAILING_STOP')badge='<span class="badge badge-sell">📉 TRAIL</span>';
+    else if (t.reason==='TIME_STOP')    badge='<span class="badge badge-sell">⏰ TIME</span>';
+    else if (t.reason==='BREAK_EVEN_STOP') badge='<span class="badge" style="background:rgba(255,181,71,0.15);color:var(--warn);border:1px solid rgba(255,181,71,0.3)">🔒 BE</span>';
+    else badge='<span class="badge badge-sell">📤 SELL</span>';
+
     return `<tr>
       <td>${new Date(t.created_at).toLocaleTimeString()}</td>
-      <td style="font-weight:700">${t.symbol}</td>
+      <td style="font-weight:700;font-size:13px">${t.symbol}</td>
       <td>${badge}</td>
-      <td>${t.qty}</td>
+      <td>${Math.abs(+t.qty)}</td>
       <td>$${(+t.price).toFixed(2)}</td>
-      <td class="${pnlClass}" style="font-family:'Space Mono',monospace">${pnl}</td>
-      <td style="color:var(--muted);font-size:10px">${icon} ${t.reason||'—'}</td>
+      <td class="${pnlClass}" style="font-family:'Space Mono',monospace;font-weight:700">${pnl}</td>
+      <td style="color:var(--muted);font-size:10px">${t.reason||'—'}</td>
       <td style="color:var(--accent)">${t.confidence?t.confidence+'%':'—'}</td>
     </tr>`;
   }).join('');
@@ -724,31 +734,87 @@ function updateLogs(logs){
 }
 
 // ─── CHART ───
-function drawChart(){
   const canvas = document.getElementById('equityChart');
   if(!chartCtx) chartCtx=canvas.getContext('2d');
-  canvas.width=canvas.parentElement.offsetWidth;
+  canvas.width = canvas.parentElement.offsetWidth;
   const W=canvas.width, H=200;
   chartCtx.clearRect(0,0,W,H);
-  const data=equityHistory;
-  if(data.length<2){
-    chartCtx.fillStyle='#4a6372'; chartCtx.font="12px 'Space Mono'"; chartCtx.textAlign='center';
-    chartCtx.fillText('Equity curve appears after first bot scan',W/2,H/2); return;
-  }
-  const min=Math.min(...data)*0.998, max=Math.max(...data)*1.002;
-  const toX=i=>(i/(data.length-1))*(W-40)+20;
-  const toY=v=>H-20-((v-min)/(max-min))*(H-40);
-  const grad=chartCtx.createLinearGradient(0,0,0,H);
-  grad.addColorStop(0,'rgba(0,229,255,0.25)'); grad.addColorStop(1,'rgba(0,229,255,0)');
-  chartCtx.beginPath(); chartCtx.moveTo(toX(0),H-20);
-  data.forEach((v,i)=>chartCtx.lineTo(toX(i),toY(v)));
-  chartCtx.lineTo(toX(data.length-1),H-20); chartCtx.closePath();
-  chartCtx.fillStyle=grad; chartCtx.fill();
+
+  const startCap = getStartingCapital();
+  const data = equityHistory.length >= 2 ? equityHistory : null;
+
+  // Always draw baseline
+  const baselineVal = startCap;
+  const minVal = data ? Math.min(...data, baselineVal)*0.998 : baselineVal*0.99;
+  const maxVal = data ? Math.max(...data, baselineVal)*1.002 : baselineVal*1.01;
+  const range  = maxVal - minVal || 1;
+  const toX    = i => data ? (i/(data.length-1))*(W-50)+25 : W/2;
+  const toY    = v => H-25 - ((v-minVal)/range)*(H-50);
+
+  // Baseline dashed line
+  const baseY = toY(baselineVal);
+  chartCtx.save();
+  chartCtx.setLineDash([5,5]);
+  chartCtx.strokeStyle = 'rgba(74,99,114,0.7)';
+  chartCtx.lineWidth = 1;
   chartCtx.beginPath();
-  data.forEach((v,i)=>i===0?chartCtx.moveTo(toX(i),toY(v)):chartCtx.lineTo(toX(i),toY(v)));
-  chartCtx.strokeStyle='#00e5ff'; chartCtx.lineWidth=2; chartCtx.stroke();
-  chartCtx.beginPath(); chartCtx.arc(toX(data.length-1),toY(data[data.length-1]),4,0,Math.PI*2);
-  chartCtx.fillStyle='#00e5ff'; chartCtx.fill();
+  chartCtx.moveTo(25, baseY);
+  chartCtx.lineTo(W-25, baseY);
+  chartCtx.stroke();
+  chartCtx.restore();
+
+  // Baseline label
+  chartCtx.fillStyle='rgba(74,99,114,0.8)';
+  chartCtx.font="9px 'Space Mono',monospace";
+  chartCtx.textAlign='left';
+  chartCtx.fillText('$'+startCap.toLocaleString(), 28, baseY-4);
+
+  if(!data){
+    chartCtx.fillStyle='#4a6372';
+    chartCtx.font="11px 'Space Mono',monospace";
+    chartCtx.textAlign='center';
+    chartCtx.fillText('Equity curve builds as bot trades', W/2, H/2+4);
+    return;
+  }
+
+  const lastVal   = data[data.length-1];
+  const isUp      = lastVal >= startCap;
+  const lineColor = isUp ? '#7fff6e' : '#ff5f57';
+  const gradTop   = isUp ? 'rgba(127,255,110,0.3)' : 'rgba(255,95,87,0.3)';
+  const gradBot   = isUp ? 'rgba(127,255,110,0)'   : 'rgba(255,95,87,0)';
+
+  // Filled area
+  const grad = chartCtx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0, gradTop);
+  grad.addColorStop(1, gradBot);
+  chartCtx.beginPath();
+  chartCtx.moveTo(toX(0), H-25);
+  data.forEach((v,i) => chartCtx.lineTo(toX(i), toY(v)));
+  chartCtx.lineTo(toX(data.length-1), H-25);
+  chartCtx.closePath();
+  chartCtx.fillStyle = grad;
+  chartCtx.fill();
+
+  // Line
+  chartCtx.beginPath();
+  data.forEach((v,i) => i===0 ? chartCtx.moveTo(toX(i),toY(v)) : chartCtx.lineTo(toX(i),toY(v)));
+  chartCtx.strokeStyle = lineColor;
+  chartCtx.lineWidth = 2;
+  chartCtx.stroke();
+
+  // End dot
+  chartCtx.beginPath();
+  chartCtx.arc(toX(data.length-1), toY(lastVal), 4, 0, Math.PI*2);
+  chartCtx.fillStyle = lineColor;
+  chartCtx.fill();
+
+  // Current value label
+  const pnl  = lastVal - startCap;
+  const pct  = ((pnl/startCap)*100).toFixed(2);
+  chartCtx.fillStyle = lineColor;
+  chartCtx.font = "10px 'Space Mono',monospace";
+  chartCtx.textAlign = 'right';
+  chartCtx.fillText(`$${lastVal.toFixed(0)} (${pnl>=0?'+':''}${pct}%)`, W-28, toY(lastVal)-6);
 }
 
 // ─── SESSION MAP ───
