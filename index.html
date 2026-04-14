@@ -506,48 +506,41 @@ async function poll(){
   document.getElementById('syncInfo').textContent = 'Updated '+new Date().toLocaleTimeString();
 }
 
-// store starting capital from first poll
-let startingCapital = null;
-
+// Starting capital — set this to match your Alpaca account funding
 function getStartingCapital(){
-  // Try settings first, then fall back to 100000 (Alpaca paper default)
   try {
     const s = JSON.parse(localStorage.getItem('tc_settings')||'{}');
-    if(s.startingCapital) return +s.startingCapital;
+    if(s.startingCapital && +s.startingCapital > 0) return +s.startingCapital;
   } catch(e){}
   return 100000;
 }
 
+// Don't lock startingCapital — recalculate all time P&L fresh every poll
 function updateKPIs(p, positions, trades){
   const cash = +p.cash;
   const wins = p.total_wins, losses = p.total_losses, total = wins+losses;
+  const startCap = getStartingCapital();
 
-  // Open position value = current price × qty (what positions are worth RIGHT NOW)
-  const openValue = positions.reduce((acc, pos) => acc + (+pos.current_price * +pos.qty), 0);
+  // Open position value: use pnl from Supabase (set by Alpaca) + cost basis
+  const openValue = positions.reduce((acc, pos) => {
+    const cost = +pos.entry_price * +pos.qty;
+    const pnl  = +pos.pnl; // this is unrealized_pl straight from Alpaca
+    return acc + cost + pnl;
+  }, 0);
   const totalValue = cash + openValue;
 
-  // Starting capital = what you funded the account with
-  if(startingCapital === null) startingCapital = getStartingCapital();
+  // Unrealized = sum of pos.pnl (Alpaca unrealized_pl for each position)
+  const unrealizedPnl = positions.reduce((acc, pos) => acc + +pos.pnl, 0);
 
-  // Unrealized P&L = what open positions are worth vs what we paid for them
-  const unrealizedPnl = positions.reduce((acc, pos) => {
-    const cost = +pos.entry_price * +pos.qty;
-    const now  = +pos.current_price * +pos.qty;
-    return acc + (now - cost);
-  }, 0);
-
-  // Realized P&L today = sum of SELL trades today only (never BUY trades)
+  // Realized today = SELL trades today only
   const todayStr = new Date().toLocaleDateString();
   const realizedToday = (trades||[])
     .filter(t => t.side === 'SELL' && t.pnl !== null && new Date(t.created_at).toLocaleDateString() === todayStr)
     .reduce((acc, t) => acc + +t.pnl, 0);
 
-  // True day P&L = realized closed trades today + unrealized on open positions
-  const dayPnl = realizedToday + unrealizedPnl;
-
-  // All time P&L = total value vs starting capital
-  const allTimePnl = totalValue - startingCapital;
-  const allTimePct = startingCapital > 0 ? ((allTimePnl / startingCapital) * 100).toFixed(2) : '0.00';
+  const dayPnl     = realizedToday + unrealizedPnl;
+  const allTimePnl = totalValue - startCap;
+  const allTimePct = ((allTimePnl / startCap) * 100).toFixed(2);
 
   document.getElementById('portfolioVal').textContent = '$' + totalValue.toFixed(2);
   const chEl = document.getElementById('portfolioChange');
@@ -558,7 +551,6 @@ function updateKPIs(p, positions, trades){
   pnlEl.textContent = `${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`;
   pnlEl.className = 'card-value '+(dayPnl>=0?'green':'red');
 
-  // Breakdown label
   document.getElementById('tradeCount').textContent =
     `Realized: ${realizedToday>=0?'+':''}$${realizedToday.toFixed(2)} | Open: ${unrealizedPnl>=0?'+':''}$${unrealizedPnl.toFixed(2)}`;
 
