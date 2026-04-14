@@ -171,24 +171,33 @@ async function sbFetch(path, method = 'GET', body = null) {
 }
 
 async function syncPortfolio() {
-  // Get real values directly from Alpaca — most accurate source
-  let cashValue = portfolio;
+  let cashValue   = portfolio;
   let equityValue = portfolio;
+  let lastEquity  = 0;
 
   if (CONFIG.alpacaKey) {
     try {
       const acct = await getAccount();
-      if (acct?.cash)         cashValue   = +parseFloat(acct.cash).toFixed(2);
-      if (acct?.equity)       equityValue = +parseFloat(acct.equity).toFixed(2);
-      if (acct?.last_equity)  CONFIG._lastEquity = +parseFloat(acct.last_equity).toFixed(2);
+      if (acct?.cash)        cashValue   = +parseFloat(acct.cash).toFixed(2);
+      if (acct?.equity)      equityValue = +parseFloat(acct.equity).toFixed(2);
+      if (acct?.last_equity) lastEquity  = +parseFloat(acct.last_equity).toFixed(2);
     } catch(e) {}
   }
 
-  // Day P&L = today's equity vs yesterday's close (from Alpaca account)
-  const dayPnl = CONFIG._lastEquity
-    ? +(equityValue - CONFIG._lastEquity).toFixed(2)
-    : trades.filter(t => t.side==='SELL' && t.pnl !== null && new Date(t.time).toDateString() === new Date().toDateString())
-             .reduce((a,t) => a + t.pnl, 0);
+  // Keep real equity updated for accurate circuit breaker
+  if (equityValue > 0) {
+    realEquity = equityValue;
+    if (realDailyStartEquity === 0 && lastEquity > 0) {
+      realDailyStartEquity = lastEquity;
+      log('risk', `Circuit breaker baseline: $${lastEquity.toFixed(2)} (yesterday close)`);
+    }
+  }
+
+  // Day P&L = today's equity vs yesterday's close
+  const dayPnl = lastEquity > 0
+    ? +(equityValue - lastEquity).toFixed(2)
+    : trades.filter(t => t.side === 'SELL' && t.pnl !== null && new Date(t.time).toDateString() === new Date().toDateString())
+            .reduce((a, t) => a + t.pnl, 0);
 
   await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
     cash:            +cashValue.toFixed(2),
@@ -202,11 +211,13 @@ async function syncPortfolio() {
     updated_at:      new Date().toISOString(),
   });
 
-  // Store equity snapshot for the chart (every sync)
-  await sbFetch('tc_equity', 'POST', {
-    value:      +equityValue.toFixed(2),
-    created_at: new Date().toISOString(),
-  });
+  // Equity snapshot for chart (only if value looks valid)
+  if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10) {
+    await sbFetch('tc_equity', 'POST', {
+      value:      +equityValue.toFixed(2),
+      created_at: new Date().toISOString(),
+    });
+  }
 }
 
 async function syncPositions() {
@@ -775,13 +786,28 @@ function hasLargeGap(symbol, price) {
   return false;
 }
 
+// Track real equity from Alpaca for circuit breaker (not just cash)
+let realEquity = 0;
+let realDailyStartEquity = 0;
+
 function checkCircuitBreaker() {
   if (circuitBreakerOn) return true;
-  const loss = (dailyStartPortfolio - portfolio) / dailyStartPortfolio;
+
+  // Use real Alpaca equity if available, otherwise skip the check
+  // (avoids false triggers after restarts when in-memory state is wrong)
+  const equityToCheck  = realEquity          > 0 ? realEquity          : null;
+  const startToCheck   = realDailyStartEquity > 0 ? realDailyStartEquity : null;
+
+  if (!equityToCheck || !startToCheck) {
+    log('risk', 'Circuit breaker: waiting for real equity data from Alpaca…');
+    return false; // don't trip until we have real data
+  }
+
+  const loss = (startToCheck - equityToCheck) / startToCheck;
   if (loss >= CONFIG.maxDailyLossPct) {
     circuitBreakerOn = true;
-    log('risk', `🔴 CIRCUIT BREAKER: Down ${(loss*100).toFixed(1)}% today — halting all trades`);
-    sendDiscordAlert('circuit_breaker', 'ALL', 0, 0, -(dailyStartPortfolio - portfolio));
+    log('risk', `🔴 CIRCUIT BREAKER: Down ${(loss*100).toFixed(1)}% today (equity $${equityToCheck.toFixed(2)} vs start $${startToCheck.toFixed(2)}) — halting all trades`);
+    sendDiscordAlert('circuit_breaker', 'ALL', 0, 0, -(startToCheck - equityToCheck));
   }
   return circuitBreakerOn;
 }
@@ -1513,11 +1539,12 @@ async function sendDailySummary() {
   }).catch(e => log('error', `Daily summary failed: ${e.message}`));
 
   // Reset daily state
-  dailyStartPortfolio = portfolio;
-  circuitBreakerOn    = false;
+  dailyStartPortfolio  = portfolio;
+  realDailyStartEquity = realEquity; // reset to current equity for new day
+  circuitBreakerOn     = false;
   totalWins = 0; totalLosses = 0;
-  trades = trades.filter(t => t.pnl === null); // keep only open trades
-  log('sys', 'Daily reset complete');
+  trades = trades.filter(t => t.pnl === null);
+  log('sys', `Daily reset complete. New baseline: $${realDailyStartEquity.toFixed(2)}`);
 }
 
 // ─────────────────────────────────────────────
@@ -1589,6 +1616,15 @@ setTimeout(syncPricesOnly, 5000);
 // HEALTH ENDPOINT
 // ─────────────────────────────────────────────
 http.createServer((req, res) => {
+  // Manual circuit breaker reset: GET /reset-cb
+  if (req.url === '/reset-cb') {
+    circuitBreakerOn     = false;
+    realDailyStartEquity = realEquity;
+    log('risk', '🟢 Circuit breaker manually reset via /reset-cb');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, message: 'Circuit breaker reset', equity: realEquity }));
+    return;
+  }
   const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
     const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
     return acc + (cur - pos.entryPrice) * pos.qty;
