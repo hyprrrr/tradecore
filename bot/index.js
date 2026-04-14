@@ -124,22 +124,30 @@ async function sbFetch(path, method = 'GET', body = null) {
 }
 
 async function syncPortfolio() {
-  // Only store realized P&L in day_pnl — unrealized is calculated from positions table
+  // Get real cash from Alpaca account (most accurate source)
+  let cashValue = portfolio; // fallback to in-memory
+  if (CONFIG.alpacaKey) {
+    try {
+      const acct = await getAccount();
+      if (acct?.cash) cashValue = +parseFloat(acct.cash).toFixed(2);
+    } catch(e) {}
+  }
+
+  // Realized P&L today = closed SELL trades only
   const realizedDayPnl = trades
-    .filter(t => t.pnl !== null && new Date(t.time).toDateString() === new Date().toDateString())
+    .filter(t => t.side === 'SELL' && t.pnl !== null && new Date(t.time).toDateString() === new Date().toDateString())
     .reduce((acc, t) => acc + t.pnl, 0);
 
-  // total_value = cash only (positions stored separately)
   await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
-    cash: +portfolio.toFixed(2),
-    total_value: +portfolio.toFixed(2),
-    day_pnl: +realizedDayPnl.toFixed(2),
-    total_wins: totalWins,
-    total_losses: totalLosses,
+    cash:           +cashValue.toFixed(2),
+    total_value:    +cashValue.toFixed(2),
+    day_pnl:        +realizedDayPnl.toFixed(2),
+    total_wins:     totalWins,
+    total_losses:   totalLosses,
     circuit_breaker: circuitBreakerOn,
-    last_scan: new Date().toISOString(),
-    session: getCurrentSession(),
-    updated_at: new Date().toISOString(),
+    last_scan:      new Date().toISOString(),
+    session:        getCurrentSession(),
+    updated_at:     new Date().toISOString(),
   });
 }
 
@@ -961,38 +969,75 @@ async function syncAlpacaPositions() {
   if (!CONFIG.alpacaKey) return;
   try {
     const data = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
-    if (Array.isArray(data)) {
-      alpacaPositions = new Set(data.map(p => p.symbol));
-      if (alpacaPositions.size > 0) {
-        log('acct', `Alpaca open positions: ${[...alpacaPositions].join(', ')}`);
-        // Also sync into local positions{} so managePosition works after restart
-        for (const p of data) {
-          if (!positions[p.symbol]) {
-            positions[p.symbol] = {
-              entryPrice:    +p.avg_entry_price,
-              qty:           +p.qty,
-              qtyRemaining:  +p.qty,
-              cost:          +p.avg_entry_price * +p.qty,
-              entryTime:     new Date(),
-              highWater:     +p.current_price,
-              atrAtEntry:    0,
-              stopPrice:     +p.avg_entry_price * (1 - CONFIG.stopLossPct),
-              breakEvenSet:  false,
-              tp1Hit:        false,
-              tp2Hit:        false,
-              srLevels:      [],
-              sigInfo:       { confidence: 0, reasons: ['Restored from Alpaca on restart'] },
-            };
-            log('sys', `Restored position from Alpaca: ${p.symbol} ${p.qty}x @ $${p.avg_entry_price}`);
-            await syncLog('sys', `Restored ${p.symbol} position from Alpaca after restart`);
-          }
-        }
-      } else {
-        alpacaPositions = new Set();
+    if (!Array.isArray(data)) return;
+
+    const liveSymbols = new Set(data.map(p => p.symbol));
+
+    // ── Detect manual closes ──
+    // If we have a position in memory but it's gone from Alpaca → manually closed
+    for (const sym of Object.keys(positions)) {
+      if (!liveSymbols.has(sym)) {
+        const pos = positions[sym];
+        // Get the last known price
+        const lastPrice = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const qty       = pos.qtyRemaining || pos.qty;
+        const pnl       = (lastPrice - pos.entryPrice) * qty;
+
+        log('sys', `🖐 Manual close detected: ${sym} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+
+        // Update stats
+        pnl > 0 ? totalWins++ : totalLosses++;
+        portfolio += qty * lastPrice;
+
+        // Record as trade
+        trades.push({ time: new Date(), sym, side: 'SELL', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
+
+        // Remove from memory and Supabase
+        delete positions[sym];
+        alpacaPositions.delete(sym);
+        await sbFetch(`tc_positions?symbol=eq.${sym}`, 'DELETE');
+
+        // Log and alert
+        await syncTrade({ sym, side: 'SELL', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
+        await syncLog('warn', `🖐 Manual close: ${sym} ${qty}x @ ~$${lastPrice.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+        await sendDiscordAlert('manual_close', sym, qty, lastPrice, pnl, 'MANUAL_CLOSE');
+        await syncPortfolio();
       }
     }
+
+    // ── Update live set ──
+    alpacaPositions = liveSymbols;
+
+    // ── Restore positions after restart ──
+    for (const p of data) {
+      if (!positions[p.symbol]) {
+        positions[p.symbol] = {
+          entryPrice:   +p.avg_entry_price,
+          qty:          +p.qty,
+          qtyRemaining: +p.qty,
+          cost:         +p.avg_entry_price * +p.qty,
+          entryTime:    new Date(),
+          highWater:    +p.current_price,
+          atrAtEntry:   0,
+          stopPrice:    +p.avg_entry_price * (1 - CONFIG.stopLossPct),
+          breakEvenSet: false,
+          tp1Hit:       false,
+          tp2Hit:       false,
+          srLevels:     [],
+          sigInfo:      { confidence: 0, reasons: ['Restored from Alpaca on restart'] },
+        };
+        log('sys', `Restored: ${p.symbol} ${p.qty}x @ $${p.avg_entry_price}`);
+        await syncLog('sys', `Restored ${p.symbol} from Alpaca after restart`);
+        // Make sure it exists in Supabase positions table
+        await syncPositions();
+      }
+    }
+
+    if (liveSymbols.size > 0) {
+      log('acct', `Alpaca positions: ${[...liveSymbols].join(', ')}`);
+    }
   } catch (e) {
-    log('error', `Failed to sync Alpaca positions: ${e.message}`);
+    log('error', `syncAlpacaPositions: ${e.message}`);
   }
 }
 
@@ -1054,15 +1099,15 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
   if (!CONFIG.discordWebhook) return;
   const { default: fetch } = await import('node-fetch');
 
-  const colorMap = { buy:0x7fff6e, partial:0x00e5ff, breakeven:0xffb547, circuit_breaker:0xff0000, sell:0x4da6ff };
-  if (type==='sell'){
+  const colorMap = { buy:0x7fff6e, partial:0x00e5ff, breakeven:0xffb547, circuit_breaker:0xff0000, sell:0x4da6ff, manual_close:0xb47fff };
+  if (type==='sell'||type==='manual_close'){
     if (['STOP_LOSS','BREAK_EVEN_STOP'].includes(reason)) colorMap.sell=0xff5f57;
     else if (reason==='TAKE_PROFIT') colorMap.sell=0x00e5ff;
     else if (reason==='TRAILING_STOP') colorMap.sell=0xffb547;
   }
 
   const iconMap = {
-    buy:'🟢', breakeven:'🔒', circuit_breaker:'🔴',
+    buy:'🟢', breakeven:'🔒', circuit_breaker:'🔴', manual_close:'🖐',
     partial:{TP1:'🎯',TP2:'🎯🎯',TP3:'🎯🎯🎯'}[reason]||'🎯',
     sell:{STOP_LOSS:'🛑',BREAK_EVEN_STOP:'🔒',TAKE_PROFIT:'🎯',TRAILING_STOP:'📉',
           TIME_STOP:'⏰',VOL_SQUEEZE:'📊',RESISTANCE_EXIT:'🧱',SIGNAL:'🔵'}[reason]||'🔵',
@@ -1070,6 +1115,7 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
   const titleMap = {
     buy:'BUY Signal Executed', breakeven:'Break-Even Stop Set 🔒',
     circuit_breaker:'⛔ CIRCUIT BREAKER', partial:`Partial Exit — ${reason}`,
+    manual_close:'🖐 Position Manually Closed',
     sell:{STOP_LOSS:'Stop Loss Hit',BREAK_EVEN_STOP:'Break-Even Stop Hit 🔒',
           TAKE_PROFIT:'Take Profit ✅',TRAILING_STOP:'Trailing Stop',
           TIME_STOP:'⏰ Time Stop — Exiting Dead Trade',
@@ -1087,6 +1133,7 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
     {name:'Portfolio',value:`$${portfolio.toFixed(2)}`,inline:true},
     {name:'W / L',value:`${totalWins} / ${totalLosses}`,inline:true},
     {name:'Mode',value:CONFIG.alpacaPaper?'📄 Paper':'💰 LIVE',inline:true},
+    type==='manual_close' ? {name:'Source',value:'Closed manually in Alpaca/TradingView',inline:false} : null,
   ].filter(Boolean);
 
   if (type==='buy' && sigInfo?.reasons?.length) {
