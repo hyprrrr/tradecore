@@ -584,6 +584,7 @@ async function enterPosition(sym, price, sigInfo, bars) {
     breakEvenSet: false, tp1Hit: false, tp2Hit: false,
     srLevels, sigInfo,
   };
+  alpacaPositions.add(sym); // prevent duplicate buys this scan
   trades.push({ time: new Date(), sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
 
   const stopPct = ((price - stopPrice) / price * 100).toFixed(2);
@@ -633,6 +634,7 @@ async function exitPosition(sym, price, reason) {
   portfolio += qtyToSell * price;
   pnl > 0 ? totalWins++ : totalLosses++;
   delete positions[sym];
+  alpacaPositions.delete(sym);
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
   const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱' }[reason] || '📤';
@@ -791,6 +793,9 @@ async function runScan() {
   log('scan', `═══ ${session} — Scanning ${CONFIG.symbols.length} symbols ═══`);
   await syncLog('sys', `Scan started — ${session} — ${CONFIG.symbols.length} symbols`);
 
+  // Always sync live Alpaca positions first — prevents duplicate buys after restarts
+  await syncAlpacaPositions();
+
   // Market regime only matters during US hours
   const marketOk = isMarketOpen() ? await getMarketRegime() : true;
 
@@ -846,6 +851,16 @@ async function runScan() {
       await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)} ${sessionLabel}`);
 
       if (adjustedSig.signal === 'BUY' && marketOk && Object.keys(positions).length < CONFIG.maxOpenPositions) {
+        // Double-check: never buy if we already have a position in this symbol
+        // This catches cases where Render restarted and positions{} was cleared
+        if (positions[sym]) {
+          log('warn', `${sym} already in positions{} — skipping duplicate buy`);
+          continue;
+        }
+        if (alpacaPositions.has(sym)) {
+          log('warn', `${sym} already held in Alpaca account — skipping duplicate buy`);
+          continue;
+        }
         await enterPosition(sym, price, adjustedSig, bars5m);
       }
     } catch (e) {
@@ -865,7 +880,47 @@ async function runScan() {
   await syncAll();
 }
 
-async function storePrevClose() {
+// Live Alpaca positions — refreshed every scan to prevent duplicate buys
+let alpacaPositions = new Set();
+
+async function syncAlpacaPositions() {
+  if (!CONFIG.alpacaKey) return;
+  try {
+    const data = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
+    if (Array.isArray(data)) {
+      alpacaPositions = new Set(data.map(p => p.symbol));
+      if (alpacaPositions.size > 0) {
+        log('acct', `Alpaca open positions: ${[...alpacaPositions].join(', ')}`);
+        // Also sync into local positions{} so managePosition works after restart
+        for (const p of data) {
+          if (!positions[p.symbol]) {
+            positions[p.symbol] = {
+              entryPrice:    +p.avg_entry_price,
+              qty:           +p.qty,
+              qtyRemaining:  +p.qty,
+              cost:          +p.avg_entry_price * +p.qty,
+              entryTime:     new Date(),
+              highWater:     +p.current_price,
+              atrAtEntry:    0,
+              stopPrice:     +p.avg_entry_price * (1 - CONFIG.stopLossPct),
+              breakEvenSet:  false,
+              tp1Hit:        false,
+              tp2Hit:        false,
+              srLevels:      [],
+              sigInfo:       { confidence: 0, reasons: ['Restored from Alpaca on restart'] },
+            };
+            log('sys', `Restored position from Alpaca: ${p.symbol} ${p.qty}x @ $${p.avg_entry_price}`);
+            await syncLog('sys', `Restored ${p.symbol} position from Alpaca after restart`);
+          }
+        }
+      } else {
+        alpacaPositions = new Set();
+      }
+    }
+  } catch (e) {
+    log('error', `Failed to sync Alpaca positions: ${e.message}`);
+  }
+}
   for (const sym of CONFIG.symbols) {
     try {
       const bars = await fetchBars(sym, '1Day', 2);
