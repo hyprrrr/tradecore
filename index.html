@@ -517,22 +517,32 @@ function getStartingCapital(){
 
 // Don't lock startingCapital — recalculate all time P&L fresh every poll
 function updateKPIs(p, positions, trades){
-  const cash = +p.cash;
-  const wins = p.total_wins, losses = p.total_losses, total = wins+losses;
+  const cash     = +p.cash;
+  const wins     = p.total_wins, losses = p.total_losses, total = wins+losses;
   const startCap = getStartingCapital();
 
-  // Open position value: use pnl from Supabase (set by Alpaca) + cost basis
-  const openValue = positions.reduce((acc, pos) => {
-    const cost = +pos.entry_price * +pos.qty;
-    const pnl  = +pos.pnl; // this is unrealized_pl straight from Alpaca
-    return acc + cost + pnl;
-  }, 0);
-  const totalValue = cash + openValue;
+  // Sanity check — if cash looks wrong (e.g. mid-sync), skip this update
+  if (isNaN(cash) || cash <= 0 || cash > startCap * 3) return;
 
-  // Unrealized = sum of pos.pnl (Alpaca unrealized_pl for each position)
+  // Total value = cash (what's not deployed) + current market value of open positions
+  // current market value = entry_price * qty + unrealized_pnl
+  const openMarketValue = positions.reduce((acc, pos) => {
+    const qty          = +pos.qty;
+    const entryPrice   = +pos.entry_price;
+    const unrealPnl    = +pos.pnl; // from Alpaca: unrealized_pl
+    const marketValue  = entryPrice * qty + unrealPnl;
+    return acc + marketValue;
+  }, 0);
+
+  const totalValue = cash + openMarketValue;
+
+  // Sanity check total value
+  if (totalValue > startCap * 3 || totalValue < 0) return;
+
+  // Unrealized P&L = sum of Alpaca's unrealized_pl per position
   const unrealizedPnl = positions.reduce((acc, pos) => acc + +pos.pnl, 0);
 
-  // Realized today = SELL trades today only
+  // Realized today = SELL trades only (BUY trades have null pnl)
   const todayStr = new Date().toLocaleDateString();
   const realizedToday = (trades||[])
     .filter(t => t.side === 'SELL' && t.pnl !== null && new Date(t.created_at).toLocaleDateString() === todayStr)
@@ -564,8 +574,13 @@ function updateKPIs(p, positions, trades){
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
   if(p.session) document.getElementById('sessionBadge').textContent=p.session;
 
-  equityHistory.push(+totalValue.toFixed(2));
-  if(equityHistory.length>288) equityHistory.shift();
+  // Only add to equity history if value is reasonable (no spikes)
+  const lastVal = equityHistory[equityHistory.length - 1] || startCap;
+  const changePct = Math.abs((totalValue - lastVal) / lastVal);
+  if(changePct < 0.05) { // ignore >5% single-poll swings (data glitch)
+    equityHistory.push(+totalValue.toFixed(2));
+    if(equityHistory.length > 288) equityHistory.shift();
+  }
   drawChart();
 }
 
@@ -628,8 +643,9 @@ function updateTrades(trades){
     const badge = t.side==='BUY'?'<span class="badge badge-buy">BUY</span>'
       :t.reason==='TAKE_PROFIT'?'<span class="badge badge-tp">TP</span>'
       :t.reason==='STOP_LOSS'?'<span class="badge badge-sl">SL</span>'
+      :t.reason==='MANUAL_CLOSE'?'<span class="badge" style="background:rgba(180,127,255,0.15);color:#b47fff;border:1px solid rgba(180,127,255,0.3)">🖐 MANUAL</span>'
       :'<span class="badge badge-sell">SELL</span>';
-    const icon={STOP_LOSS:'🛑',TAKE_PROFIT:'🎯',TRAILING_STOP:'📉',SIGNAL:'📤'}[t.reason]||'';
+    const icon={STOP_LOSS:'🛑',TAKE_PROFIT:'🎯',TRAILING_STOP:'📉',SIGNAL:'📤',MANUAL_CLOSE:'🖐',TIME_STOP:'⏰',VOL_SQUEEZE:'📊',RESISTANCE_EXIT:'🧱'}[t.reason]||'';
     return `<tr>
       <td>${new Date(t.created_at).toLocaleTimeString()}</td>
       <td style="font-weight:700">${t.symbol}</td>
