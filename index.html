@@ -771,6 +771,7 @@ function updateLogs(logs){
 }
 
 // ─── CHART ───
+function drawChart(){
   const canvas = document.getElementById('equityChart');
   if(!chartCtx) chartCtx=canvas.getContext('2d');
   canvas.width = canvas.parentElement.offsetWidth;
