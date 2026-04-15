@@ -2186,8 +2186,8 @@ async function runScan() {
     return;
   }
 
-  // Reload settings from dashboard on every scan
-  await loadRemoteConfig();
+  // Settings are loaded by the fast config poll every 5s — no need to reload here
+  // This prevents the sim mode from being reset on every scan
 
   // If swing mode is disabled, skip signal scanning (scalp still runs separately)
   if (CONFIG.swingEnabled === false) {
