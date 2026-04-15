@@ -153,15 +153,14 @@ async function loadRemoteConfig() {
     if (s.swing_enabled !== undefined) CONFIG.swingEnabled = !!s.swing_enabled;
     if (s.scalp_mode    !== undefined) CONFIG.scalpMode    = !!s.scalp_mode;
     if (s.sim_mode !== undefined) {
-      const wasSimMode = isSimMode();
-      CONFIG.mode = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
-      // Reset replay state when toggling sim on — load fresh bars next scan
-      if (!wasSimMode && isSimMode()) {
-        simState.loaded = false;
-        log('sim', '🎮 Simulation mode enabled — will load bar replay data on next scan');
-      } else if (wasSimMode && !isSimMode()) {
-        simState.loaded = false;
-        log('sim', '🎮 Simulation mode disabled — returning to live/paper mode');
+      const newMode = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
+      if (newMode !== CONFIG.mode) {
+        const entering = newMode === 'sim';
+        CONFIG.mode = newMode;
+        simState.loaded = false; // always reload bars when mode changes
+        log('sim', entering
+          ? '🎮 Simulation mode ENABLED — will load bar replay data on next scan'
+          : '✅ Simulation mode DISABLED — returning to live/paper trading');
       }
     }
 
@@ -302,40 +301,83 @@ async function syncPortfolio() {
 }
 
 async function syncPositions() {
-  // Step 1: get all symbols currently tracked in Supabase
-  const existing = await sbFetch('tc_positions', 'GET');
-  const existingSyms = new Set((existing || []).map(p => p.symbol));
+  // Build the full list of all open positions across all types
+  const allPositions = [];
 
-  // Step 2: delete any symbols no longer in positions{}
-  const currentSyms = new Set(Object.keys(positions));
-  for (const sym of existingSyms) {
-    if (!currentSyms.has(sym)) {
-      await sbFetch(`tc_positions?symbol=eq.${sym}`, 'DELETE');
-    }
-  }
-
-  // Step 3: upsert each current position with latest price
+  // Swing longs
   for (const [sym, pos] of Object.entries(positions)) {
-    const cur     = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
-    const qty     = pos.qtyRemaining || pos.qty;
-    const cost    = pos.entryPrice * qty;
-    const pnl     = (cur - pos.entryPrice) * qty;
-    const pnlPct  = ((cur - pos.entryPrice) / pos.entryPrice) * 100;
-
-    await sbFetch('tc_positions?symbol=eq.' + sym, 'DELETE');
-    await sbFetch('tc_positions', 'POST', {
+    const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const qty    = pos.qtyRemaining || pos.qty;
+    const pnl    = (cur - pos.entryPrice) * qty;
+    const pnlPct = pos.entryPrice > 0 ? ((cur - pos.entryPrice) / pos.entryPrice) * 100 : 0;
+    allPositions.push({
       symbol:        sym,
+      side:          'LONG',
       entry_price:   +pos.entryPrice.toFixed(4),
       qty,
-      cost:          +cost.toFixed(2),
+      cost:          +(pos.entryPrice * qty).toFixed(2),
       current_price: +cur.toFixed(4),
       pnl:           +pnl.toFixed(2),
       pnl_pct:       +pnlPct.toFixed(2),
       entry_time:    new Date(pos.entryTime).toISOString(),
-      high_water:    +pos.highWater.toFixed(4),
+      high_water:    +(pos.highWater || pos.entryPrice).toFixed(4),
       confidence:    pos.sigInfo?.confidence || 0,
       updated_at:    new Date().toISOString(),
     });
+  }
+
+  // Swing shorts
+  for (const [sym, pos] of Object.entries(shortPositions)) {
+    const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const qty    = pos.qtyRemaining || pos.qty;
+    const pnl    = (pos.entryPrice - cur) * qty; // inverted for shorts
+    const pnlPct = pos.entryPrice > 0 ? ((pos.entryPrice - cur) / pos.entryPrice) * 100 : 0;
+    allPositions.push({
+      symbol:        sym,
+      side:          'SHORT',
+      entry_price:   +pos.entryPrice.toFixed(4),
+      qty:           -qty, // negative qty = short in dashboard
+      cost:          +(pos.entryPrice * qty).toFixed(2),
+      current_price: +cur.toFixed(4),
+      pnl:           +pnl.toFixed(2),
+      pnl_pct:       +pnlPct.toFixed(2),
+      entry_time:    new Date(pos.entryTime).toISOString(),
+      high_water:    +(pos.lowWater || pos.entryPrice).toFixed(4),
+      confidence:    pos.sigInfo?.confidence || 0,
+      updated_at:    new Date().toISOString(),
+    });
+  }
+
+  // Scalp positions
+  for (const [sym, pos] of Object.entries(scalpPositions)) {
+    const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const qty    = pos.qty;
+    const pnl    = pos.direction === 'long'
+      ? (cur - pos.entryPrice) * qty
+      : (pos.entryPrice - cur) * qty;
+    const pnlPct = pos.entryPrice > 0 ? (pnl / (pos.entryPrice * qty)) * 100 : 0;
+    allPositions.push({
+      symbol:        sym,
+      side:          pos.direction === 'long' ? 'SCALP_LONG' : 'SCALP_SHORT',
+      entry_price:   +pos.entryPrice.toFixed(4),
+      qty:           pos.direction === 'long' ? qty : -qty,
+      cost:          +(pos.entryPrice * qty).toFixed(2),
+      current_price: +cur.toFixed(4),
+      pnl:           +pnl.toFixed(2),
+      pnl_pct:       +pnlPct.toFixed(2),
+      entry_time:    new Date(pos.entryTime).toISOString(),
+      high_water:    +(pos.highWater || pos.entryPrice).toFixed(4),
+      confidence:    pos.sigInfo?.confidence || 0,
+      updated_at:    new Date().toISOString(),
+    });
+  }
+
+  // Delete all existing rows then batch insert current state
+  // Use ?id=neq.0 trick so Supabase doesn't complain about deleting without a filter
+  await sbFetch('tc_positions?id=gt.0', 'DELETE');
+  if (allPositions.length > 0) {
+    // Batch POST — insert all positions in one request
+    await sbFetch('tc_positions', 'POST', allPositions);
   }
 }
 
@@ -361,6 +403,7 @@ async function syncLog(type, msg) {
 }
 
 async function syncAll() {
+  // Run both in parallel — was sequential before (2× slower)
   await Promise.all([syncPortfolio(), syncPositions()]);
 }
 
@@ -1912,60 +1955,47 @@ async function storePrevClose() {
 }
 
 async function syncPricesOnly() {
-  // In sim mode — update prices from cached bar data, no Alpaca needed
+  // In sim mode — update prices from bar cache
   if (isSimMode()) {
-    // Update unrealized P&L on all simulated positions using latest cached prices
     for (const [sym, pos] of Object.entries(positions)) {
       const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
       if (!cur) continue;
       if (cur > pos.highWater) positions[sym].highWater = cur;
-      const pnl    = (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
-      const pnlPct = pnl / pos.cost;
-      await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
-        current_price: +cur.toFixed(4),
-        pnl:           +pnl.toFixed(2),
-        pnl_pct:       +pnlPct.toFixed(4),
-        updated_at:    new Date().toISOString(),
-      });
     }
-    // Sync simulated portfolio
-    const openVal  = Object.values(positions).reduce((a, p) => {
-      const cur = priceHistory5m[p.entryPrice]?.[priceHistory5m[p.entryPrice]?.length-1] || p.entryPrice;
-      return a + cur * (p.qtyRemaining || p.qty);
-    }, 0);
-    await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
-      cash:       +portfolio.toFixed(2),
-      total_value:+(portfolio + openVal).toFixed(2),
-      updated_at: new Date().toISOString(),
-    });
+    await syncPositions();
     return;
   }
 
   if (!CONFIG.alpacaKey) return;
+
   try {
     const alpacaPos = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
-    if (!Array.isArray(alpacaPos) || alpacaPos.length === 0) return;
+    if (!Array.isArray(alpacaPos)) return;
 
     for (const ap of alpacaPos) {
-      const sym    = ap.symbol;
-      const cur    = +ap.current_price;
-      const pnl    = +ap.unrealized_pl;
-      const pnlPct = +ap.unrealized_plpc * 100;
+      const sym = ap.symbol;
+      const cur = +ap.current_price;
+      if (!cur || cur <= 0) continue;
 
+      // Update price history
       if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
       priceHistory5m[sym].push(cur);
       if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
-      if (positions[sym] && cur > positions[sym].highWater) positions[sym].highWater = cur;
 
-      await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
-        current_price: +cur.toFixed(4),
-        pnl:           +pnl.toFixed(2),
-        pnl_pct:       +pnlPct.toFixed(4),
-        updated_at:    new Date().toISOString(),
-      });
-      log('price', `${sym} $${cur.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
+      // Update high water mark for longs
+      if (positions[sym] && cur > positions[sym].highWater) {
+        positions[sym].highWater = cur;
+      }
+      // Update low water mark for shorts
+      if (shortPositions[sym] && cur < shortPositions[sym].lowWater) {
+        shortPositions[sym].lowWater = cur;
+      }
     }
 
+    // Batch-update all positions to Supabase (single write)
+    await syncPositions();
+
+    // Update portfolio cash from Alpaca account
     const acct = await getAccount();
     if (acct?.cash) {
       await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
@@ -2873,13 +2903,33 @@ const nacl = require('tweetnacl');
 
 // Verify Discord's Ed25519 signature — required or Discord rejects the endpoint
 function verifyDiscordRequest(rawBody, signature, timestamp) {
-  if (!CONFIG.discordPublicKey) return true; // skip if not configured
+  if (!CONFIG.discordPublicKey) {
+    log('warn', 'Discord: DISCORD_PUBLIC_KEY not set — skipping verification (unsafe)');
+    return true;
+  }
+  if (!signature || !timestamp) {
+    log('warn', 'Discord: missing signature or timestamp headers');
+    return false;
+  }
   try {
-    const key = Buffer.from(CONFIG.discordPublicKey, 'hex');
-    const msg = Buffer.from(timestamp + rawBody);
-    const sig = Buffer.from(signature, 'hex');
-    return nacl.sign.detached.verify(msg, sig, key);
+    const key = Buffer.from(CONFIG.discordPublicKey.trim(), 'hex');
+    const msg = Buffer.from(timestamp + rawBody, 'utf8');
+    const sig = Buffer.from(signature.trim(), 'hex');
+
+    if (key.length !== 32) {
+      log('error', `Discord: public key wrong length (${key.length} bytes, expected 32) — check DISCORD_PUBLIC_KEY`);
+      return false;
+    }
+    if (sig.length !== 64) {
+      log('error', `Discord: signature wrong length (${sig.length} bytes, expected 64)`);
+      return false;
+    }
+
+    const valid = nacl.sign.detached.verify(new Uint8Array(msg), new Uint8Array(sig), new Uint8Array(key));
+    if (!valid) log('warn', 'Discord: signature verification failed');
+    return valid;
   } catch(e) {
+    log('error', `Discord: verification error — ${e.message}`);
     return false;
   }
 }
@@ -3062,10 +3112,14 @@ http.createServer(async (req, res) => {
     const signature = req.headers['x-signature-ed25519'];
     const timestamp = req.headers['x-signature-timestamp'];
 
+    log('sys', `Discord POST received | sig:${signature?.slice(0,8)}… ts:${timestamp} body:${rawBody.slice(0,60)}…`);
+
     // Discord requires signature verification
     if (!verifyDiscordRequest(rawBody, signature, timestamp)) {
-      log('warn', 'Discord: invalid signature rejected');
-      res.writeHead(401); res.end('Invalid signature'); return;
+      log('warn', 'Discord: rejected invalid signature');
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Invalid request signature');
+      return;
     }
 
     let interaction;
@@ -3073,8 +3127,11 @@ http.createServer(async (req, res) => {
       res.writeHead(400); res.end('Invalid JSON'); return;
     }
 
+    log('sys', `Discord interaction type: ${interaction.type}`);
+
     // Discord PING — must respond with type 1 to verify endpoint
     if (interaction.type === 1) {
+      log('sys', 'Discord PING received → responding with PONG');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 1 }));
       log('sys', 'Discord endpoint verified ✅');
