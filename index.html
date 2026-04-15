@@ -663,21 +663,18 @@ function onModeChange(){
   if(modeBadge) modeBadge.style.display = simOn ? '' : 'none';
   if(simProg)   simProg.style.display   = simOn ? 'block' : 'none';
 
-  // If turning sim OFF — immediately clear sim values and reload real data
+  // Reset equity chart — reloads from correct table (sim_tc_equity or tc_equity)
+  equityHistory = [];
+  equityLoaded  = false;
+  drawChart();
+
+  // If turning sim OFF — show syncing state and poll aggressively
   if (!simOn) {
-    // Clear visual state immediately
     const pnlEl  = document.getElementById('todayPnl');
     const portEl = document.getElementById('portfolioVal');
     if(pnlEl)  { pnlEl.textContent = '…'; pnlEl.className = 'kpi-value'; }
     if(portEl)   portEl.textContent = 'Syncing…';
     document.getElementById('syncInfo').textContent = 'Switching to live mode…';
-
-    // Reset equity chart — sim wrote fake values, need to reload real ones
-    equityHistory = [];
-    equityLoaded  = false; // forces reload from tc_equity on next poll
-    drawChart();
-
-    // Poll aggressively for 15 seconds to pick up real values fast
     let fastPolls = 0;
     const fastPoll = setInterval(async () => {
       await poll();
@@ -714,6 +711,9 @@ let equityHistory=[], equityLoaded=false, lastTradeIds=new Set(), lastLogIds=new
 
 let lastTradeCount = 0, lastLogCount = 0, lastPositionHash = '', pollCount = 0;
 
+// Table name helper — reads from sim tables when sim mode is active
+function dtbl(name){ return document.getElementById('simEnabled')?.checked ? `sim_${name}` : name; }
+
 async function poll(){
   pollCount++;
   const fetchTrades = pollCount % 3 === 0; // trades every 15s
@@ -721,10 +721,10 @@ async function poll(){
 
   // Always fetch portfolio + positions (lightweight, change frequently)
   const fetches = [
-    sbGet('tc_portfolio','?id=eq.1'),
-    sbGet('tc_positions','?order=updated_at.desc'),
-    fetchTrades ? sbGet('tc_trades','?order=created_at.desc&limit=100') : Promise.resolve(null),
-    fetchLogs   ? sbGet('tc_logs','?order=created_at.desc&limit=100')   : Promise.resolve(null),
+    sbGet(dtbl('tc_portfolio'),'?id=eq.1'),
+    sbGet(dtbl('tc_positions'),'?order=updated_at.desc'),
+    fetchTrades ? sbGet(dtbl('tc_trades'),'?order=created_at.desc&limit=100') : Promise.resolve(null),
+    fetchLogs   ? sbGet(dtbl('tc_logs'),'?order=created_at.desc&limit=100')   : Promise.resolve(null),
   ];
 
   const [portfolio, positions, trades, logs] = await Promise.all(fetches);
@@ -732,7 +732,7 @@ async function poll(){
   if(!portfolio||portfolio.length===0){ setOffline(); return; }
 
   if(!equityLoaded){
-    try{ const eq=await sbGet('tc_equity','?order=created_at.asc&limit=500'); if(eq&&eq.length>0) equityHistory=eq.map(e=>+e.value).filter(v=>!isNaN(v)&&v>0); }catch(e){}
+    try{ const eq=await sbGet(dtbl('tc_equity'),'?order=created_at.asc&limit=500'); if(eq&&eq.length>0) equityHistory=eq.map(e=>+e.value).filter(v=>!isNaN(v)&&v>0); }catch(e){}
     equityLoaded=true;
   }
 
