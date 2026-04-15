@@ -718,25 +718,32 @@ function getStartingCapital(){ try{ const s=JSON.parse(localStorage.getItem('tc_
 function updateKPIs(p, positions, trades){
   const equity=+p.total_value, wins=+p.total_wins, losses=+p.total_losses, total=wins+losses, startCap=getStartingCapital(), dayPnl=+p.day_pnl;
   if(isNaN(equity)||equity<=0||equity>startCap*5) return;
-  if(isNaN(dayPnl)||Math.abs(dayPnl)>startCap) return;
 
   const allTimePnl=equity-startCap, allTimePct=((allTimePnl/startCap)*100).toFixed(2);
-  const unrealized=positions.reduce((a,pos)=>a+ +pos.pnl,0);
 
-  document.getElementById('portfolioVal').textContent='$'+equity.toFixed(2);
-  const chEl=document.getElementById('portfolioChange');
-  chEl.textContent=`${allTimePnl>=0?'+':''}$${allTimePnl.toFixed(2)} (${allTimePct}%) all time`;
-  chEl.className='kpi-sub '+(allTimePnl>=0?'green':'red');
+  // Unrealized P&L = sum of open position pnl values (already correct from syncPositions)
+  const unrealized = positions.reduce((a, pos) => a + +pos.pnl, 0);
+  // Realized today = day P&L minus what's still open
+  const realizedToday = dayPnl - unrealized;
 
-  const pnlEl=document.getElementById('todayPnl');
-  pnlEl.textContent=`${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`;
-  pnlEl.className='kpi-value '+(dayPnl>=0?'green':'red');
-  document.getElementById('tradeCount').textContent=`Realized: ${(dayPnl-unrealized)>=0?'+':''}$${(dayPnl-unrealized).toFixed(2)} | Open: ${unrealized>=0?'+':''}$${unrealized.toFixed(2)}`;
+  document.getElementById('portfolioVal').textContent = '$' + equity.toFixed(2);
+  const chEl = document.getElementById('portfolioChange');
+  chEl.textContent = `${allTimePnl>=0?'+':''}$${allTimePnl.toFixed(2)} (${allTimePct}%) all time`;
+  chEl.className = 'kpi-sub ' + (allTimePnl >= 0 ? 'green' : 'red');
 
-  document.getElementById('winRate').textContent=total>0?((wins/total)*100).toFixed(0)+'%':'—';
-  document.getElementById('winRateSub').textContent=total>0?`${wins}W / ${losses}L`:'No closed trades';
-  document.getElementById('circuitStatus').textContent=p.circuit_breaker?'🔴 Circuit breaker ON':'✅ Trading active';
-  document.getElementById('circuitStatus').className='kpi-sub '+(p.circuit_breaker?'red':'green');
+  const pnlEl = document.getElementById('todayPnl');
+  // Show day P&L only if it looks sane (not a full position cost)
+  const dayPnlSane = !isNaN(dayPnl) && Math.abs(dayPnl) < startCap * 0.5;
+  pnlEl.textContent = dayPnlSane ? `${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}` : `${unrealized>=0?'+':''}$${unrealized.toFixed(2)}`;
+  pnlEl.className = 'kpi-value ' + ((dayPnlSane ? dayPnl : unrealized) >= 0 ? 'green' : 'red');
+
+  document.getElementById('tradeCount').textContent =
+    `Realized: ${realizedToday>=0?'+':''}$${realizedToday.toFixed(2)} | Open: ${unrealized>=0?'+':''}$${unrealized.toFixed(2)}`;
+
+  document.getElementById('winRate').textContent = total>0 ? ((wins/total)*100).toFixed(0)+'%' : '—';
+  document.getElementById('winRateSub').textContent = total>0 ? `${wins}W / ${losses}L` : 'No closed trades';
+  document.getElementById('circuitStatus').textContent = p.circuit_breaker ? '🔴 Circuit breaker ON' : '✅ Trading active';
+  document.getElementById('circuitStatus').className = 'kpi-sub ' + (p.circuit_breaker ? 'red' : 'green');
 
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
   if(p.session)   document.getElementById('sessionBadge').textContent=p.session;
