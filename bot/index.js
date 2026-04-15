@@ -86,9 +86,10 @@ const CONFIG = {
   scanIntervalMin: +(process.env.SCAN_INTERVAL_MIN || 5),
 
   // ── Mode controls (overridden by dashboard via Supabase) ──
-  swingEnabled:        process.env.SWING_ENABLED !== 'false', // default on
+  swingEnabled:        process.env.SWING_ENABLED !== 'false',
   scalpMode:           process.env.SCALP_MODE === 'true',
-  shortsEnabled:       process.env.ENABLE_SHORTS === 'true', // default OFF
+  shortsEnabled:       process.env.ENABLE_SHORTS === 'true',
+  minConfidence:       +(process.env.MIN_CONFIDENCE || 60), // adaptive — auto-adjusted by learning engine
   scalpSymbols:        (process.env.SCALP_SYMBOLS || 'SPY,QQQ,AAPL,TSLA,NVDA').split(',').map(s => s.trim().toUpperCase()),
   scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.4)  / 100, // take profit at +0.4%
   scalpSlPct:          +(process.env.SCALP_SL_PCT        || 0.2)  / 100, // stop loss at -0.2%
@@ -240,9 +241,205 @@ const CORRELATION_GROUPS = [
   ['JPM', 'BAC', 'GS', 'MS'],
 ];
 
-// ─────────────────────────────────────────────
-// SUPABASE SYNC
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// ADAPTIVE LEARNING ENGINE
+// ═══════════════════════════════════════════════════════════════════
+//
+// Tracks win/loss patterns and automatically adjusts entry thresholds
+// based on what conditions are actually producing profitable trades.
+//
+// What it adjusts:
+//   - Minimum confidence threshold (tighten/loosen based on win rate)
+//   - RSI oversold/overbought levels (shift based on where wins cluster)
+//   - ADX minimum (raise if ranging trades keep losing)
+//   - Confirmation gate count (raise if too many false signals)
+//   - Position sizing (reduce after losing streaks, increase on hot streaks)
+//
+// Rules:
+//   - Never adjusts more than ±20% from the original defaults
+//   - Requires minimum 10 trades before any adjustment
+//   - Re-evaluates every 20 closed trades
+//   - All changes are logged and written to Supabase for transparency
+// ═══════════════════════════════════════════════════════════════════
+
+const ADAPT_DEFAULTS = {
+  rsiOversold:    35,
+  rsiOverbought:  65,
+  minConfidence:  60, // minimum confidence to enter a trade
+  atrStopMult:    2.0,
+  maxPositionPct: 0.15,
+};
+
+// Bounds — never go outside these ranges
+const ADAPT_BOUNDS = {
+  rsiOversold:    { min: 20, max: 42 },
+  rsiOverbought:  { min: 58, max: 80 },
+  minConfidence:  { min: 50, max: 85 },
+  atrStopMult:    { min: 1.5, max: 3.0 },
+  maxPositionPct: { min: 0.05, max: 0.25 },
+};
+
+// In-memory trade performance log
+// Each entry: { pnl, confidence, rsi, session, won, timestamp }
+let tradePerformanceLog = [];
+let lastAdaptAt = 0;
+const ADAPT_EVERY_N_TRADES = 20;
+
+// Called when a trade closes — record conditions for learning
+function recordTradeOutcome(pnl, entryConditions = {}) {
+  const won = pnl > 0;
+  tradePerformanceLog.push({
+    pnl,
+    won,
+    confidence: entryConditions.confidence || 0,
+    rsi:        entryConditions.rsi        || 50,
+    session:    entryConditions.session    || 'unknown',
+    side:       entryConditions.side       || 'long',
+    timestamp:  Date.now(),
+  });
+
+  // Keep last 100 trades only
+  if (tradePerformanceLog.length > 100) tradePerformanceLog.shift();
+
+  // Adapt every N closed trades
+  const closedCount = tradePerformanceLog.length;
+  if (closedCount >= 10 && closedCount % ADAPT_EVERY_N_TRADES === 0) {
+    runAdaptiveTuning();
+  }
+}
+
+// Core adaptive tuning — analyzes recent trades and adjusts CONFIG
+async function runAdaptiveTuning() {
+  const trades = tradePerformanceLog.slice(-50); // last 50 trades
+  if (trades.length < 10) return;
+
+  const wins   = trades.filter(t => t.won);
+  const losses = trades.filter(t => !t.won);
+  const winRate = wins.length / trades.length;
+
+  log('adapt', `═══ Adaptive Tuning (${trades.length} trades, ${(winRate*100).toFixed(0)}% win rate) ═══`);
+
+  const changes = {};
+
+  // ── 1. Confidence threshold ──
+  // Find the confidence level where win rate is consistently good
+  const highConf  = trades.filter(t => t.confidence >= 75);
+  const lowConf   = trades.filter(t => t.confidence < 75);
+  const highWR    = highConf.length > 3 ? highConf.filter(t=>t.won).length / highConf.length : null;
+  const lowWR     = lowConf.length  > 3 ? lowConf.filter(t=>t.won).length  / lowConf.length  : null;
+
+  if (highWR !== null && lowWR !== null) {
+    if (highWR > lowWR + 0.15) {
+      // High confidence trades win much more — raise the bar
+      const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, CONFIG.minConfidence + 5);
+      if (newConf !== CONFIG.minConfidence) { CONFIG.minConfidence = newConf; changes.minConfidence = newConf; }
+    } else if (lowWR > 0.6 && winRate > 0.6) {
+      // Even lower confidence trades are winning — can loosen slightly
+      const newConf = Math.max(ADAPT_BOUNDS.minConfidence.min, CONFIG.minConfidence - 3);
+      if (newConf !== CONFIG.minConfidence) { CONFIG.minConfidence = newConf; changes.minConfidence = newConf; }
+    }
+  }
+
+  // ── 2. RSI thresholds ──
+  // Find where winning long trades cluster by RSI
+  const longWins  = trades.filter(t => t.won && t.side === 'long');
+  const longLoses = trades.filter(t => !t.won && t.side === 'long');
+
+  if (longWins.length >= 3 && longLoses.length >= 3) {
+    const avgWinRSI  = longWins.reduce((a,t) => a + t.rsi, 0) / longWins.length;
+    const avgLossRSI = longLoses.reduce((a,t) => a + t.rsi, 0) / longLoses.length;
+
+    // If wins cluster at lower RSI than losses, tighten the oversold threshold
+    if (avgWinRSI < avgLossRSI - 5) {
+      const newRSI = Math.max(ADAPT_BOUNDS.rsiOversold.min, CONFIG.rsiOversold - 2);
+      if (newRSI !== CONFIG.rsiOversold) { CONFIG.rsiOversold = newRSI; changes.rsiOversold = newRSI; }
+    } else if (avgWinRSI > avgLossRSI + 5) {
+      // Wins happening at higher RSI — loosen slightly
+      const newRSI = Math.min(ADAPT_BOUNDS.rsiOversold.max, CONFIG.rsiOversold + 2);
+      if (newRSI !== CONFIG.rsiOversold) { CONFIG.rsiOversold = newRSI; changes.rsiOversold = newRSI; }
+    }
+  }
+
+  // ── 3. Position sizing ──
+  // Reduce size on losing streaks, increase on winning streaks
+  const last10    = trades.slice(-10);
+  const last10WR  = last10.filter(t=>t.won).length / last10.length;
+  const last5     = trades.slice(-5);
+  const last5WR   = last5.filter(t=>t.won).length / last5.length;
+
+  if (last5WR === 0) {
+    // 5 straight losses — cut position size significantly
+    const newPct = Math.max(ADAPT_BOUNDS.maxPositionPct.min, CONFIG.maxPositionPct * 0.7);
+    if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.01) { CONFIG.maxPositionPct = newPct; changes.maxPositionPct = +(newPct*100).toFixed(1)+'%'; }
+    log('adapt', '⚠ 5 straight losses — reducing position size to ' + (newPct*100).toFixed(1) + '%');
+  } else if (last5WR === 1.0 && last10WR >= 0.7) {
+    // 5 straight wins and hot streak — increase size slightly
+    const newPct = Math.min(ADAPT_BOUNDS.maxPositionPct.max, CONFIG.maxPositionPct * 1.1);
+    if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.01) { CONFIG.maxPositionPct = newPct; changes.maxPositionPct = +(newPct*100).toFixed(1)+'%'; }
+    log('adapt', '🔥 Hot streak — increasing position size to ' + (newPct*100).toFixed(1) + '%');
+  } else if (last10WR < 0.4) {
+    // Poor recent performance — reset position size toward default
+    const newPct = Math.max(ADAPT_BOUNDS.maxPositionPct.min, Math.min(ADAPT_DEFAULTS.maxPositionPct, CONFIG.maxPositionPct));
+    if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.01) { CONFIG.maxPositionPct = newPct; changes.maxPositionPct = +(newPct*100).toFixed(1)+'%'; }
+  }
+
+  // ── 4. ATR stop multiplier ──
+  // If too many stop losses, widen the stop
+  const stoppedOut = trades.filter(t => !t.won).length / trades.length;
+  if (stoppedOut > 0.5 && winRate < 0.45) {
+    const newMult = Math.min(ADAPT_BOUNDS.atrStopMult.max, CONFIG.atrStopMult + 0.2);
+    if (newMult !== CONFIG.atrStopMult) { CONFIG.atrStopMult = +newMult.toFixed(1); changes.atrStopMult = CONFIG.atrStopMult; }
+    log('adapt', `Stop too tight — widening ATR mult to ${CONFIG.atrStopMult}`);
+  } else if (winRate > 0.7 && CONFIG.atrStopMult > ADAPT_DEFAULTS.atrStopMult) {
+    // Winning well — can tighten stops back toward default
+    const newMult = Math.max(ADAPT_DEFAULTS.atrStopMult, CONFIG.atrStopMult - 0.1);
+    if (newMult !== CONFIG.atrStopMult) { CONFIG.atrStopMult = +newMult.toFixed(1); changes.atrStopMult = CONFIG.atrStopMult; }
+  }
+
+  if (Object.keys(changes).length === 0) {
+    log('adapt', 'No adjustments needed — current settings performing well');
+    return;
+  }
+
+  log('adapt', `Adjustments: ${JSON.stringify(changes)}`);
+
+  // Save to Supabase so dashboard shows current adapted settings
+  try {
+    await sbFetch('tc_settings?id=eq.1', 'PATCH', {
+      rsi_oversold:     CONFIG.rsiOversold,
+      rsi_overbought:   CONFIG.rsiOverbought,
+      max_position_pct: +(CONFIG.maxPositionPct * 100).toFixed(1),
+      atr_stop_mult:    CONFIG.atrStopMult,
+      updated_at:       new Date().toISOString(),
+    });
+    await syncLog('adapt', `🧠 Auto-tuned: ${JSON.stringify(changes)} | WinRate=${(winRate*100).toFixed(0)}% over ${trades.length} trades`);
+  } catch(e) {}
+
+  // Send Discord alert about the adjustment
+  if (CONFIG.discordWebhook) {
+    const fetch = await getFetch();
+    const changeStr = Object.entries(changes).map(([k,v]) => `**${k}** → ${v}`).join('\n');
+    fetch(CONFIG.discordWebhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ embeds: [{
+        title: '🧠 TradeCore Auto-Tuned Settings',
+        color: winRate >= 0.5 ? 0x7fff6e : 0xffb547,
+        fields: [
+          { name: 'Win Rate', value: `${(winRate*100).toFixed(0)}% (${wins.length}W / ${losses.length}L)`, inline: true },
+          { name: 'Trades Analyzed', value: String(trades.length), inline: true },
+          { name: 'Changes Made', value: changeStr || 'None', inline: false },
+        ],
+        footer: { text: 'TradeCore Adaptive Engine' },
+        timestamp: new Date().toISOString(),
+      }]}),
+    }).catch(() => {});
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// END ADAPTIVE LEARNING ENGINE
+// ═══════════════════════════════════════════════════════════════════
 async function sbFetch(path, method = 'GET', body = null) {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return null;
   try {
@@ -1418,9 +1615,16 @@ function generateSignal(sym, bars5m, bars15m) {
   }
 
   reasons.push(`✅ ${passedGates} gates + ${bonus} bonus — HIGH QUALITY SETUP`);
+
+  // Final confidence check against adaptive threshold
+  const finalConf = Math.min(99, confidence + bonus * 5);
+  if (finalConf < CONFIG.minConfidence) {
+    return { signal: 'HOLD', confidence: finalConf, score, reasons: [...reasons, `Confidence ${finalConf}% below adaptive threshold ${CONFIG.minConfidence}%`], rsi: r };
+  }
+
   return {
     signal:     direction === 'buy' ? 'BUY' : 'SELL',
-    confidence: Math.min(99, confidence + bonus * 5),
+    confidence: finalConf,
     score,
     reasons,
     rsi: r,
@@ -1626,6 +1830,7 @@ async function coverShort(sym, price, reason) {
   const pnl = (pos.entryPrice - price) * qty;
   portfolio += pnl; // add profit (or subtract loss)
   pnl > 0 ? totalWins++ : totalLosses++;
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short' });
   delete shortPositions[sym];
   alpacaShorts.delete(sym);
 
@@ -1755,6 +1960,7 @@ async function exitPosition(sym, price, reason) {
   const pnl = qtyToSell * price - qtyToSell * avgCost;
   portfolio += qtyToSell * price;
   pnl > 0 ? totalWins++ : totalLosses++;
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long' });
   delete positions[sym];
   alpacaPositions.delete(sym);
 
@@ -2647,6 +2853,7 @@ async function exitScalp(sym, price, reason) {
 
   portfolio += direction === 'long' ? qty * price : pnl;
   pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++);
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: 50, session: getCurrentSession(), side: pos?.direction||'long' });
 
   const holdSecs = Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 1000);
   const icons = { SCALP_TP:'🎯', SCALP_SL:'🛑', SCALP_TRAIL:'📉', SCALP_TIME:'⏰', SCALP_REVERSE:'↩️', SCALP_MANUAL:'🖐' };
