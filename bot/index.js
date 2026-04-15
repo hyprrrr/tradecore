@@ -1341,7 +1341,7 @@ async function runSimScan() {
 
     if (sig.signal === 'BUY' && totalOpen < CONFIG.maxOpenPositions) {
       await enterPosition(sym, price, sig, bars5m, 'long');
-    } else if (sig.signal === 'SELL' && SHORTING_ENABLED && totalOpen < CONFIG.maxOpenPositions) {
+    } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled && totalOpen < CONFIG.maxOpenPositions) {
       await enterPosition(sym, price, sig, bars5m, 'short');
     }
   }
@@ -2309,7 +2309,7 @@ async function runScan() {
       }
 
       // SHORT — confirmed signal
-      if (sig.signal === 'SELL' && SHORTING_ENABLED && totalOpen < CONFIG.maxOpenPositions) {
+      if (sig.signal === 'SELL' && CONFIG.shortsEnabled && totalOpen < CONFIG.maxOpenPositions) {
         if (!shortPositions[sym] && !alpacaShorts.has(sym)) {
           const spreadOk = await spreadIsAcceptable(sym, price);
           if (spreadOk) await enterPosition(sym, price, sig, bars5m, 'short');
@@ -2335,7 +2335,7 @@ async function runScan() {
 // Live Alpaca positions — refreshed every scan to prevent duplicate buys
 let alpacaPositions = new Set();
 let alpacaShorts    = new Set();
-const SHORTING_ENABLED = process.env.ENABLE_SHORTS === 'true'; // default OFF — must explicitly enable
+// Shorting controlled via CONFIG.shortsEnabled (dashboard toggle)
 
 async function syncAlpacaPositions() {
   if (isSimMode()) return; // sim tracks positions in memory — no Alpaca sync needed
@@ -3093,7 +3093,7 @@ async function runScalpScan() {
 
       if (sig.signal === 'BUY') {
         await enterScalp(sym, price, sig, 'long');
-      } else if (sig.signal === 'SELL' && SHORTING_ENABLED) {
+      } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled) {
         await enterScalp(sym, price, sig, 'short');
       }
     } catch(e) {
