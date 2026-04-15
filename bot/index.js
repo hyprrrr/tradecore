@@ -148,7 +148,18 @@ async function loadRemoteConfig() {
     // Mode flags — controlled from dashboard
     if (s.swing_enabled !== undefined) CONFIG.swingEnabled = !!s.swing_enabled;
     if (s.scalp_mode    !== undefined) CONFIG.scalpMode    = !!s.scalp_mode;
-    if (s.sim_mode      !== undefined) CONFIG.mode         = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
+    if (s.sim_mode !== undefined) {
+      const wasSimMode = isSimMode();
+      CONFIG.mode = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
+      // Reset replay state when toggling sim on — load fresh bars next scan
+      if (!wasSimMode && isSimMode()) {
+        simState.loaded = false;
+        log('sim', '🎮 Simulation mode enabled — will load bar replay data on next scan');
+      } else if (wasSimMode && !isSimMode()) {
+        simState.loaded = false;
+        log('sim', '🎮 Simulation mode disabled — returning to live/paper mode');
+      }
+    }
 
     // Scalp settings
     if (s.scalp_tp_pct)        CONFIG.scalpTpPct        = +s.scalp_tp_pct        / 100;
@@ -737,12 +748,8 @@ function buildScanList() {
 // END MARKET SCREENER
 // ═══════════════════════════════════════════════════════════════════
 
-async function placeOrder(symbol, qty, side, currentPrice = null) {
-  // Sim mode — instant fake fill, no Alpaca request
-  if (isSimMode()) {
-    const price = currentPrice || (priceHistory5m[symbol]?.[priceHistory5m[symbol].length - 1] || 100);
-    return simOrder(symbol, qty, side, price);
-  }
+async function placeOrder(symbol, qty, side) {
+  if (isSimMode()) return simOrder(symbol, qty, side);
   const data = await alpacaFetch(`${ALPACA_BASE()}/v2/orders`, {
     method: 'POST',
     body: JSON.stringify({ symbol, qty: String(qty), side, type: 'market', time_in_force: 'day' }),
@@ -751,16 +758,238 @@ async function placeOrder(symbol, qty, side, currentPrice = null) {
   throw new Error(data.message || JSON.stringify(data));
 }
 
-// ── Simulation mode ──
-// When MODE=sim (or toggled from dashboard), all orders are simulated.
-// No requests go to Alpaca. Fills happen instantly at current price.
-// Everything else works: Supabase sync, Discord, equity curve, P&L.
+// ─────────────────────────────────────────────
+// SIMULATION / BAR REPLAY ENGINE
+// ─────────────────────────────────────────────
+//
+// Problem: when markets are closed there's no live price.
+// A simulated fill at a stale price hours old = meaningless.
+//
+// Solution: Bar Replay.
+// We load the last N days of 5-minute bars from Yahoo Finance,
+// then step through them one bar at a time at the scan interval.
+// Every "scan" the bot sees exactly the bars it would have seen
+// if it were running live at that moment in time.
+//
+// This gives you realistic, honest backtesting using real
+// historical prices — anytime, any day of the week.
+// ─────────────────────────────────────────────
+
 function isSimMode() { return CONFIG.mode === 'sim'; }
 
-function simOrder(symbol, qty, side, price) {
+// Bar replay state
+const simState = {
+  loaded:      false,          // has replay data been loaded?
+  bars:        {},             // { SYM: [bar, bar, ...] } — full history
+  cursor:      0,              // which bar index we're "at" right now
+  totalBars:   0,              // total bars available
+  startTime:   null,           // timestamp of first bar
+  currentTime: null,           // timestamp of current bar
+  speed:       1,              // replay speed multiplier (1 = real-time equivalent)
+};
+
+// Load historical 5-minute bars for all symbols to replay
+async function loadSimBars(symbols) {
+  log('sim', `🎮 Loading bar replay data for ${symbols.length} symbols…`);
+  simState.bars    = {};
+  simState.cursor  = 0;
+  simState.loaded  = false;
+
+  const fetch = await getFetch();
+
+  for (const sym of symbols) {
+    try {
+      // Fetch last 5 trading days of 5-minute bars from Yahoo Finance
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=5d`;
+      const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const data = await res.json();
+      const result = data?.chart?.result?.[0];
+      if (!result) continue;
+
+      const timestamps = result.timestamp || [];
+      const q = result.indicators?.quote?.[0] || {};
+
+      const bars = timestamps.map((t, i) => ({
+        t: new Date(t * 1000).toISOString(),
+        o: q.open?.[i]   || null,
+        h: q.high?.[i]   || null,
+        l: q.low?.[i]    || null,
+        c: q.close?.[i]  || null,
+        v: q.volume?.[i] || 0,
+      })).filter(b => b.c != null && b.h != null && b.l != null);
+
+      if (bars.length >= 20) {
+        simState.bars[sym] = bars;
+        log('sim', `  ${sym}: ${bars.length} bars loaded (${bars[0].t.slice(0,10)} → ${bars[bars.length-1].t.slice(0,10)})`);
+      }
+    } catch(e) {
+      log('warn', `  ${sym}: failed to load bars — ${e.message}`);
+    }
+  }
+
+  // All symbols share the same bar timeline — find the shortest
+  const lengths = Object.values(simState.bars).map(b => b.length);
+  if (lengths.length === 0) {
+    log('error', 'Sim: no bar data loaded — cannot start replay');
+    return false;
+  }
+
+  simState.totalBars   = Math.min(...lengths);
+  simState.cursor      = 0; // start from the beginning of the replay window
+  simState.loaded      = true;
+  simState.startTime   = simState.bars[Object.keys(simState.bars)[0]][0].t;
+  simState.currentTime = simState.startTime;
+
+  log('sim', `🎮 Bar replay ready: ${simState.totalBars} bars per symbol`);
+  log('sim', `🎮 Replay starts at: ${simState.startTime}`);
+  return true;
+}
+
+// Advance the replay cursor by one bar
+// Returns { sym → bars[] } sliced up to current cursor, or null if replay is done
+function simAdvanceCursor() {
+  if (!simState.loaded) return null;
+
+  if (simState.cursor >= simState.totalBars - 20) {
+    // End of replay — loop back to start (or stop)
+    log('sim', '🎮 Bar replay reached end — looping back to start');
+    simState.cursor = 20; // start with enough history for indicators
+  }
+
+  simState.cursor++;
+  const firstSym = Object.keys(simState.bars)[0];
+  if (simState.bars[firstSym]?.[simState.cursor]) {
+    simState.currentTime = simState.bars[firstSym][simState.cursor].t;
+  }
+
+  // Return sliced bars — bot only sees bars UP TO current cursor
+  // This is the key: no lookahead, realistic simulation
+  const snapshot = {};
+  for (const [sym, bars] of Object.entries(simState.bars)) {
+    snapshot[sym] = bars.slice(0, simState.cursor + 1);
+  }
+  return snapshot;
+}
+
+// Get sim price for a symbol at current cursor position
+function simCurrentPrice(sym) {
+  if (!simState.loaded || !simState.bars[sym]) return null;
+  const bar = simState.bars[sym][simState.cursor];
+  return bar?.c || null;
+}
+
+// Simulated order — fills at the OPEN of the NEXT bar (realistic)
+// In real trading you submit at bar close, fill at next open
+function simOrder(symbol, qty, side) {
+  // Fill at next bar's open price (realistic — avoids lookahead bias)
+  const nextIdx  = Math.min(simState.cursor + 1, (simState.bars[symbol]?.length || 1) - 1);
+  const nextBar  = simState.bars[symbol]?.[nextIdx];
+  const fillPrice = nextBar?.o || simCurrentPrice(symbol) || 100;
+
   const id = `SIM-${Date.now()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
-  log('sim', `🎮 SIM ${side.toUpperCase()} ${qty}x ${symbol} @ $${price.toFixed(2)} [ID: ${id}]`);
-  return { id, status: 'filled', filled_avg_price: String(price), symbol, qty: String(qty), side };
+  const ts = simState.currentTime || new Date().toISOString();
+  log('sim', `🎮 SIM ${side.toUpperCase()} ${qty}x ${symbol} @ $${fillPrice.toFixed(2)} [bar: ${ts.slice(11,16)}]`);
+  return { id, status: 'filled', filled_avg_price: String(fillPrice), symbol, qty: String(qty), side, simPrice: fillPrice };
+}
+
+// Sim-mode runScan — uses replayed bars instead of live data
+async function runSimScan() {
+  if (!isSimMode()) return;
+
+  // Load bars on first run
+  if (!simState.loaded) {
+    const symbols = buildScanList().slice(0, 20); // limit to 20 in sim for speed
+    const ok = await loadSimBars(symbols);
+    if (!ok) return;
+    // Reset portfolio for fresh sim
+    portfolio = CONFIG.startingCapital;
+    Object.keys(positions).forEach(k => delete positions[k]);
+    Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
+    totalWins = 0; totalLosses = 0;
+    realDailyStartEquity = CONFIG.startingCapital;
+    await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+      cash: portfolio, total_value: portfolio, day_pnl: 0,
+      total_wins: 0, total_losses: 0, circuit_breaker: false,
+      session: '🎮 SIM REPLAY', updated_at: new Date().toISOString(),
+    });
+    log('sim', `🎮 Sim portfolio reset to $${portfolio.toFixed(2)}`);
+  }
+
+  // Advance one bar
+  const snapshot = simAdvanceCursor();
+  if (!snapshot) return;
+
+  const barTime = simState.currentTime;
+  log('sim', `─── 🎮 SIM BAR [${barTime?.slice(11,16)||'?'}] cursor:${simState.cursor}/${simState.totalBars} ───`);
+
+  // Manage existing positions using replayed prices
+  for (const sym of Object.keys(positions)) {
+    const bars5m = snapshot[sym];
+    if (!bars5m || bars5m.length < 5) continue;
+    const price = bars5m[bars5m.length - 1].c;
+    priceHistory5m[sym] = bars5m.map(b => b.c);
+    await managePosition(sym, price, bars5m);
+  }
+  for (const sym of Object.keys(shortPositions)) {
+    const bars5m = snapshot[sym];
+    if (!bars5m || bars5m.length < 5) continue;
+    const price = bars5m[bars5m.length - 1].c;
+    await manageShort(sym, price, bars5m);
+  }
+
+  // Generate signals using replayed bars
+  const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
+  for (const sym of Object.keys(snapshot)) {
+    if (positions[sym] || shortPositions[sym]) continue;
+    const bars5m  = snapshot[sym];
+    const bars15m = simState.bars[sym]
+      ? simState.bars[sym].slice(0, simState.cursor + 1).filter((_, i) => i % 3 === 0) // approximate 15min
+      : null;
+    if (!bars5m || bars5m.length < 20) continue;
+
+    const price = bars5m[bars5m.length - 1].c;
+    priceHistory5m[sym] = bars5m.map(b => b.c);
+
+    let sig = generateSignal(sym, bars5m, bars15m);
+    sig = applyDayBias(sig);
+
+    if (sig.signal !== 'HOLD' && sig.score > 0) {
+      log('sim', `  ${sym} $${price.toFixed(2)} → ${sig.signal} (score:${sig.score} conf:${sig.confidence}%)`);
+    }
+
+    const confirmed = confirmSignal(sym, sig);
+    if (!confirmed) continue;
+
+    if (sig.signal === 'BUY' && totalOpen < CONFIG.maxOpenPositions) {
+      await enterPosition(sym, price, sig, bars5m, 'long');
+    } else if (sig.signal === 'SELL' && SHORTING_ENABLED && totalOpen < CONFIG.maxOpenPositions) {
+      await enterPosition(sym, price, sig, bars5m, 'short');
+    }
+  }
+
+  // Sync simulated portfolio to Supabase so dashboard updates live
+  const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    return acc + (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
+  }, 0);
+  const equity = portfolio + openPnl;
+  const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
+
+  realEquity = equity;
+
+  await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+    cash:            +portfolio.toFixed(2),
+    total_value:     +equity.toFixed(2),
+    day_pnl:         +dayPnl.toFixed(2),
+    total_wins:      totalWins,
+    total_losses:    totalLosses,
+    circuit_breaker: circuitBreakerOn,
+    last_scan:       new Date().toISOString(),
+    session:         `🎮 SIM [${barTime?.slice(11,16)||'?'}]`,
+    updated_at:      new Date().toISOString(),
+  });
+  await sbFetch('tc_equity', 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+  await syncLog('sim', `🎮 SIM bar ${simState.cursor}/${simState.totalBars} | Equity=$${equity.toFixed(2)} P&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
 }
 
 async function getAccount() {
@@ -2475,11 +2704,7 @@ function orbScoreBonus(symbol, price, direction) {
 // for better fill price. Falls back to market after 4 seconds.
 // For scalps: always market (speed > price improvement).
 async function placeSmartOrder(symbol, qty, side, isScalp = false) {
-  // Sim mode — instant fill, no Alpaca
-  if (isSimMode()) {
-    const price = priceHistory5m[symbol]?.[priceHistory5m[symbol].length - 1] || 100;
-    return simOrder(symbol, qty, side, price);
-  }
+  if (isSimMode()) return simOrder(symbol, qty, side);
   if (isScalp || !CONFIG.alpacaKey) return placeOrder(symbol, qty, side);
 
   try {
@@ -2564,13 +2789,24 @@ async function tick() {
   try {
     const now = Date.now();
 
-    // Run market screener every 3 minutes to refresh candidate list
+    // ── Simulation mode — use bar replay instead of live market ──
+    if (isSimMode()) {
+      if (now - lastFullScan >= FULL_SCAN_INTERVAL_MS) {
+        lastFullScan = now;
+        await runSimScan();
+      }
+      return; // skip all live market logic in sim mode
+    }
+
+    // ── Live / Paper mode ──
+
+    // Screener every 3 minutes
     if (isMarketOpen() && (now - lastScreenerRun >= SCREENER_INTERVAL_MS)) {
       lastScreenerRun    = now;
       screenerCandidates = await runMarketScreener();
     }
 
-    // Scalp scan — every 5s
+    // Scalp scan every 5s
     if (CONFIG.scalpMode && (now - lastScalpScan >= SCALP_SCAN_INTERVAL_MS)) {
       lastScalpScan = now;
       await runScalpScan();
