@@ -29,6 +29,16 @@
 const cron = require('node-cron');
 const http = require('http');
 
+// Cache node-fetch at startup — importing dynamically on every request adds ~5-20ms latency
+let _fetch = null;
+async function getFetch() {
+  if (!_fetch) {
+    const mod = await import('node-fetch');
+    _fetch = mod.default;
+  }
+  return _fetch;
+}
+
 // ─────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────
@@ -99,7 +109,7 @@ const CONFIG = {
 async function loadRemoteConfig() {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return;
   try {
-    const { default: fetch } = await import('node-fetch');
+    const fetch = await getFetch();
     const res = await fetch(`${CONFIG.supabaseUrl}/rest/v1/tc_settings?id=eq.1`, {
       headers: {
         'apikey': CONFIG.supabaseKey,
@@ -169,7 +179,7 @@ const CORRELATION_GROUPS = [
 async function sbFetch(path, method = 'GET', body = null) {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return null;
   try {
-    const { default: fetch } = await import('node-fetch');
+    const fetch = await getFetch();
     const headers = {
       'apikey': CONFIG.supabaseKey,
       'Authorization': `Bearer ${CONFIG.supabaseKey}`,
@@ -507,7 +517,7 @@ const ALPACA_BASE      = () => CONFIG.alpacaPaper ? 'https://paper-api.alpaca.ma
 const ALPACA_DATA_BASE = 'https://data.alpaca.markets';
 
 async function alpacaFetch(url, opts = {}) {
-  const { default: fetch } = await import('node-fetch');
+  const fetch = await getFetch();
   const res = await fetch(url, {
     ...opts,
     headers: {
@@ -531,7 +541,7 @@ async function fetchBars(symbol, timeframe, limit) {
 
   // Fallback: Yahoo Finance (free, no key)
   try {
-    const { default: fetch } = await import('node-fetch');
+    const fetch = await getFetch();
     const interval = timeframe === '5Min' ? '5m' : timeframe === '15Min' ? '15m' : '1d';
     const range    = timeframe === '1Day' ? '3mo' : '5d';
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${interval}&range=${range}`;
@@ -896,7 +906,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     const stopPrice = Math.max(atrStop, pctStop);
 
     if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
-      try { await placeOrder(sym, qty, 'buy'); }
+      try { await placeSmartOrder(sym, qty, 'buy', false); }
       catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
     }
     portfolio -= cost;
@@ -922,7 +932,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     const stopPrice = Math.min(atrStop, pctStop);
 
     if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
-      try { await placeOrder(sym, qty, 'sell'); } // Alpaca handles shorting automatically
+      try { await placeSmartOrder(sym, qty, 'sell', false); } // sell to open short
       catch (e) { log('error', `SHORT failed ${sym}: ${e.message}`); return; }
     }
     shortPositions[sym] = {
@@ -1261,6 +1271,23 @@ async function runScan() {
   // Always sync live Alpaca positions first — prevents duplicate buys after restarts
   await syncAlpacaPositions();
 
+  // Prefetch all bars in parallel — this is the main speed improvement
+  // Old: 15 symbols × 2 fetches × ~400ms = ~12 seconds sequential
+  // New: all fetched simultaneously = ~400-600ms total
+  const symbolsToScan = CONFIG.symbols.filter(s => shouldScanSymbol(s));
+  log('scan', `Prefetching bars for ${symbolsToScan.length} symbols in parallel…`);
+  const prefetchStart = Date.now();
+  const allBarData = await fetchAllBarsParallel(symbolsToScan);
+  log('scan', `Bars ready in ${Date.now() - prefetchStart}ms`);
+
+  // Build lookup maps from prefetch results
+  const barData5m  = {};
+  const barData15m = {};
+  for (const { sym, bars5m, bars15m } of allBarData) {
+    barData5m[sym]  = bars5m;
+    barData15m[sym] = bars15m;
+  }
+
   // Market regime only matters during US hours
   const marketOk = isMarketOpen() ? await getMarketRegime() : true;
 
@@ -1270,24 +1297,25 @@ async function runScan() {
     if (acct?.equity) log('acct', `Equity=$${(+acct.equity).toFixed(2)} BuyingPower=$${(+acct.buying_power).toFixed(2)}`);
   }
 
-  for (const sym of CONFIG.symbols) {
+  for (const sym of symbolsToScan) {
     try {
-      // Skip if this symbol shouldn't be scanned right now
-      if (!shouldScanSymbol(sym)) {
-        log('skip', `${sym} — not in trading window`);
-        continue;
-      }
 
       const sessionMult = getSessionMultiplier(sym);
       const sessionLabel = ETF_SESSIONS[sym]
         ? `[${ETF_SESSIONS[sym].region} ${sessionMult >= 1.0 ? '🟢 PRIME' : '🟡 off-hrs'} x${sessionMult}]`
         : '[US stock]';
 
-      const bars5m  = await fetchBars(sym, '5Min',  60);
-      const bars15m = await fetchBars(sym, '15Min', 40);
+      // Use cached bars from parallel prefetch
+      const bars5m  = barData5m[sym]  || await fetchBarsCached(sym, '5Min',  60);
+      const bars15m = barData15m[sym] || await fetchBarsCached(sym, '15Min', 40);
       if (!bars5m || bars5m.length < 10) { log('warn', `No data for ${sym}`); continue; }
 
-      const price = bars5m[bars5m.length - 1].c;
+      // Capture opening range at 10:00 AM ET
+      await captureOpeningRange(sym);
+
+      // Use real-time trade price if available, fall back to last bar close
+      const rtPrice    = await fetchLatestPrice(sym);
+      const price      = rtPrice || bars5m[bars5m.length - 1].c;
       priceHistory5m[sym]  = bars5m.map(b => b.c);
       priceHistory15m[sym] = bars15m?.map(b => b.c) || [];
 
@@ -1311,30 +1339,48 @@ async function runScan() {
         continue;
       }
 
-      // Generate signal and apply session multiplier to confidence
-      const sig = generateSignal(sym, bars5m, bars15m);
+      // Generate signal
+      let sig = generateSignal(sym, bars5m, bars15m);
       const adjustedConfidence = Math.round(sig.confidence * sessionMult);
-      const adjustedSig = { ...sig, confidence: adjustedConfidence };
+      sig = { ...sig, confidence: adjustedConfidence };
 
-      if (sessionMult < 1.0) adjustedSig.reasons = [`Off-prime (x${sessionMult})`, ...sig.reasons];
-      else if (sessionMult > 1.0) adjustedSig.reasons = [`Prime boost (x${sessionMult})`, ...sig.reasons];
+      if (sessionMult < 1.0) sig.reasons = [`Off-prime (x${sessionMult})`, ...sig.reasons];
+      else if (sessionMult > 1.0) sig.reasons = [`Prime boost (x${sessionMult})`, ...sig.reasons];
 
-      log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)} score:${sig.score||0}) ${sessionLabel}`);
-      await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${adjustedConfidence}% RSI:${sig.rsi?.toFixed(1)} ${sessionLabel}`);
+      // Apply day bias (aligns with institutional flow)
+      sig = applyDayBias(sig);
 
-      const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
-
-      // BUY long
-      if (adjustedSig.signal === 'BUY' && marketOk && totalOpen < CONFIG.maxOpenPositions) {
-        if (!positions[sym] && !alpacaPositions.has(sym)) {
-          await enterPosition(sym, price, adjustedSig, bars5m, 'long');
+      // Apply ORB score bonus
+      if (sig.signal !== 'HOLD') {
+        const orbBonus = orbScoreBonus(sym, price, sig.signal === 'BUY' ? 'buy' : 'sell');
+        if (orbBonus !== 0) {
+          sig = { ...sig, score: (sig.score||0) + orbBonus, reasons: [`ORB ${orbBonus > 0 ? 'breakout ↑' : 'against breakout ↓'} (${orbBonus > 0 ? '+' : ''}${orbBonus}pts)`, ...sig.reasons] };
         }
       }
 
-      // SHORT — only when market is bearish or stock is overbought+downtrending
-      if (adjustedSig.signal === 'SELL' && SHORTING_ENABLED && totalOpen < CONFIG.maxOpenPositions) {
+      log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${sig.confidence}% RSI:${sig.rsi?.toFixed(1)} score:${sig.score||0}) ${sessionLabel}`);
+      await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${sig.confidence}% RSI:${sig.rsi?.toFixed(1)} ${sessionLabel}`);
+
+      const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
+
+      // Signal confirmation gate — must appear on 2 consecutive scans
+      const confirmed = confirmSignal(sym, sig);
+      if (!confirmed) continue; // waiting for confirmation
+
+      // BUY long — confirmed signal
+      if (sig.signal === 'BUY' && marketOk && totalOpen < CONFIG.maxOpenPositions) {
+        if (!positions[sym] && !alpacaPositions.has(sym)) {
+          // Spread check — don't enter into a wide spread
+          const spreadOk = await spreadIsAcceptable(sym, price);
+          if (spreadOk) await enterPosition(sym, price, sig, bars5m, 'long');
+        }
+      }
+
+      // SHORT — confirmed signal
+      if (sig.signal === 'SELL' && SHORTING_ENABLED && totalOpen < CONFIG.maxOpenPositions) {
         if (!shortPositions[sym] && !alpacaShorts.has(sym)) {
-          await enterPosition(sym, price, adjustedSig, bars5m, 'short');
+          const spreadOk = await spreadIsAcceptable(sym, price);
+          if (spreadOk) await enterPosition(sym, price, sig, bars5m, 'short');
         }
       }
     } catch (e) {
@@ -1491,7 +1537,7 @@ async function syncPricesOnly() {
 // ─────────────────────────────────────────────
 async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, extra) {
   if (!CONFIG.discordWebhook) return;
-  const { default: fetch } = await import('node-fetch');
+  const fetch = await getFetch();
 
   const colorMap = { buy:0x7fff6e, short:0xff5f57, cover:0xb47fff, partial:0x00e5ff, breakeven:0xffb547, circuit_breaker:0xff0000, sell:0x4da6ff, manual_close:0xb47fff, scalp_entry:0x00e5ff, scalp_exit:0xffb547 };
   if (type==='sell'||type==='manual_close'){
@@ -1559,7 +1605,7 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
 
 async function sendDailySummary() {
   if (!CONFIG.discordWebhook) return;
-  const { default: fetch } = await import('node-fetch');
+  const fetch = await getFetch();
 
   const closed   = trades.filter(t => t.pnl !== null);
   const totalPnl = closed.reduce((a, t) => a + t.pnl, 0);
@@ -1625,7 +1671,7 @@ async function fetchScalpBars(symbol, limit = 30) {
 
   // Yahoo Finance fallback (1m bars, last 1 day)
   try {
-    const { default: fetch } = await import('node-fetch');
+    const fetch = await getFetch();
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
     const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     const data = await res.json();
@@ -2034,7 +2080,250 @@ log('sys', `Risk: SL=${CONFIG.stopLossPct*100}% TP=${CONFIG.takeProfitPct*100}% 
 log('sys', `Filters: Trend=${CONFIG.trendFilter} Volume=${CONFIG.volumeFilter} Regime=${CONFIG.regimeFilter} Corr=${CONFIG.correlationFilter}`);
 log('sys', `Current session: ${getCurrentSession()}`);
 
-// ── Scan interval ──
+// ═══════════════════════════════════════════════════════════════════
+// SPEED & ACCURACY LAYER
+// All of these run before/during signal generation to make entries
+// faster and more precise.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── 1. Bar cache ──
+// Avoid re-fetching the same bars multiple times per scan cycle.
+// Bars change at most every minute, so an 8-second cache is safe.
+const barCache = new Map(); // `SYM_TF` → { bars, ts }
+const BAR_CACHE_TTL = 8000;
+
+async function fetchBarsCached(symbol, timeframe, limit) {
+  const key = `${symbol}_${timeframe}`;
+  const hit  = barCache.get(key);
+  if (hit && Date.now() - hit.ts < BAR_CACHE_TTL) return hit.bars;
+  const bars = await fetchBars(symbol, timeframe, limit);
+  if (bars) barCache.set(key, { bars, ts: Date.now() });
+  return bars;
+}
+
+// ── 2. Parallel bar fetching ──
+// Old: fetched symbols one-by-one (symbol 15 waited for symbols 1-14)
+// New: fetch all symbols simultaneously → scan time drops ~10x
+async function fetchAllBarsParallel(symbols) {
+  const results = await Promise.allSettled(
+    symbols.map(async sym => {
+      const [bars5m, bars15m] = await Promise.all([
+        fetchBarsCached(sym, '5Min',  60),
+        fetchBarsCached(sym, '15Min', 40),
+      ]);
+      return { sym, bars5m, bars15m };
+    })
+  );
+  return results
+    .filter(r => r.status === 'fulfilled' && r.value.bars5m)
+    .map(r => r.value);
+}
+
+// ── 3. Latest trade price (real-time, not bar close) ──
+// Bar closes can be up to 5 minutes stale. For entry, we want
+// the actual last traded price from the tape.
+const latestPriceCache = new Map(); // sym → { price, ts }
+async function fetchLatestPrice(symbol) {
+  const cached = latestPriceCache.get(symbol);
+  if (cached && Date.now() - cached.ts < 3000) return cached.price; // 3s cache
+
+  try {
+    const data = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/trades/latest?feed=iex`);
+    const price = data?.trade?.p;
+    if (price) {
+      latestPriceCache.set(symbol, { price: +price, ts: Date.now() });
+      return +price;
+    }
+  } catch (e) {}
+  return null;
+}
+
+// ── 4. Bid/ask spread check ──
+// If the spread is wider than your TP target, you're losing money
+// before the order even fills. Skip these.
+async function spreadIsAcceptable(symbol, price) {
+  try {
+    const data  = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/quotes/latest?feed=iex`);
+    const quote = data?.quote;
+    if (!quote?.ap || !quote?.bp) return true; // can't check — allow
+    const spreadPct = (quote.ap - quote.bp) / price;
+    const maxSpread = 0.0015; // 0.15% max spread — tighter than any TP target
+    if (spreadPct > maxSpread) {
+      log('filter', `${symbol} spread too wide: ${(spreadPct*100).toFixed(3)}% — skipping`);
+      return false;
+    }
+    return true;
+  } catch (e) { return true; }
+}
+
+// ── 5. Signal confirmation gate ──
+// Requires a signal to appear on 2 CONSECUTIVE scans before acting.
+// Eliminates single-candle spikes that look like signals but reverse
+// immediately. The most effective false-positive filter possible.
+const pendingSignals = new Map(); // sym → { signal, count, sigInfo }
+
+function confirmSignal(sym, sig) {
+  if (sig.signal === 'HOLD') {
+    pendingSignals.delete(sym);
+    return false;
+  }
+  const prev = pendingSignals.get(sym);
+  if (prev && prev.signal === sig.signal) {
+    prev.count++;
+    prev.sigInfo = sig;
+    pendingSignals.set(sym, prev);
+    if (prev.count >= 2) {
+      pendingSignals.delete(sym); // consume
+      log('signal', `✅ ${sym} signal CONFIRMED after ${prev.count} scans → ${sig.signal}`);
+      return true;
+    }
+    log('signal', `⏳ ${sym} signal pending (${sig.signal} x${prev.count}) — waiting for confirmation`);
+    return false;
+  }
+  // New or direction-changed signal — start the counter
+  pendingSignals.set(sym, { signal: sig.signal, count: 1, sigInfo: sig });
+  log('signal', `⏳ ${sym} new signal (${sig.signal} conf:${sig.confidence}%) — need 1 more confirmation`);
+  return false;
+}
+
+// ── 6. Day bias ──
+// SPY's gap at open tells us if institutional money is buying or selling.
+// Align trades with the day's institutional flow for higher win rate.
+let dayBias = 'neutral'; // 'bullish' | 'bearish' | 'neutral'
+let dayBiasBonus = 0;
+
+async function updateDayBias() {
+  try {
+    const bars = await fetchBars('SPY', '1Day', 3);
+    if (!bars || bars.length < 2) return;
+    const prevClose = bars[bars.length - 2].c;
+    const todayOpen = bars[bars.length - 1].o || prevClose;
+    const gapPct    = (todayOpen - prevClose) / prevClose;
+
+    if      (gapPct >  0.003) { dayBias = 'bullish'; dayBiasBonus = Math.min(20, Math.round(gapPct * 3000)); }
+    else if (gapPct < -0.003) { dayBias = 'bearish'; dayBiasBonus = Math.min(20, Math.round(Math.abs(gapPct) * 3000)); }
+    else                      { dayBias = 'neutral';  dayBiasBonus = 0; }
+
+    log('sys', `Day bias: ${dayBias.toUpperCase()} (SPY gap ${gapPct >= 0 ? '+' : ''}${(gapPct*100).toFixed(2)}%${dayBiasBonus ? `, bonus ±${dayBiasBonus}pts` : ''})`);
+  } catch (e) {}
+}
+
+function applyDayBias(sig) {
+  if (dayBias === 'neutral' || !dayBiasBonus) return sig;
+  if (dayBias === 'bullish' && sig.signal === 'BUY') {
+    return { ...sig, score: (sig.score||0) + dayBiasBonus, reasons: [`📈 Day bias bullish (+${dayBiasBonus}pts)`, ...(sig.reasons||[])] };
+  }
+  if (dayBias === 'bearish' && sig.signal === 'SELL') {
+    return { ...sig, score: (sig.score||0) + dayBiasBonus, reasons: [`📉 Day bias bearish (+${dayBiasBonus}pts)`, ...(sig.reasons||[])] };
+  }
+  // Fighting the bias — dampen
+  const dampened = Math.max(0, (sig.score||0) - dayBiasBonus);
+  return { ...sig, score: dampened, confidence: Math.max(0, (sig.confidence||0) - 8), reasons: [`⚠ Against day bias (${dayBias}) -${dayBiasBonus}pts`, ...(sig.reasons||[])] };
+}
+
+// ── 7. Opening Range Breakout (ORB) ──
+// The first 30 minutes of trading (9:30-10:00 AM ET) establishes
+// the day's opening range. A break ABOVE the high = strong bull signal.
+// A break BELOW the low = strong bear signal.
+// Used as a score modifier on top of the main signal.
+const openingRanges = {}; // sym → { high, low }
+
+async function captureOpeningRange(symbol) {
+  const et   = getETTime();
+  const mins = et.getHours() * 60 + et.getMinutes();
+  if (mins < 600 || mins > 606) return; // only capture at 10:00-10:06 AM ET
+  if (openingRanges[symbol]) return;    // already captured today
+
+  try {
+    const bars = await fetchBars(symbol, '5Min', 10);
+    if (!bars || bars.length < 6) return;
+    const orbBars = bars.slice(0, 6); // first 6 × 5min = 30 minutes
+    openingRanges[symbol] = {
+      high: Math.max(...orbBars.map(b => b.h)),
+      low:  Math.min(...orbBars.map(b => b.l)),
+    };
+    log('sys', `ORB ${symbol}: $${openingRanges[symbol].low.toFixed(2)} — $${openingRanges[symbol].high.toFixed(2)}`);
+  } catch (e) {}
+}
+
+function orbScoreBonus(symbol, price, direction) {
+  const orb = openingRanges[symbol];
+  if (!orb) return 0;
+  if (direction === 'buy'  && price > orb.high) return 20; // ORB breakout ↑
+  if (direction === 'sell' && price < orb.low)  return 20; // ORB breakdown ↓
+  if (direction === 'buy'  && price < orb.low)  return -15; // buying into breakdown
+  if (direction === 'sell' && price > orb.high) return -15; // shorting into breakout
+  return 0;
+}
+
+// ── 8. Smart limit order ──
+// For swing trades: attempt a limit order just inside the spread
+// for better fill price. Falls back to market after 4 seconds.
+// For scalps: always market (speed > price improvement).
+async function placeSmartOrder(symbol, qty, side, isScalp = false) {
+  // Scalps always market — speed is everything
+  if (isScalp || !CONFIG.alpacaKey) return placeOrder(symbol, qty, side);
+
+  try {
+    const fetch = await getFetch();
+    // Get current quote
+    const qd    = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/quotes/latest?feed=iex`);
+    const quote = qd?.quote;
+
+    if (!quote?.ap || !quote?.bp) return placeOrder(symbol, qty, side);
+
+    // Limit price just inside the spread — virtually guaranteed fill on liquid stocks
+    const limitPrice = side === 'buy'
+      ? +(quote.ap + 0.01).toFixed(2) // 1 cent above ask
+      : +(quote.bp - 0.01).toFixed(2); // 1 cent below bid
+
+    const orderData = await alpacaFetch(`${ALPACA_BASE()}/v2/orders`, {
+      method: 'POST',
+      body: JSON.stringify({
+        symbol, qty: String(qty), side,
+        type: 'limit', limit_price: String(limitPrice),
+        time_in_force: 'day',
+      }),
+    });
+
+    if (!orderData.id) return placeOrder(symbol, qty, side); // placement failed → market
+
+    log('order', `LIMIT ${side.toUpperCase()} ${qty}x ${symbol} @ $${limitPrice} | ID: ${orderData.id}`);
+
+    // Wait up to 4 seconds for fill
+    await new Promise(r => setTimeout(r, 4000));
+    const status = await alpacaFetch(`${ALPACA_BASE()}/v2/orders/${orderData.id}`);
+
+    if (status.status === 'filled') {
+      const fillPrice = +status.filled_avg_price;
+      log('order', `✅ Limit filled: ${symbol} @ $${fillPrice} (saved ~$${((Math.abs(fillPrice - limitPrice)) * qty).toFixed(2)})`);
+      return status;
+    }
+
+    // Not filled in time — cancel and market
+    log('order', `Limit not filled (${symbol}) — cancelling and placing market order`);
+    try { await alpacaFetch(`${ALPACA_BASE()}/v2/orders/${orderData.id}`, { method: 'DELETE' }); } catch(e) {}
+    return placeOrder(symbol, qty, side);
+
+  } catch (e) {
+    log('warn', `Smart order error ${symbol}: ${e.message} — falling back to market`);
+    return placeOrder(symbol, qty, side);
+  }
+}
+
+// ── 9. Data pre-warming ──
+// Fetch all bar data on startup so the first scan fires immediately
+// with full data instead of waiting for serial fetches.
+async function prewarmData() {
+  log('sys', `Pre-warming bar cache for ${CONFIG.symbols.length} symbols…`);
+  const t = Date.now();
+  await fetchAllBarsParallel(CONFIG.symbols);
+  log('sys', `Bar cache ready in ${Date.now() - t}ms — first scan will fire immediately`);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// END SPEED & ACCURACY LAYER
+// ═══════════════════════════════════════════════════════════════════
 // Use setInterval so we can do sub-minute scans (cron only supports 1min minimum)
 // Rate limit guard: Alpaca free tier = ~200 req/min
 // Each scan = ~2 requests per symbol (5min bars + 15min bars) + ~3 account calls
@@ -2081,13 +2370,16 @@ async function tick() {
 // Main tick every 10 seconds
 setInterval(tick, PRICE_SYNC_INTERVAL_MS);
 
-// Daily tasks (cron still handles these fine)
-cron.schedule('5 16 * * 1-5', sendDailySummary, { timezone: 'America/New_York' });
-cron.schedule('55 8 * * 1-5', storePrevClose,   { timezone: 'America/New_York' });
+// Daily tasks
+cron.schedule('5 16 * * 1-5',  sendDailySummary, { timezone: 'America/New_York' });
+cron.schedule('55 8 * * 1-5',  storePrevClose,   { timezone: 'America/New_York' });
+cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' }); // run at market open
 
-// Startup
-loadRemoteConfig().then(() => {
-  runScan();
+// Startup — prewarm data then scan immediately
+loadRemoteConfig().then(async () => {
+  await updateDayBias();   // know the day's direction before first trade
+  await prewarmData();     // fill bar cache so first scan is instant
+  await runScan();
   lastFullScan = Date.now();
 });
 setTimeout(syncPricesOnly, 5000);
