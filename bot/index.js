@@ -88,6 +88,7 @@ const CONFIG = {
   // ── Mode controls (overridden by dashboard via Supabase) ──
   swingEnabled:        process.env.SWING_ENABLED !== 'false', // default on
   scalpMode:           process.env.SCALP_MODE === 'true',
+  shortsEnabled:       process.env.ENABLE_SHORTS === 'true', // default OFF
   scalpSymbols:        (process.env.SCALP_SYMBOLS || 'SPY,QQQ,AAPL,TSLA,NVDA').split(',').map(s => s.trim().toUpperCase()),
   scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.4)  / 100, // take profit at +0.4%
   scalpSlPct:          +(process.env.SCALP_SL_PCT        || 0.2)  / 100, // stop loss at -0.2%
@@ -150,8 +151,9 @@ async function loadRemoteConfig() {
     if (s.correlation_filter !== undefined) CONFIG.correlationFilter = !!s.correlation_filter;
 
     // Mode flags — controlled from dashboard
-    if (s.swing_enabled !== undefined) CONFIG.swingEnabled = !!s.swing_enabled;
-    if (s.scalp_mode    !== undefined) CONFIG.scalpMode    = !!s.scalp_mode;
+    if (s.swing_enabled  !== undefined) CONFIG.swingEnabled  = !!s.swing_enabled;
+    if (s.scalp_mode     !== undefined) CONFIG.scalpMode     = !!s.scalp_mode;
+    if (s.shorts_enabled !== undefined) CONFIG.shortsEnabled = !!s.shorts_enabled;
     if (s.sim_mode !== undefined) {
       const newMode = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
       if (newMode !== CONFIG.mode) {
@@ -1269,14 +1271,40 @@ function generateSignal(sym, bars5m, bars15m) {
   else reasons.push(`MACD aligned ${direction === 'buy' ? 'bullish' : 'bearish'}`);
   passedGates++;
 
-  // ── GATE 3: 200 EMA trend alignment ──
-  // Never fight the primary trend. Long only above 200 EMA, short only below.
+  // ── GATE 3: Trend alignment ──
+  // For LONGS: price must be above 5-min 200 EMA (short-term uptrend)
+  // For SHORTS: much stricter — need BOTH 5-min below 200 EMA AND daily downtrend
   if (c5.length >= 30) {
     const e200 = ema(c5, Math.min(200, c5.length));
-    if      (direction === 'buy'  && price > e200) { reasons.push(`Above 200 EMA ✅`); passedGates++; }
-    else if (direction === 'sell' && price < e200) { reasons.push(`Below 200 EMA ✅`); passedGates++; }
-    else {
-      return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `200 EMA against signal — skip`], rsi: r };
+    if (direction === 'buy') {
+      if (price > e200) { reasons.push(`Above 200 EMA ✅`); passedGates++; }
+      else return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `Below 200 EMA — no long`], rsi: r };
+    } else {
+      // Shorts: must be below 200 EMA on 5-min
+      if (price >= e200) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `Above 200 EMA — no short`], rsi: r };
+      reasons.push(`Below 200 EMA ✅`);
+      passedGates++;
+
+      // Shorts: ALSO require 15-min downtrend confirmed (not just 5-min)
+      // This prevents shorting a stock that's only pulling back intraday
+      if (c15 && c15.length >= 20) {
+        const e50_15 = ema(c15, Math.min(50, c15.length));
+        const e20_15 = ema(c15, Math.min(20, c15.length));
+        const price15 = c15[c15.length - 1];
+        if (price15 >= e50_15) {
+          return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `15min above 50 EMA — stock in uptrend, no short`], rsi: r };
+        }
+        if (e20_15 >= e50_15) {
+          return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `15min EMA20 above EMA50 — uptrend, no short`], rsi: r };
+        }
+        reasons.push(`15min confirmed downtrend ✅`);
+      }
+
+      // Shorts: RSI must be truly overbought (>65), not just leaning
+      // Shorting on RSI 62-65 is too risky — needs real exhaustion
+      if (r < 65) {
+        return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `RSI ${r.toFixed(1)} not overbought enough for short (need >65)`], rsi: r };
+      }
     }
   }
 
@@ -1380,10 +1408,12 @@ function generateSignal(sym, bars5m, bars15m) {
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
 
-  // ── Shorting requires extra conviction ──
-  // Stocks have natural upward drift — short signals need more gates
-  if (direction === 'sell' && bonus < 2) {
-    reasons.push(`Short needs 2+ bonus confirmations (only ${bonus}) — skip`);
+  // ── Shorting requires much more conviction than going long ──
+  // Stocks have natural upward drift — the market always assumes growth.
+  // A short that fails means you're fighting the trend AND the market makers.
+  // Requirements: 3+ bonus confirmations (vs 1 for longs) and higher RSI threshold
+  if (direction === 'sell' && bonus < 3) {
+    reasons.push(`Short needs 3+ bonus confirmations (only ${bonus}) — skip`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
 
@@ -2032,7 +2062,7 @@ async function runScan() {
 // Live Alpaca positions — refreshed every scan to prevent duplicate buys
 let alpacaPositions = new Set();
 let alpacaShorts    = new Set();
-const SHORTING_ENABLED = process.env.ENABLE_SHORTS !== 'false'; // default on
+const SHORTING_ENABLED = process.env.ENABLE_SHORTS === 'true'; // default OFF — must explicitly enable
 
 async function syncAlpacaPositions() {
   if (isSimMode()) return; // sim tracks positions in memory — no Alpaca sync needed
@@ -2228,16 +2258,24 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
           RESISTANCE_EXIT:'🧱 Resistance Exit',SIGNAL:'SELL Signal'}[reason]||'Exit',
   };
 
+  const displayEquity = realEquity > 0 ? realEquity : portfolio;
+  const openPnlTotal  = Object.entries(positions).reduce((a, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    return a + (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
+  }, 0);
+  const dayPnlDisplay = realDailyStartEquity > 0 ? displayEquity - realDailyStartEquity : openPnlTotal;
+
   const fields = [
     sym!=='ALL' ? {name:'Symbol',value:sym,inline:true} : null,
     qty>0       ? {name:'Shares',value:String(qty),inline:true} : null,
     price>0     ? {name:'Price',value:`$${price.toFixed(2)}`,inline:true} : null,
-    pnl!==undefined ? {name:'P&L',value:`${pnl>=0?'+':''}$${pnl.toFixed(2)}`,inline:true} : null,
+    pnl!==undefined ? {name:'Trade P&L',value:`${pnl>=0?'+':''}$${(+pnl).toFixed(2)}`,inline:true} : null,
     extra?.stopPrice ? {name:'Stop Loss',value:`$${extra.stopPrice.toFixed(2)}`,inline:true} : null,
-    extra?.atrVal    ? {name:'ATR',value:extra.atrVal.toFixed(2),inline:true} : null,
-    {name:'Portfolio',value:`$${portfolio.toFixed(2)}`,inline:true},
+    extra?.atrVal    ? {name:'ATR',value:(+extra.atrVal).toFixed(2),inline:true} : null,
+    {name:'Account Value',value:`$${displayEquity.toFixed(2)}`,inline:true},
+    {name:'Day P&L',value:`${dayPnlDisplay>=0?'+':''}$${dayPnlDisplay.toFixed(2)}`,inline:true},
     {name:'W / L',value:`${totalWins} / ${totalLosses}`,inline:true},
-    {name:'Mode',value:CONFIG.alpacaPaper?'📄 Paper':'💰 LIVE',inline:true},
+    {name:'Mode',value:isSimMode()?'🎮 Sim':CONFIG.alpacaPaper?'📄 Paper':'💰 LIVE',inline:true},
     type==='manual_close' ? {name:'Source',value:'Closed manually in Alpaca/TradingView',inline:false} : null,
   ].filter(Boolean);
 
@@ -2276,8 +2314,8 @@ async function sendDailySummary() {
       title: '📊 TradeCore Pro — End of Day Summary',
       color: totalPnl >= 0 ? 0x7fff6e : 0xff5f57,
       fields: [
-        { name: 'Portfolio',     value: `$${portfolio.toFixed(2)}`, inline: true },
-        { name: 'Day P&L',       value: `${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`, inline: true },
+        { name: 'Account Value',  value: `$${(realEquity > 0 ? realEquity : portfolio).toFixed(2)}`, inline: true },
+        { name: 'Day P&L',        value: `${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`, inline: true },
         { name: 'Win Rate',      value: `${winRate}%`, inline: true },
         { name: 'Trades Today',  value: String(closed.length), inline: true },
         { name: 'W / L',         value: `${totalWins} / ${totalLosses}`, inline: true },
@@ -2829,16 +2867,21 @@ function confirmSignal(sym, sig) {
     prev.count++;
     prev.sigInfo = sig;
     pendingSignals.set(sym, prev);
-    if (prev.count >= 3) {  // 3 consecutive scans = ~90 seconds of signal holding
+
+    // Shorts need 5 consecutive confirmations (~2.5 min), longs need 3 (~90s)
+    const required = sig.signal === 'SELL' ? 5 : 3;
+
+    if (prev.count >= required) {
       pendingSignals.delete(sym);
       log('signal', `✅ ${sym} signal CONFIRMED after ${prev.count} scans → ${sig.signal} (conf:${sig.confidence}%)`);
       return true;
     }
-    log('signal', `⏳ ${sym} signal pending (${sig.signal} x${prev.count}/3)`);
+    log('signal', `⏳ ${sym} ${sig.signal} pending (${prev.count}/${required})`);
     return false;
   }
+  const required = sig.signal === 'SELL' ? 5 : 3;
   pendingSignals.set(sym, { signal: sig.signal, count: 1, sigInfo: sig });
-  log('signal', `⏳ ${sym} new signal (${sig.signal} conf:${sig.confidence}%) — need 2 more confirmations`);
+  log('signal', `⏳ ${sym} new signal (${sig.signal} conf:${sig.confidence}%) — need ${required - 1} more confirmations`);
   return false;
 }
 
