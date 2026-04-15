@@ -566,6 +566,149 @@ async function fetchBars(symbol, timeframe, limit) {
   return null;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// MARKET SCREENER
+// ═══════════════════════════════════════════════════════════════════
+//
+// Two-stage pipeline:
+//  Stage 1 (screener): 1 API call → snapshots for ~150 stocks
+//                      Scores each by volume, momentum, range
+//                      Returns top 25 candidates in ~500ms
+//  Stage 2 (signal):   Full RSI/MACD/VWAP/ADX analysis on candidates
+//
+// Favorites (watchlist) are always included regardless of screener.
+
+const UNIVERSE = [
+  'AAPL','MSFT','GOOGL','AMZN','META','NVDA','TSLA','AMD','INTC','QCOM',
+  'ORCL','CRM','ADBE','NFLX','PYPL','SHOP','SNOW','UBER','LYFT','COIN',
+  'JPM','BAC','GS','MS','WFC','C','BLK','SCHW','V','MA','AXP',
+  'JNJ','UNH','PFE','ABBV','MRK','LLY','BMY','GILD','AMGN',
+  'WMT','TGT','COST','HD','LOW','NKE','MCD','SBUX','DKNG',
+  'XOM','CVX','SLB','OXY','MPC','VLO',
+  'BA','CAT','DE','MMM','HON','UPS','FDX',
+  'SPY','QQQ','IWM','DIA','XLK','XLF','XLE','XLV','XLI',
+  'GLD','SLV','TLT','HYG','XBI','ARKK','SQQQ','TQQQ',
+  'PLTR','SOFI','RIVN','NIO','RBLX','HOOD','AFRM',
+  'MARA','RIOT','CLSK','GME','AMC',
+  'MU','AMAT','LRCX','KLAC','MRVL','TXN','AVGO',
+  'PANW','CRWD','ZS','NET','DDOG','MDB','OKTA',
+];
+
+let screenerCandidates = [];
+let lastScreenerRun    = 0;
+const SCREENER_INTERVAL_MS = 3 * 60 * 1000; // re-screen every 3 minutes
+
+function scoreSnapshot(sym, snap) {
+  let score = 0;
+  const reasons = [];
+  const dailyBar = snap.dailyBar, prevDay = snap.prevDailyBar;
+  const minuteBar = snap.minuteBar, latestTrade = snap.latestTrade;
+  const latestQuote = snap.latestQuote;
+  if (!dailyBar || !latestTrade) return null;
+
+  const price    = latestTrade.p || dailyBar.c;
+  const dayVol   = dailyBar.v || 0;
+  const prevVol  = prevDay?.v || 0;
+  const dayHigh  = dailyBar.h || price;
+  const dayLow   = dailyBar.l || price;
+  const prevClose= prevDay?.c || price;
+  const dayOpen  = dailyBar.o || prevClose;
+
+  if (price < 5 || price > 2000) return null;
+  if (dayVol < 500000) return null;
+  if (latestQuote?.ap && latestQuote?.bp) {
+    if ((latestQuote.ap - latestQuote.bp) / price > 0.003) return null;
+  }
+
+  const volRatio = prevVol > 0 ? dayVol / prevVol : 1;
+  if      (volRatio > 3.0) { score += 40; reasons.push(`Volume ${volRatio.toFixed(1)}x 🔥`); }
+  else if (volRatio > 2.0) { score += 30; reasons.push(`Volume ${volRatio.toFixed(1)}x strong`); }
+  else if (volRatio > 1.5) { score += 20; reasons.push(`Volume ${volRatio.toFixed(1)}x`); }
+  else if (volRatio < 0.5) return null;
+
+  const dayChangePct = (price - prevClose) / prevClose;
+  if      (Math.abs(dayChangePct) > 0.05)  { score += 30; reasons.push(`Move ${(dayChangePct*100).toFixed(1)}% 🔥`); }
+  else if (Math.abs(dayChangePct) > 0.03)  { score += 20; reasons.push(`Move ${(dayChangePct*100).toFixed(1)}%`); }
+  else if (Math.abs(dayChangePct) > 0.015) { score += 10; reasons.push(`Move ${(dayChangePct*100).toFixed(1)}%`); }
+  else if (Math.abs(dayChangePct) < 0.005) score -= 10;
+
+  const dayRange = dayHigh - dayLow;
+  const rangeRatio = dayRange / price;
+  if      (rangeRatio > 0.04)  { score += 25; reasons.push(`Wide range ${(rangeRatio*100).toFixed(1)}%`); }
+  else if (rangeRatio > 0.02)  { score += 15; reasons.push(`Range ${(rangeRatio*100).toFixed(1)}%`); }
+  else if (rangeRatio < 0.005) return null;
+
+  if (dayRange > 0) {
+    const posInRange = (price - dayLow) / dayRange;
+    if      (posInRange > 0.85) { score += 20; reasons.push('Near day high'); }
+    else if (posInRange < 0.15) { score += 20; reasons.push('Near day low'); }
+    else                         score +=  5;
+  }
+
+  const gapPct = (dayOpen - prevClose) / prevClose;
+  if (Math.abs(gapPct) > 0.02) { score += 15; reasons.push(`Gap ${gapPct > 0 ? 'up' : 'dn'} ${(Math.abs(gapPct)*100).toFixed(1)}%`); }
+
+  if (minuteBar) {
+    const minChg = (minuteBar.c - minuteBar.o) / (minuteBar.o || 1);
+    if (Math.abs(minChg) > 0.002) { score += 10; reasons.push(`Last min ${minChg > 0 ? '▲' : '▼'}${(Math.abs(minChg)*100).toFixed(2)}%`); }
+  }
+
+  const direction = dayChangePct > 0.001 ? 'bullish' : dayChangePct < -0.001 ? 'bearish' : 'neutral';
+  return { symbol: sym, score, direction, reasons, price, volRatio, dayChangePct };
+}
+
+async function runMarketScreener() {
+  if (!CONFIG.alpacaKey) return [];
+  try {
+    const symbolsParam = UNIVERSE.join(',');
+    const url  = `${ALPACA_DATA_BASE}/v2/stocks/snapshots?symbols=${symbolsParam}&feed=iex`;
+    const data = await alpacaFetch(url);
+    if (!data || typeof data !== 'object') { log('screen', 'Screener: no data'); return []; }
+
+    const candidates = [];
+    for (const [sym, snap] of Object.entries(data)) {
+      const scored = scoreSnapshot(sym, snap);
+      if (scored && scored.score >= 30) candidates.push(scored);
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    const top = candidates.slice(0, 25);
+    log('screen', `Screener: ${Object.keys(data).length} scanned → ${candidates.length} candidates → top ${top.length}: ${top.slice(0,6).map(c=>`${c.symbol}(${c.score})`).join(' ')}`);
+    await syncScreenerResults(top);
+    return top.map(c => c.symbol);
+  } catch (e) {
+    log('error', `Screener failed: ${e.message}`);
+    return [];
+  }
+}
+
+async function syncScreenerResults(candidates) {
+  if (!candidates.length) return;
+  try {
+    await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+      screener_candidates: JSON.stringify(candidates.slice(0, 15).map(c => ({
+        symbol: c.symbol, score: c.score, price: (+c.price).toFixed(2),
+        change: (c.dayChangePct * 100).toFixed(2) + '%',
+        volume: c.volRatio.toFixed(1) + 'x', direction: c.direction,
+        reasons: c.reasons.slice(0, 2).join(', '),
+      }))),
+      updated_at: new Date().toISOString(),
+    });
+  } catch(e) {}
+}
+
+// Build the final scan list: favorites + screener candidates, deduplicated
+function buildScanList() {
+  const favorites  = CONFIG.symbols; // always included — from dashboard watchlist
+  const discovered = screenerCandidates;
+  const combined   = [...new Set([...favorites, ...discovered])];
+  return combined.filter(s => /^[A-Z]{1,5}$/.test(s)); // strip invalid symbols
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// END MARKET SCREENER
+// ═══════════════════════════════════════════════════════════════════
+
 async function placeOrder(symbol, qty, side) {
   const data = await alpacaFetch(`${ALPACA_BASE()}/v2/orders`, {
     method: 'POST',
@@ -1265,16 +1408,15 @@ async function runScan() {
     return;
   }
 
-  log('scan', `═══ ${session} — Scanning ${CONFIG.symbols.length} symbols ═══`);
-  await syncLog('sys', `Scan started — ${session} — ${CONFIG.symbols.length} symbols`);
+  // Build dynamic scan list: favorites + screener candidates
+  const scanList = buildScanList();
+  const symbolsToScan = scanList.filter(s => shouldScanSymbol(s));
+  log('scan', `Scan list: ${symbolsToScan.length} symbols (${CONFIG.symbols.length} favorites + ${Math.max(0, symbolsToScan.length - CONFIG.symbols.length)} screener picks)`);
+  log('scan', `═══ ${session} — Scanning ${symbolsToScan.length} symbols ═══`);
+  await syncLog('sys', `Scan started — ${session} — ${symbolsToScan.length} symbols (${CONFIG.symbols.length} favs + screener)`);
 
-  // Always sync live Alpaca positions first — prevents duplicate buys after restarts
+  // Always sync live Alpaca positions first
   await syncAlpacaPositions();
-
-  // Prefetch all bars in parallel — this is the main speed improvement
-  // Old: 15 symbols × 2 fetches × ~400ms = ~12 seconds sequential
-  // New: all fetched simultaneously = ~400-600ms total
-  const symbolsToScan = CONFIG.symbols.filter(s => shouldScanSymbol(s));
   log('scan', `Prefetching bars for ${symbolsToScan.length} symbols in parallel…`);
   const prefetchStart = Date.now();
   const allBarData = await fetchAllBarsParallel(symbolsToScan);
@@ -2346,7 +2488,13 @@ async function tick() {
   try {
     const now = Date.now();
 
-    // Scalp scan — runs every 5s independently of full scan
+    // Run market screener every 3 minutes to refresh candidate list
+    if (isMarketOpen() && (now - lastScreenerRun >= SCREENER_INTERVAL_MS)) {
+      lastScreenerRun    = now;
+      screenerCandidates = await runMarketScreener();
+    }
+
+    // Scalp scan — every 5s
     if (CONFIG.scalpMode && (now - lastScalpScan >= SCALP_SCAN_INTERVAL_MS)) {
       lastScalpScan = now;
       await runScalpScan();
@@ -2357,7 +2505,6 @@ async function tick() {
       lastFullScan = now;
       await runScan();
     } else {
-      // Price-only update between full scans
       await syncPricesOnly();
     }
   } catch(e) {
@@ -2377,8 +2524,13 @@ cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' 
 
 // Startup — prewarm data then scan immediately
 loadRemoteConfig().then(async () => {
-  await updateDayBias();   // know the day's direction before first trade
-  await prewarmData();     // fill bar cache so first scan is instant
+  await updateDayBias();
+  // Run screener first so first scan has candidates ready
+  if (isMarketOpen()) {
+    screenerCandidates = await runMarketScreener();
+    lastScreenerRun    = Date.now();
+  }
+  await prewarmData();
   await runScan();
   lastFullScan = Date.now();
 });
