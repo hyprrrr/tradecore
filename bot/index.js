@@ -158,38 +158,57 @@ async function loadRemoteConfig() {
         const entering = newMode === 'sim';
         CONFIG.mode = newMode;
         simState.loaded = false;
-        log('sim', entering
-          ? '🎮 Simulation mode ENABLED — loading bar data on next scan'
-          : '✅ Simulation mode DISABLED — back to live/paper trading');
-        // Immediately clear all sim state when leaving sim mode
+
         if (!entering) {
-          // Clear all in-memory sim positions
+          log('sim', '✅ Simulation mode DISABLED — restoring live account');
+          await syncLog('sys', '✅ Exited sim mode — restoring live Alpaca account…');
+
+          // 1. Clear all sim positions from memory
           Object.keys(positions).forEach(k => delete positions[k]);
           Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
           Object.keys(scalpPositions).forEach(k => delete scalpPositions[k]);
           pendingSignals.clear();
           totalWins = 0; totalLosses = 0;
 
-          // Wipe ALL positions from Supabase
+          // 2. Wipe sim positions from Supabase
           await sbFetch('tc_positions?symbol=neq.____NONE____', 'DELETE');
 
-          log('sys', '✅ Sim positions cleared from Supabase');
-          await syncLog('sys', '✅ Exited sim mode — syncing real Alpaca account…');
-
-          // Restore real portfolio value from Alpaca immediately
+          // 3. Fetch real Alpaca account values RIGHT NOW
+          let liveEquity = 0, liveCash = 0, liveLastEquity = 0;
           try {
             const acct = await getAccount();
-            if (acct?.equity) {
-              portfolio          = +parseFloat(acct.equity).toFixed(2);
-              realEquity         = portfolio;
-              realDailyStartEquity = acct.last_equity ? +parseFloat(acct.last_equity).toFixed(2) : portfolio;
-              log('sys', `Portfolio restored from Alpaca: $${portfolio.toFixed(2)}`);
-            }
-          } catch(e) {}
+            if (acct?.equity)      liveEquity      = +parseFloat(acct.equity).toFixed(2);
+            if (acct?.cash)        liveCash        = +parseFloat(acct.cash).toFixed(2);
+            if (acct?.last_equity) liveLastEquity  = +parseFloat(acct.last_equity).toFixed(2);
+          } catch(e) { log('warn', `Could not fetch Alpaca account: ${e.message}`); }
 
-          // Restore real open positions from Alpaca
+          // Use live values if valid, otherwise keep startingCapital
+          if (liveEquity > 0) {
+            portfolio            = liveEquity;
+            realEquity           = liveEquity;
+            realDailyStartEquity = liveLastEquity > 0 ? liveLastEquity : liveEquity;
+            const dayPnl         = liveLastEquity > 0 ? liveEquity - liveLastEquity : 0;
+
+            // 4. Write live values directly to Supabase immediately
+            await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+              cash:            +liveCash.toFixed(2),
+              total_value:     +liveEquity.toFixed(2),
+              day_pnl:         +dayPnl.toFixed(2),
+              total_wins:      0,
+              total_losses:    0,
+              circuit_breaker: false,
+              session:         getCurrentSession(),
+              updated_at:      new Date().toISOString(),
+            });
+            log('sys', `✅ Live account restored: equity=$${liveEquity.toFixed(2)} dayPnl=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
+          }
+
+          // 5. Restore real open positions from Alpaca
           await syncAlpacaPositions();
-          await syncAll();
+          await syncPositions();
+
+        } else {
+          log('sim', '🎮 Simulation mode ENABLED — loading bar data on next scan');
         }
       }
     }
@@ -281,8 +300,8 @@ async function syncPortfolio() {
     if (equity > 0) await sbFetch('tc_equity', 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
     return;
   }
-  let cashValue   = portfolio;
-  let equityValue = portfolio;
+  let cashValue   = 0;
+  let equityValue = 0;
   let lastEquity  = 0;
 
   if (CONFIG.alpacaKey) {
@@ -291,7 +310,13 @@ async function syncPortfolio() {
       if (acct?.cash)        cashValue   = +parseFloat(acct.cash).toFixed(2);
       if (acct?.equity)      equityValue = +parseFloat(acct.equity).toFixed(2);
       if (acct?.last_equity) lastEquity  = +parseFloat(acct.last_equity).toFixed(2);
-    } catch(e) {}
+    } catch(e) { log('warn', `getAccount failed: ${e.message}`); }
+  }
+
+  // If Alpaca didn't return valid equity, skip this sync — don't write wrong values
+  if (equityValue <= 0) {
+    log('warn', 'syncPortfolio: no valid equity from Alpaca — skipping write');
+    return;
   }
 
   // Sanity check: Alpaca's equity can lag after a new order fills —
