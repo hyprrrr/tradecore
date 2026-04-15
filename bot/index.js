@@ -157,10 +157,21 @@ async function loadRemoteConfig() {
       if (newMode !== CONFIG.mode) {
         const entering = newMode === 'sim';
         CONFIG.mode = newMode;
-        simState.loaded = false; // always reload bars when mode changes
+        simState.loaded = false;
         log('sim', entering
-          ? '🎮 Simulation mode ENABLED — will load bar replay data on next scan'
-          : '✅ Simulation mode DISABLED — returning to live/paper trading');
+          ? '🎮 Simulation mode ENABLED — loading bar data on next scan'
+          : '✅ Simulation mode DISABLED — back to live/paper trading');
+        // Immediately clear positions display when leaving sim mode
+        if (!entering) {
+          Object.keys(positions).forEach(k => delete positions[k]);
+          Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
+          Object.keys(scalpPositions).forEach(k => delete scalpPositions[k]);
+          portfolio = CONFIG.startingCapital;
+          totalWins = 0; totalLosses = 0;
+          await sbFetch('tc_positions?id=gt.0', 'DELETE');
+          await syncLog('sys', '✅ Exited sim mode — positions cleared, syncing live data');
+          setTimeout(() => syncPricesOnly().catch(() => {}), 1000);
+        }
       }
     }
 
@@ -864,44 +875,44 @@ const simState = {
 
 // Load historical 5-minute bars for all symbols to replay
 async function loadSimBars(symbols) {
-  log('sim', `🎮 Loading bar replay data for ${symbols.length} symbols…`);
+  log('sim', `🎮 Loading bar replay data for ${symbols.length} symbols in parallel…`);
   simState.bars    = {};
   simState.cursor  = 0;
   simState.loaded  = false;
 
   const fetch = await getFetch();
 
-  for (const sym of symbols) {
-    try {
-      // Fetch last 5 trading days of 5-minute bars from Yahoo Finance
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=5d`;
-      const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-      const data = await res.json();
-      const result = data?.chart?.result?.[0];
-      if (!result) continue;
+  // Fetch all symbols in parallel — was sequential before (~10s), now ~1-2s
+  const results = await Promise.allSettled(symbols.map(async sym => {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=5d`;
+    const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) return { sym, bars: null };
 
-      const timestamps = result.timestamp || [];
-      const q = result.indicators?.quote?.[0] || {};
+    const timestamps = result.timestamp || [];
+    const q = result.indicators?.quote?.[0] || {};
+    const bars = timestamps.map((t, i) => ({
+      t: new Date(t * 1000).toISOString(),
+      o: q.open?.[i]   || null,
+      h: q.high?.[i]   || null,
+      l: q.low?.[i]    || null,
+      c: q.close?.[i]  || null,
+      v: q.volume?.[i] || 0,
+    })).filter(b => b.c != null && b.h != null && b.l != null);
 
-      const bars = timestamps.map((t, i) => ({
-        t: new Date(t * 1000).toISOString(),
-        o: q.open?.[i]   || null,
-        h: q.high?.[i]   || null,
-        l: q.low?.[i]    || null,
-        c: q.close?.[i]  || null,
-        v: q.volume?.[i] || 0,
-      })).filter(b => b.c != null && b.h != null && b.l != null);
+    return { sym, bars: bars.length >= 20 ? bars : null };
+  }));
 
-      if (bars.length >= 20) {
-        simState.bars[sym] = bars;
-        log('sim', `  ${sym}: ${bars.length} bars loaded (${bars[0].t.slice(0,10)} → ${bars[bars.length-1].t.slice(0,10)})`);
-      }
-    } catch(e) {
-      log('warn', `  ${sym}: failed to load bars — ${e.message}`);
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value.bars) {
+      simState.bars[r.value.sym] = r.value.bars;
     }
   }
 
-  // All symbols share the same bar timeline — find the shortest
+  const loaded = Object.keys(simState.bars);
+  log('sim', `🎮 Loaded ${loaded.length}/${symbols.length} symbols`);
+
   const lengths = Object.values(simState.bars).map(b => b.length);
   if (lengths.length === 0) {
     log('error', 'Sim: no bar data loaded — cannot start replay');
@@ -1409,6 +1420,10 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
       srLevels, sigInfo, direction: 'long',
     };
     alpacaPositions.add(sym);
+    // Seed price history immediately so P&L shows right away
+    if (!priceHistory5m[sym] || priceHistory5m[sym].length === 0) {
+      priceHistory5m[sym] = [price];
+    }
     trades.push({ time: new Date(), sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
     const stopPct = ((price - stopPrice) / price * 100).toFixed(2);
     log('buy', `✅ LONG ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (-${stopPct}%) | conf=${sigInfo.confidence}%`);
@@ -1434,6 +1449,10 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
       srLevels, sigInfo, direction: 'short',
     };
     alpacaShorts.add(sym);
+    // Seed price history immediately
+    if (!priceHistory5m[sym] || priceHistory5m[sym].length === 0) {
+      priceHistory5m[sym] = [price];
+    }
     trades.push({ time: new Date(), sym, side: 'SHORT', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
     const stopPct = ((stopPrice - price) / price * 100).toFixed(2);
     log('short', `🔴 SHORT ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (+${stopPct}%) | conf=${sigInfo.confidence}%`);
@@ -1443,6 +1462,15 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
 
   await syncAll();
   await syncLog(direction === 'long' ? 'buy' : 'sell', `${direction === 'long' ? '✅ LONG' : '🔴 SHORT'} ${qty}x ${sym} @ $${price.toFixed(2)} conf=${sigInfo.confidence}%`);
+
+  // Fetch live price immediately so dashboard shows P&L right away
+  // Don't wait — fire and forget
+  fetchLatestPrice(sym).then(livePrice => {
+    if (livePrice && livePrice !== price) {
+      priceHistory5m[sym] = [...(priceHistory5m[sym] || [price]), livePrice];
+      syncPositions().catch(() => {});
+    }
+  }).catch(() => {});
 }
 
 // Cover a short position (buy back the borrowed shares)
@@ -3091,7 +3119,44 @@ function readBody(req) {
 http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
 
-  // ── GET /reset-cb ──
+  // ── GET /setup-discord — register slash commands (visit once in browser) ──
+  if (req.method === 'GET' && url === '/setup-discord') {
+    if (!CONFIG.discordAppId || !process.env.DISCORD_TOKEN) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Missing DISCORD_APP_ID or DISCORD_TOKEN env vars in Render');
+      return;
+    }
+    try {
+      const fetch = await getFetch();
+      const commands = [
+        { name:'exit',      description:'Exit an open position immediately', options:[{name:'symbol',description:'Ticker (e.g. AAPL)',type:3,required:true}] },
+        { name:'status',    description:'Show bot status and all open positions' },
+        { name:'positions', description:'List all open positions with P&L' },
+        { name:'pause',     description:'Pause the bot — no new trades' },
+        { name:'resume',    description:'Resume the bot — clear circuit breaker' },
+        { name:'sim',       description:'Toggle simulation mode on/off' },
+      ];
+      const r = await fetch(`https://discord.com/api/v10/applications/${CONFIG.discordAppId}/commands`, {
+        method: 'PUT',
+        headers: { 'Authorization': `Bot ${process.env.DISCORD_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(commands),
+      });
+      const data = await r.json();
+      if (r.ok) {
+        const list = data.map(c => `✅ /${c.name}`).join('\n');
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end(`Commands registered successfully!\n\n${list}\n\nYou can close this page.`);
+        log('sys', `Discord commands registered: ${data.map(c=>'/'+c.name).join(', ')}`);
+      } else {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end(`Failed: ${JSON.stringify(data)}`);
+      }
+    } catch(e) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end(`Error: ${e.message}`);
+    }
+    return;
+  }
   if (req.method === 'GET' && url === '/reset-cb') {
     circuitBreakerOn     = false;
     realDailyStartEquity = realEquity;
