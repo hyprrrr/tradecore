@@ -3521,7 +3521,8 @@ function verifyDiscordRequest(rawBody, signature, timestamp) {
     }
 
     const valid = nacl.sign.detached.verify(new Uint8Array(msg), new Uint8Array(sig), new Uint8Array(key));
-    if (!valid) log('warn', 'Discord: signature verification failed');
+    if (!valid) log('warn', `Discord: signature verification FAILED — key=${CONFIG.discordPublicKey?.slice(0,8)}... keylen=${key.length} siglen=${sig.length} msglen=${msg.length}`);
+    else log('sys', 'Discord: signature verified ✅');
     return valid;
   } catch(e) {
     log('error', `Discord: verification error — ${e.message}`);
@@ -3744,6 +3745,13 @@ http.createServer(async (req, res) => {
     const signature = req.headers['x-signature-ed25519'];
     const timestamp = req.headers['x-signature-timestamp'];
 
+    // Debug — log everything so we can see exactly what's failing
+    log('discord', `POST /discord received`);
+    log('discord', `  signature: ${signature?.slice(0,16)}... (${signature?.length} chars)`);
+    log('discord', `  timestamp: ${timestamp}`);
+    log('discord', `  body: ${rawBody.slice(0,80)}`);
+    log('discord', `  public key set: ${!!CONFIG.discordPublicKey} (${CONFIG.discordPublicKey?.length} chars)`);
+
     // Verify signature
     if (!verifyDiscordRequest(rawBody, signature, timestamp)) {
       log('warn', 'Discord: rejected invalid signature');
@@ -3758,7 +3766,6 @@ http.createServer(async (req, res) => {
     }
 
     // Discord PING — respond IMMEDIATELY with type 1
-    // This must happen within 3 seconds or Discord rejects the endpoint
     if (interaction.type === 1) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 1 }));
