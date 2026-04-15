@@ -28,6 +28,7 @@
 'use strict';
 const cron = require('node-cron');
 const http = require('http');
+const nacl = require('tweetnacl');
 
 // Cache node-fetch at startup — importing dynamically on every request adds ~5-20ms latency
 let _fetch = null;
@@ -3493,7 +3494,7 @@ setTimeout(syncPricesOnly, 5000);
 //   /positions         — list all open positions
 //
 
-const nacl = require('tweetnacl');
+// Discord Ed25519 signature verification (nacl loaded at top of file)
 
 // Verify Discord's Ed25519 signature — required or Discord rejects the endpoint
 function verifyDiscordRequest(rawBody, signature, timestamp) {
@@ -3743,9 +3744,7 @@ http.createServer(async (req, res) => {
     const signature = req.headers['x-signature-ed25519'];
     const timestamp = req.headers['x-signature-timestamp'];
 
-    log('sys', `Discord POST received | sig:${signature?.slice(0,8)}… ts:${timestamp} body:${rawBody.slice(0,60)}…`);
-
-    // Discord requires signature verification
+    // Verify signature
     if (!verifyDiscordRequest(rawBody, signature, timestamp)) {
       log('warn', 'Discord: rejected invalid signature');
       res.writeHead(401, { 'Content-Type': 'text/plain' });
@@ -3758,14 +3757,12 @@ http.createServer(async (req, res) => {
       res.writeHead(400); res.end('Invalid JSON'); return;
     }
 
-    log('sys', `Discord interaction type: ${interaction.type}`);
-
-    // Discord PING — must respond with type 1 to verify endpoint
+    // Discord PING — respond IMMEDIATELY with type 1
+    // This must happen within 3 seconds or Discord rejects the endpoint
     if (interaction.type === 1) {
-      log('sys', 'Discord PING received → responding with PONG');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 1 }));
-      log('sys', 'Discord endpoint verified ✅');
+      log('sys', '✅ Discord PING verified');
       return;
     }
 
