@@ -1271,23 +1271,35 @@ async function runSimScan() {
   const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
   for (const sym of Object.keys(snapshot)) {
     if (positions[sym] || shortPositions[sym]) continue;
-    const bars5m  = snapshot[sym];
-    const bars15m = simState.bars[sym]
-      ? simState.bars[sym].slice(0, simState.cursor + 1).filter((_, i) => i % 3 === 0) // approximate 15min
-      : null;
-    if (!bars5m || bars5m.length < 20) continue;
+    const bars5m = snapshot[sym];
+    if (!bars5m || bars5m.length < 30) continue;
+
+    // Build proper 15-min bars by aggregating 3 consecutive 5-min bars
+    const bars15m = [];
+    for (let i = 0; i + 2 < bars5m.length; i += 3) {
+      const chunk = bars5m.slice(i, i + 3);
+      bars15m.push({
+        t: chunk[0].t,
+        o: chunk[0].o,
+        h: Math.max(...chunk.map(b => b.h)),
+        l: Math.min(...chunk.map(b => b.l)),
+        c: chunk[chunk.length - 1].c,
+        v: chunk.reduce((a, b) => a + b.v, 0),
+      });
+    }
 
     const price = bars5m[bars5m.length - 1].c;
     priceHistory5m[sym] = bars5m.map(b => b.c);
 
-    let sig = generateSignal(sym, bars5m, bars15m);
+    let sig = generateSignal(sym, bars5m, bars15m.length >= 10 ? bars15m : null);
     sig = applyDayBias(sig);
 
-    if (sig.signal !== 'HOLD' && sig.score > 0) {
+    if (sig.signal !== 'HOLD') {
       log('sim', `  ${sym} $${price.toFixed(2)} → ${sig.signal} (score:${sig.score} conf:${sig.confidence}%)`);
     }
 
-    const confirmed = confirmSignal(sym, sig);
+    // In sim mode use 1-scan confirmation — 3-scan would make replay too slow
+    const confirmed = sig.signal !== 'HOLD' && sig.score > 0;
     if (!confirmed) continue;
 
     if (sig.signal === 'BUY' && totalOpen < CONFIG.maxOpenPositions) {
@@ -1727,7 +1739,11 @@ let shortPositions = {};
 
 async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   const isIntlETF = !!ETF_SESSIONS[sym];
-  if (!isIntlETF && !isMarketOpen()) { log('warn', `🚫 Blocked ${sym} — market closed`); return; }
+  // In sim mode — always allow entries (we're replaying historical market hours)
+  if (!isSimMode() && !isIntlETF && !isMarketOpen()) {
+    log('warn', `🚫 Blocked ${sym} — market closed`);
+    return;
+  }
   if (checkCircuitBreaker()) return;
   if (hasLargeGap(sym, price)) return;
 
@@ -1820,10 +1836,15 @@ async function coverShort(sym, price, reason) {
   const pos = shortPositions[sym];
   if (!pos) return;
   const qty = pos.qtyRemaining || pos.qty;
+  const forceClose = reason === 'MANUAL_DISCORD';
 
   if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
-    try { await placeOrder(sym, qty, 'buy'); } // buy back to cover
-    catch (e) { log('error', `Cover failed ${sym}: ${e.message}`); return; }
+    try { await placeOrder(sym, qty, 'buy'); }
+    catch (e) {
+      log('error', `Cover failed ${sym}: ${e.message}`);
+      if (!forceClose) return;
+      log('warn', `Force-closing short ${sym} in memory despite order failure`);
+    }
   }
 
   // Short P&L = (entry - exit) × qty (profit when price drops)
@@ -1952,9 +1973,15 @@ async function exitPosition(sym, price, reason) {
   const pos = positions[sym];
   if (!pos) return;
   const qtyToSell = pos.qtyRemaining || pos.qty;
+  const forceClose = reason === 'MANUAL_DISCORD'; // Discord commands always close in memory
+
   if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
     try { await placeOrder(sym, qtyToSell, 'sell'); }
-    catch (e) { log('error', `Sell failed ${sym}: ${e.message}`); return; }
+    catch (e) {
+      log('error', `Sell order failed ${sym}: ${e.message}`);
+      if (!forceClose) return; // only abort if not a forced manual close
+      log('warn', `Force-closing ${sym} in memory despite order failure`);
+    }
   }
   const avgCost = pos.cost / qtyToSell;
   const pnl = qtyToSell * price - qtyToSell * avgCost;
