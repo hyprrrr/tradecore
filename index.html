@@ -573,7 +573,13 @@ function loadSettings(){
     if(s.startingCapital) document.getElementById('startingCapital').value=s.startingCapital;
     if(s.swingEnabled!==undefined) document.getElementById('swingEnabled').checked=s.swingEnabled;
     if(s.scalpEnabled!==undefined) document.getElementById('scalpEnabled').checked=s.scalpEnabled;
-    if(s.simEnabled!==undefined)   document.getElementById('simEnabled').checked=s.simEnabled;
+    // Sim mode always defaults to OFF on page load — must be explicitly turned on
+    // This prevents it from getting stuck on after a session
+    document.getElementById('simEnabled').checked = false;
+    if(s.simEnabled === true) {
+      // Only restore sim=true if explicitly saved and user is aware
+      document.getElementById('simEnabled').checked = false; // always start off
+    }
     const smap={scalpTp:'%',scalpSl:'%',scalpHold:'m',scalpMax:'',scalpPosPct:'%',scalpMinScore:''};
     Object.entries(smap).forEach(([id,sfx])=>{ if(s[id]!==undefined){ document.getElementById(id).value=s[id]; document.getElementById(id+'V').textContent=s[id]+sfx; }});
     if(s.scalpSymbols) document.getElementById('scalpSymbols').value=s.scalpSymbols;
@@ -769,22 +775,16 @@ function updateKPIs(p, positions, trades){
   document.getElementById('circuitStatus').className = 'kpi-sub ' + (p.circuit_breaker ? 'red' : 'green');
 
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
-  if(p.session)   document.getElementById('sessionBadge').textContent=p.session;
+  // Only show real session (not sim session) in the session badge
+  if(p.session && !p.session.includes('SIM')) document.getElementById('sessionBadge').textContent=p.session;
 
-  // Sim mode badge — read from bot's reported session, not just the checkbox
-  // This way if the bot is still in sim but the checkbox was toggled, it shows correctly
-  const simOn        = document.getElementById('simEnabled')?.checked;
-  const botInSim     = p.session && p.session.includes('SIM');
-  const showSimBadge = simOn || botInSim;
-  const modeBadge    = document.getElementById('modeBadge');
-  const simProg      = document.getElementById('simProgress');
-  if(modeBadge){ modeBadge.textContent = showSimBadge ? '🎮 SIM MODE' : ''; modeBadge.style.display = showSimBadge ? '' : 'none'; }
-  if(simProg){
-    simProg.style.display = showSimBadge ? 'block' : 'none';
-    if(showSimBadge && p.session && p.session.includes('SIM')) {
-      document.getElementById('simProgressLabel').textContent = `Replaying: ${p.session}`;
-    }
-  }
+  // Sim badge — only show if dashboard checkbox is checked
+  // Don't rely on stale session field from Supabase
+  const simOn     = document.getElementById('simEnabled')?.checked;
+  const modeBadge = document.getElementById('modeBadge');
+  const simProg   = document.getElementById('simProgress');
+  if(modeBadge){ modeBadge.textContent='🎮 SIM MODE'; modeBadge.style.display = simOn ? '' : 'none'; }
+  if(simProg)   simProg.style.display = simOn ? 'block' : 'none';
 
   const lastVal=equityHistory[equityHistory.length-1];
   if(!lastVal||Math.abs(equity-lastVal)>0.01){
