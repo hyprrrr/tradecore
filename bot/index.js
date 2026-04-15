@@ -3662,7 +3662,7 @@ http.createServer(async (req, res) => {
   if (req.method === 'GET' && url === '/setup-discord') {
     if (!CONFIG.discordAppId || !process.env.DISCORD_TOKEN) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Missing DISCORD_APP_ID or DISCORD_TOKEN env vars in Render');
+      res.end('Missing DISCORD_APP_ID or DISCORD_TOKEN env vars — add them in Railway → Variables');
       return;
     }
     try {
@@ -3816,7 +3816,9 @@ http.createServer(async (req, res) => {
 
 }).listen(process.env.PORT || 3000, () => {
   log('sys', `Server on port ${process.env.PORT || 3000}`);
-  log('sys', `Discord endpoint: POST /discord`);
+  log('sys', `Health check: https://tradecore.up.railway.app/`);
+  log('sys', `Discord endpoint: https://tradecore.up.railway.app/discord`);
+  log('sys', `Register commands: https://tradecore.up.railway.app/setup-discord`);
   if (CONFIG.discordPublicKey) log('sys', `Discord signature verification: ✅ enabled`);
   else log('warn', `Discord signature verification: ⚠ DISCORD_PUBLIC_KEY not set`);
 });
