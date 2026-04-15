@@ -716,22 +716,21 @@ async function testDiscord(){ const wh=document.getElementById('discordWebhook')
 // ══════════════════════════════════════════
 let equityHistory=[], equityLoaded=false, lastTradeIds=new Set(), lastLogIds=new Set(), chartCtx=null;
 
-let lastTradeCount = 0, lastLogCount = 0, lastPositionHash = '', pollCount = 0;
+let lastTradeCount = 0, lastLogTimestamp = '', lastPositionHash = '', pollCount = 0;
 
 // Table name helper — reads from sim tables when sim mode is active
 function dtbl(name){ return document.getElementById('simEnabled')?.checked ? `sim_${name}` : name; }
 
 async function poll(){
   pollCount++;
-  const fetchTrades = pollCount % 3 === 0; // trades every 15s
-  const fetchLogs   = pollCount % 4 === 0; // logs every 20s
+  const fetchTrades = pollCount % 4 === 0;  // trades every 12s
+  const fetchLogs   = true;                  // logs EVERY poll — real-time bot log
 
-  // Always fetch portfolio + positions (lightweight, change frequently)
   const fetches = [
     sbGet(dtbl('tc_portfolio'),'?id=eq.1'),
     sbGet(dtbl('tc_positions'),'?order=updated_at.desc'),
     fetchTrades ? sbGet(dtbl('tc_trades'),'?order=created_at.desc&limit=100') : Promise.resolve(null),
-    fetchLogs   ? sbGet(dtbl('tc_logs'),'?order=created_at.desc&limit=100')   : Promise.resolve(null),
+    sbGet(dtbl('tc_logs'),'?order=created_at.desc&limit=50'),  // always fetch, smaller limit
   ];
 
   const [portfolio, positions, trades, logs] = await Promise.all(fetches);
@@ -759,7 +758,8 @@ async function poll(){
   }
   if(logs !== null){
     const logData = logs || [];
-    if(logData.length !== lastLogCount){ lastLogCount = logData.length; updateLogs(logData); }
+    const latestLog = logData[0]?.created_at || '';
+    if(latestLog !== lastLogTimestamp){ lastLogTimestamp = latestLog; updateLogs(logData); }
   }
 
   updateScreener(p);
@@ -1037,7 +1037,7 @@ if(!getSbUrl()||!getSbKey()){
   document.getElementById('sbUrlInput').value=getSbUrl();
   document.getElementById('sbKeyInput').value=getSbKey();
   poll();
-  setInterval(poll, 8000);
+  setInterval(poll, 3000);
 }
 </script>
 </body>
