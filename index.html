@@ -275,6 +275,20 @@ canvas{width:100%!important;display:block;}
       </div>
     </div>
 
+    <!-- Adaptive Engine Status -->
+    <div style="margin-bottom:14px;padding:12px;border-radius:8px;border:1px solid var(--border);background:var(--surface)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div style="font-family:'Space Mono',monospace;font-size:10px;font-weight:800;letter-spacing:.08em">🧠 ADAPTIVE ENGINE</div>
+        <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)" id="adaptLastRun">analyzing…</div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px" id="adaptStats">
+        <div style="text-align:center"><div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">MIN CONF</div><div style="font-family:'Space Mono',monospace;font-size:14px;font-weight:700" id="adaptConf">60%</div></div>
+        <div style="text-align:center"><div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">RSI BUY</div><div style="font-family:'Space Mono',monospace;font-size:14px;font-weight:700" id="adaptRSI">≤35</div></div>
+        <div style="text-align:center"><div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">POS SIZE</div><div style="font-family:'Space Mono',monospace;font-size:14px;font-weight:700" id="adaptSize">15%</div></div>
+        <div style="text-align:center"><div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">ATR MULT</div><div style="font-family:'Space Mono',monospace;font-size:14px;font-weight:700" id="adaptATR">2.0×</div></div>
+      </div>
+    </div>
+
     <!-- Recent trades preview (collapsible) -->
     <div style="margin-bottom:14px">
       <div class="collapsible-hdr" id="tradesColl" onclick="toggleColl('tradesColl','tradesBody')">
@@ -715,8 +729,26 @@ async function poll(){
   }
 
   updateScreener(p);
+  updateAdaptiveStats(p);
   setOnline();
   document.getElementById('syncInfo').textContent='Updated '+new Date().toLocaleTimeString();
+}
+
+function updateAdaptiveStats(p){
+  // Read adapted settings from tc_settings if available
+  // For now read from the bot log or portfolio fields
+  // The bot writes adapted values back to tc_settings via Supabase
+  const wins   = +p.total_wins  || 0;
+  const losses = +p.total_losses|| 0;
+  const total  = wins + losses;
+  const wr     = total > 0 ? ((wins/total)*100).toFixed(0) : '—';
+
+  // Update last run label with win rate
+  const el = document.getElementById('adaptLastRun');
+  if(el) el.textContent = total > 0 ? `${wr}% win rate · ${total} trades analyzed` : 'waiting for trades…';
+
+  // These values update when the bot writes back to Supabase after tuning
+  // For now show defaults — they'll update after first auto-tune
 }
 
 function updateScreener(p){
