@@ -3391,6 +3391,24 @@ async function tick() {
 // Main tick every 15 seconds
 setInterval(tick, PRICE_SYNC_INTERVAL_MS);
 
+// Fast config poll — checks for mode changes every 5 seconds
+// This means sim on/off takes effect within 5s instead of up to 30s
+let lastConfigCheck = 0;
+setInterval(async () => {
+  const now = Date.now();
+  if (now - lastConfigCheck < 4500) return;
+  lastConfigCheck = now;
+  try {
+    const prev = CONFIG.mode;
+    await loadRemoteConfig();
+    // If mode just changed, trigger immediate sync
+    if (CONFIG.mode !== prev) {
+      log('sys', `Mode changed: ${prev} → ${CONFIG.mode}`);
+      lastFullScan = 0; // force next tick to run full scan immediately
+    }
+  } catch(e) {}
+}, 5000);
+
 // Dedicated scalp exit monitor — runs every 2 seconds independently
 // Much faster than the main tick so TP/SL exits happen near-instantly
 setInterval(() => {
