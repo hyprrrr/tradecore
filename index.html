@@ -768,12 +768,19 @@ function updatePositions(positions){
   const el=document.getElementById('positionsList');
   if(!positions.length){ el.innerHTML='<div class="empty-state">No open positions</div>'; return; }
   el.innerHTML=positions.map(p=>{
-    const ep=+p.entry_price, cp=+p.current_price, qty=+p.qty, pnl=+p.pnl, pct=+p.pnl_pct, conf=p.confidence||0;
-    const isShort=qty<0, absQty=Math.abs(qty), pc=pnl>=0?'var(--accent2)':'var(--accent3)';
+    const ep=+p.entry_price, cp=+p.current_price, qty=Math.abs(+p.qty);
+    const pnl=+p.pnl, pct=+p.pnl_pct, conf=p.confidence||0;
+    const side=p.side||'LONG';
+    const isScalpLong=side==='SCALP_LONG', isScalpShort=side==='SCALP_SHORT', isShort=side==='SHORT'||isScalpShort;
+    const pc=pnl>=0?'var(--accent2)':'var(--accent3)';
     const hm=p.entry_time?Math.round((Date.now()-new Date(p.entry_time).getTime())/60000):0;
     const hs=hm<60?hm+'m':(hm/60).toFixed(1)+'h';
-    const db=isShort?`<span class="badge b-sl">SHORT</span>`:`<span class="badge b-buy">LONG</span>`;
-    return `<div class="pos-row"><div style="flex:1"><div style="display:flex;align-items:center;gap:5px"><span class="pos-sym">${p.symbol}</span>${db}</div><div class="pos-meta">${absQty}× @ $${ep.toFixed(2)} · Now $${cp.toFixed(2)} · ${hs}</div><div class="conf-bar"><div class="conf-fill" style="width:${conf}%;background:${conf>70?'var(--accent2)':conf>50?'var(--warn)':'var(--accent3)'}"></div></div></div><div style="text-align:right"><div style="font-family:'Space Mono',monospace;font-size:18px;font-weight:700;color:${pc}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</div><div style="font-family:'Space Mono',monospace;font-size:10px;color:${pc}">${pct>=0?'+':''}${(+pct).toFixed(2)}%</div><div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">$${(cp*absQty).toFixed(2)}</div></div></div>`;
+    let db;
+    if(isScalpLong)  db=`<span class="badge" style="background:rgba(0,229,255,.15);color:var(--accent);border:1px solid rgba(0,229,255,.3)">⚡ SCALP</span>`;
+    else if(isScalpShort) db=`<span class="badge" style="background:rgba(255,95,87,.15);color:var(--accent3);border:1px solid rgba(255,95,87,.3)">⚡ SHORT</span>`;
+    else if(isShort) db=`<span class="badge b-sl">🔴 SHORT</span>`;
+    else             db=`<span class="badge b-buy">🟢 LONG</span>`;
+    return `<div class="pos-row"><div style="flex:1"><div style="display:flex;align-items:center;gap:5px"><span class="pos-sym">${p.symbol}</span>${db}</div><div class="pos-meta">${qty}× @ $${ep.toFixed(2)} · Now $${cp.toFixed(2)} · ${hs}</div><div class="conf-bar" style="margin-top:4px"><div class="conf-fill" style="width:${conf}%;background:${conf>70?'var(--accent2)':conf>50?'var(--warn)':'var(--accent3)'}"></div></div></div><div style="text-align:right"><div style="font-family:'Space Mono',monospace;font-size:18px;font-weight:700;color:${pc}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</div><div style="font-family:'Space Mono',monospace;font-size:10px;color:${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%</div><div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted)">$${(cp*qty).toFixed(2)}</div></div></div>`;
   }).join('');
 }
 
