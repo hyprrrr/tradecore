@@ -253,6 +253,27 @@ canvas{width:100%!important;display:block;}
       </div>
     </div>
 
+    <!-- Screener Results -->
+    <div style="margin-bottom:14px">
+      <div class="collapsible-hdr open" id="screenerColl" onclick="toggleColl('screenerColl','screenerBody')">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="coll-title">🔍 Market Screener</div>
+          <span class="coll-meta" id="screenerMeta">scanning…</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="coll-meta">top picks from 150+ stocks</span>
+          <span class="chevron open" id="screenerColl-chev">▼</span>
+        </div>
+      </div>
+      <div class="collapsible-body open" id="screenerBody">
+        <div class="collapsible-body-inner" style="padding-top:12px">
+          <div id="screenerList" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px">
+            <div class="empty-state">Waiting for screener data…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Recent trades preview (collapsible) -->
     <div style="margin-bottom:14px">
       <div class="collapsible-hdr" id="tradesColl" onclick="toggleColl('tradesColl','tradesBody')">
@@ -410,7 +431,10 @@ canvas{width:100%!important;display:block;}
 
       <!-- Watchlist + Discord -->
       <div class="card">
-        <div class="card-hdr"><div class="card-title">Watchlist</div></div>
+        <div class="card-hdr"><div class="card-title">Favorites (always scanned)</div></div>
+        <p style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:8px;line-height:1.7">
+          These stocks are <em>always</em> analyzed regardless of screener output. The bot also automatically discovers the best movers from 150+ stocks every 3 minutes — no setup needed.
+        </p>
         <div class="sym-tags" id="symbolTags"></div>
         <div class="add-sym" style="margin-bottom:14px">
           <input type="text" id="newSym" placeholder="AAPL, EWJ…" maxlength="10" onkeydown="if(event.key==='Enter')addSym()">
@@ -624,8 +648,38 @@ async function poll(){
   updatePositions(posData);
   updateTrades(tradeData);
   updateLogs(logs||[]);
+  updateScreener(p);
   setOnline();
   document.getElementById('syncInfo').textContent='Updated '+new Date().toLocaleTimeString();
+}
+
+function updateScreener(p){
+  const raw = p?.screener_candidates;
+  if(!raw) return;
+  let candidates;
+  try { candidates = JSON.parse(raw); } catch(e){ return; }
+  if(!candidates||!candidates.length) return;
+
+  document.getElementById('screenerMeta').textContent = `${candidates.length} picks · updated ${new Date().toLocaleTimeString()}`;
+
+  document.getElementById('screenerList').innerHTML = candidates.map(c => {
+    const chg   = parseFloat(c.change);
+    const isUp  = chg >= 0;
+    const color = isUp ? 'var(--accent2)' : 'var(--accent3)';
+    const dir   = c.direction === 'bullish' ? '📈' : c.direction === 'bearish' ? '📉' : '➡️';
+    const score = Math.min(100, Math.round(c.score));
+    return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px;transition:border-color .2s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+        <span style="font-weight:800;font-size:14px">${c.symbol}</span>
+        <span style="font-family:'Space Mono',monospace;font-size:11px;color:${color};font-weight:700">${chg >= 0 ? '+' : ''}${c.change}</span>
+      </div>
+      <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:6px">$${c.price} · Vol ${c.volume} · ${dir} ${c.direction}</div>
+      <div style="height:3px;background:var(--border);border-radius:2px;margin-bottom:5px">
+        <div style="height:100%;width:${score}%;background:${score>70?'var(--accent2)':score>50?'var(--warn)':'var(--accent)'};border-radius:2px;transition:width .3s"></div>
+      </div>
+      <div style="font-family:'Space Mono',monospace;font-size:8px;color:var(--muted)">${c.reasons}</div>
+    </div>`;
+  }).join('');
 }
 
 function getStartingCapital(){ try{ const s=JSON.parse(localStorage.getItem('tc_settings')||'{}'); if(s.startingCapital&&+s.startingCapital>0) return +s.startingCapital; }catch(e){} return 100000; }
