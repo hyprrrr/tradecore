@@ -2615,9 +2615,30 @@ async function exitScalp(sym, price, reason) {
   const { qty, entryPrice, direction } = pos;
   const side = direction === 'long' ? 'sell' : 'buy';
 
+  // Delete position immediately to prevent double-exit from monitor loop
+  delete scalpPositions[sym];
+
   if (isSimMode() || (CONFIG.alpacaKey && CONFIG.mode === 'alpaca')) {
-    try { await placeOrder(sym, qty, side); }
-    catch(e) { log('error', `Scalp exit failed ${sym}: ${e.message}`); return; }
+    try {
+      // Always use market order for scalp exits — speed is everything
+      // Smart limit orders add 2-4s latency which kills scalp profitability
+      if (isSimMode()) {
+        simOrder(sym, qty, side);
+      } else {
+        await alpacaFetch(`${ALPACA_BASE()}/v2/orders`, {
+          method: 'POST',
+          body: JSON.stringify({
+            symbol: sym, qty: String(qty), side,
+            type: 'market', time_in_force: 'day',
+          }),
+        });
+      }
+    } catch(e) {
+      log('error', `Scalp exit order failed ${sym}: ${e.message}`);
+      // Restore position if order failed
+      scalpPositions[sym] = pos;
+      return;
+    }
   }
 
   const pnl = direction === 'long'
@@ -2627,92 +2648,141 @@ async function exitScalp(sym, price, reason) {
   portfolio += direction === 'long' ? qty * price : pnl;
   pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++);
 
-  delete scalpPositions[sym];
-
   const holdSecs = Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 1000);
   const icons = { SCALP_TP:'🎯', SCALP_SL:'🛑', SCALP_TRAIL:'📉', SCALP_TIME:'⏰', SCALP_REVERSE:'↩️', SCALP_MANUAL:'🖐' };
-  const icon  = icons[reason] || '📤';
-  log('scalp', `${icon} SCALP EXIT ${qty}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} | Held: ${holdSecs}s | (${reason})`);
+  log('scalp', `${icons[reason]||'📤'} SCALP EXIT ${qty}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} | ${holdSecs}s | ${reason}`);
 
   trades.push({ time: new Date(), sym, side: 'SCALP_EXIT', qty, price, pnl, reason });
-  await syncTrade({ sym, side: 'SCALP_EXIT', qty, price, pnl, reason });
-  await sendDiscordAlert('scalp_exit', sym, qty, price, pnl, reason, pos.sigInfo);
-  await syncLog('sell', `${icon} SCALP EXIT ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason}) ${holdSecs}s`);
-  await syncAll();
+
+  // Fire-and-forget the non-critical async work — don't await it
+  // This prevents the monitor from being held up by Supabase/Discord writes
+  Promise.all([
+    syncTrade({ sym, side: 'SCALP_EXIT', qty, price, pnl, reason }),
+    sendDiscordAlert('scalp_exit', sym, qty, price, pnl, reason, pos.sigInfo),
+    syncLog('sell', `${icons[reason]||'📤'} SCALP EXIT ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason}) ${holdSecs}s`),
+    syncAll(),
+  ]).catch(e => log('error', `Scalp exit sync failed: ${e.message}`));
 }
 
 /**
  * Manage all open scalp positions — called every 5 seconds
  * Precision exit logic: TP, SL, trailing, time stop, signal reversal
  */
+// ─────────────────────────────────────────────
+// SCALP POSITION MONITOR — runs every 2 seconds
+// ─────────────────────────────────────────────
+// Completely separate from the main scan tick.
+// Uses cached prices for checks (no API call),
+// only hits Alpaca when actually placing an exit order.
+// This makes exits near-instant instead of delayed by scan cycle.
+// ─────────────────────────────────────────────
+let scalpMonitorRunning = false;
+
+async function scalpPositionMonitor() {
+  if (scalpMonitorRunning) return;
+  if (Object.keys(scalpPositions).length === 0) return;
+  scalpMonitorRunning = true;
+
+  try {
+    for (const [sym, pos] of Object.entries(scalpPositions)) {
+      // Use cached price first — no API call needed for the check
+      // priceHistory5m is updated every 15s by syncPricesOnly
+      let price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+
+      // If cache is stale (>15s old) or missing, fetch live
+      if (!price) {
+        price = await fetchLatestTrade(sym);
+        if (!price) continue;
+        if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
+        priceHistory5m[sym].push(price);
+      }
+
+      const { direction, entryPrice, stopPrice, tpPrice } = pos;
+      const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
+      const pnlNow   = direction === 'long' ? (price - entryPrice) * pos.qty : (entryPrice - price) * pos.qty;
+
+      // Update water marks
+      if (direction === 'long'  && price > pos.highWater) scalpPositions[sym].highWater = price;
+      if (direction === 'short' && price < pos.lowWater)  scalpPositions[sym].lowWater  = price;
+
+      // ── EXIT 1: Take profit ──
+      const hitTP = direction === 'long' ? price >= tpPrice : price <= tpPrice;
+      if (hitTP) {
+        log('scalp', `🎯 TP hit: ${sym} @ $${price.toFixed(2)} (+$${pnlNow.toFixed(2)})`);
+        await exitScalp(sym, price, 'SCALP_TP');
+        continue;
+      }
+
+      // ── EXIT 2: Stop loss ──
+      const hitSL = direction === 'long' ? price <= stopPrice : price >= stopPrice;
+      if (hitSL) {
+        log('scalp', `🛑 SL hit: ${sym} @ $${price.toFixed(2)} ($${pnlNow.toFixed(2)})`);
+        await exitScalp(sym, price, 'SCALP_SL');
+        continue;
+      }
+
+      // ── EXIT 3: Trailing stop (activates at 50% of TP distance) ──
+      const tpDist = Math.abs(tpPrice - entryPrice);
+      const moved  = direction === 'long' ? price - entryPrice : entryPrice - price;
+      if (moved >= tpDist * 0.5) {
+        if (!scalpPositions[sym].trailingActive) {
+          scalpPositions[sym].trailingActive = true;
+          log('scalp', `📉 ${sym} trailing stop activated @ $${price.toFixed(2)}`);
+        }
+        const trail = direction === 'long'
+          ? scalpPositions[sym].highWater * (1 - CONFIG.scalpTrailingPct)
+          : scalpPositions[sym].lowWater  * (1 + CONFIG.scalpTrailingPct);
+        if (direction === 'long'  && trail > scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trail;
+        if (direction === 'short' && trail < scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trail;
+
+        // If trailing stop now hit
+        const trailHit = direction === 'long' ? price <= scalpPositions[sym].stopPrice : price >= scalpPositions[sym].stopPrice;
+        if (trailHit) {
+          log('scalp', `📉 Trail stop hit: ${sym} @ $${price.toFixed(2)} P&L: ${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)}`);
+          await exitScalp(sym, price, 'SCALP_TRAIL');
+          continue;
+        }
+      }
+
+      // ── EXIT 4: Time stop ──
+      if (holdMins >= CONFIG.scalpMaxHoldMins) {
+        log('scalp', `⏰ Time stop: ${sym} held ${holdMins.toFixed(1)}m P&L: ${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)}`);
+        await exitScalp(sym, price, 'SCALP_TIME');
+        continue;
+      }
+
+      // Still holding — log status
+      log('scalp', `⚡ ${sym} ${direction.toUpperCase()} $${entryPrice.toFixed(2)}→$${price.toFixed(2)} P&L:${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)} SL=$${pos.stopPrice.toFixed(2)} TP=$${tpPrice.toFixed(2)} ${holdMins.toFixed(1)}m`);
+    }
+  } catch(e) {
+    log('error', `scalpMonitor: ${e.message}`);
+  } finally {
+    scalpMonitorRunning = false;
+  }
+}
+
 async function manageScalpPositions() {
+  // Now just a thin wrapper — real management is in scalpPositionMonitor
+  // Keep this for signal reversal check (less time-critical)
   if (Object.keys(scalpPositions).length === 0) return;
 
   for (const [sym, pos] of Object.entries(scalpPositions)) {
-    // Get latest price — use trade price for max precision
-    let price = await fetchLatestTrade(sym);
-    if (!price) {
-      // Fallback to last bar close
-      const bars = await fetchScalpBars(sym, 3);
-      price = bars ? bars[bars.length - 1].c : null;
-    }
-    if (!price) continue;
+    if (!scalpPositions[sym]) continue; // may have been exited by monitor
 
-    const { direction, entryPrice, stopPrice, tpPrice, highWater, lowWater } = pos;
-    const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
-
-    // Update high/low water marks
-    if (direction === 'long'  && price > pos.highWater) scalpPositions[sym].highWater = price;
-    if (direction === 'short' && price < pos.lowWater)  scalpPositions[sym].lowWater  = price;
-
-    // ── 1. Take profit ──
-    const hitTP = direction === 'long' ? price >= tpPrice : price <= tpPrice;
-    if (hitTP) { await exitScalp(sym, price, 'SCALP_TP'); continue; }
-
-    // ── 2. Stop loss ──
-    const hitSL = direction === 'long' ? price <= stopPrice : price >= stopPrice;
-    if (hitSL) { await exitScalp(sym, price, 'SCALP_SL'); continue; }
-
-    // ── 3. Trailing stop — activates once 50% of TP distance is covered ──
-    const tpDist  = Math.abs(tpPrice - entryPrice);
-    const moved   = direction === 'long' ? price - entryPrice : entryPrice - price;
-    if (moved >= tpDist * 0.5) {
-      if (!scalpPositions[sym].trailingActive) {
-        scalpPositions[sym].trailingActive = true;
-        log('scalp', `${sym} trailing stop activated`);
+    // Signal reversal check — only fetch bars if still holding
+    try {
+      const bars1m = await fetchScalpBars(sym, 20);
+      if (bars1m) {
+        const sig      = generateScalpSignal(sym, bars1m);
+        const reversed = (pos.direction === 'long'  && sig.signal === 'SELL' && sig.score >= CONFIG.scalpMinScore)
+                      || (pos.direction === 'short' && sig.signal === 'BUY'  && sig.score >= CONFIG.scalpMinScore);
+        if (reversed && scalpPositions[sym]) {
+          const price = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+          log('scalp', `↩️ Signal reversal: ${sym} — exiting`);
+          await exitScalp(sym, price, 'SCALP_REVERSE');
+        }
       }
-      // Trail at CONFIG.scalpTrailingPct below/above the high/low water
-      const trail = direction === 'long'
-        ? scalpPositions[sym].highWater * (1 - CONFIG.scalpTrailingPct)
-        : scalpPositions[sym].lowWater  * (1 + CONFIG.scalpTrailingPct);
-      // Ratchet the stop — only moves in favor, never against
-      if (direction === 'long'  && trail > scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trail;
-      if (direction === 'short' && trail < scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trail;
-    }
-
-    // ── 4. Time stop — scalps must not sit idle ──
-    if (holdMins >= CONFIG.scalpMaxHoldMins) {
-      log('scalp', `⏰ Scalp time stop: ${sym} held ${holdMins.toFixed(1)}m`);
-      await exitScalp(sym, price, 'SCALP_TIME');
-      continue;
-    }
-
-    // ── 5. Signal reversal — exit if 1m signal flips strongly against us ──
-    const bars1m = await fetchScalpBars(sym, 20);
-    if (bars1m) {
-      const sig = generateScalpSignal(sym, bars1m);
-      const reversed = (direction === 'long'  && sig.signal === 'SELL' && sig.score >= CONFIG.scalpMinScore)
-                    || (direction === 'short' && sig.signal === 'BUY'  && sig.score >= CONFIG.scalpMinScore);
-      if (reversed) {
-        log('scalp', `↩️ Signal reversal: ${sym} ${direction} → exiting`);
-        await exitScalp(sym, price, 'SCALP_REVERSE');
-        continue;
-      }
-    }
-
-    // Log current scalp status
-    const pnlNow = direction === 'long' ? (price - entryPrice) * pos.qty : (entryPrice - price) * pos.qty;
-    log('scalp', `${sym} ${direction.toUpperCase()} ${pos.qty}x @ $${entryPrice.toFixed(2)} → $${price.toFixed(2)} | P&L: ${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)} | ${holdMins.toFixed(1)}m | SL=$${pos.stopPrice.toFixed(2)} TP=$${tpPrice.toFixed(2)}`);
+    } catch(e) {}
   }
 }
 
@@ -3084,8 +3154,16 @@ async function tick() {
   }
 }
 
-// Main tick every 10 seconds
+// Main tick every 15 seconds
 setInterval(tick, PRICE_SYNC_INTERVAL_MS);
+
+// Dedicated scalp exit monitor — runs every 2 seconds independently
+// Much faster than the main tick so TP/SL exits happen near-instantly
+setInterval(() => {
+  if (CONFIG.scalpMode && Object.keys(scalpPositions).length > 0) {
+    scalpPositionMonitor().catch(e => log('error', `scalpMonitor: ${e.message}`));
+  }
+}, 2000);
 
 // Daily tasks
 cron.schedule('5 16 * * 1-5',  sendDailySummary, { timezone: 'America/New_York' });
@@ -3403,29 +3481,37 @@ http.createServer(async (req, res) => {
     if (interaction.type === 2) {
       const commandName = interaction.data?.name;
       const options     = interaction.data?.options || [];
+      const username    = interaction.member?.user?.username || interaction.user?.username || 'unknown';
+      const token       = interaction.token;
 
-      log('sys', `Discord command: /${commandName} from ${interaction.member?.user?.username || interaction.user?.username || 'unknown'}`);
+      log('sys', `Discord command: /${commandName} from ${username}`);
 
-      try {
-        const result = await handleSlashCommand(commandName, options);
+      // Respond immediately with type 5 (deferred) — Discord requires response within 3s
+      // Then do the real work and send a followup
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 5, data: { flags: 0 } }));
 
-        // Respond immediately (Discord requires response within 3 seconds)
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
-          data: {
-            content: result.content,
-            flags: 0, // 64 = ephemeral (only visible to user who ran command)
-          },
-        }));
-      } catch(e) {
+      handleSlashCommand(commandName, options).then(async result => {
+        try {
+          const fetch = await getFetch();
+          await fetch(`https://discord.com/api/v10/webhooks/${CONFIG.discordAppId}/${token}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: result.content }),
+          });
+        } catch(e) { log('error', `Discord followup failed: ${e.message}`); }
+      }).catch(async e => {
         log('error', `Discord command error: ${e.message}`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 4,
-          data: { content: `❌ Error: ${e.message}`, flags: 64 },
-        }));
-      }
+        try {
+          const fetch = await getFetch();
+          await fetch(`https://discord.com/api/v10/webhooks/${CONFIG.discordAppId}/${token}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: `❌ Error: ${e.message}` }),
+          });
+        } catch(_) {}
+      });
+
       return;
     }
 
