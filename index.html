@@ -193,6 +193,7 @@ canvas{width:100%!important;display:block;}
 <header>
   <div class="logo"><div class="logo-dot"></div>TRADECORE</div>
   <div class="hdr-right">
+    <span id="modeBadge" style="display:none;font-family:'Space Mono',monospace;font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(255,181,71,0.15);border:1px solid rgba(255,181,71,0.4);color:var(--warn)">🎮 SIM MODE</span>
     <span class="session-badge" id="sessionBadge">—</span>
     <div class="status-pill offline" id="statusPill"><div class="dot"></div><span id="statusText">CONNECTING</span></div>
     <span class="sync-info" id="syncInfo">—</span>
@@ -394,6 +395,20 @@ canvas{width:100%!important;display:block;}
         <div class="setting-row" style="margin-top:4px"><div class="setting-label">Scalp Symbols</div><input type="text" class="setting-input" id="scalpSymbols" value="SPY,QQQ,AAPL,TSLA,NVDA"></div>
       </div>
       <button class="btn btn-primary btn-sm" style="width:100%;margin-top:14px" onclick="saveSettings()">💾 Save & Apply — no redeploy needed</button>
+
+      <!-- Simulation mode -->
+      <div style="margin-top:12px;padding:12px;border-radius:8px;border:1px solid rgba(255,181,71,0.3);background:rgba(255,181,71,0.05)">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <div style="font-weight:800;font-size:13px">🎮 Simulation Mode</div>
+            <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px;line-height:1.7">
+              Runs the full bot logic — signals, entries, exits, P&amp;L — but<br>
+              no real orders sent to Alpaca. Works 24/7, any day of week.
+            </div>
+          </div>
+          <label class="toggle"><input type="checkbox" id="simEnabled" onchange="onModeChange()"><span class="tog-slider"></span></label>
+        </div>
+      </div>
     </div>
 
     <div class="three-col">
@@ -552,6 +567,7 @@ function loadSettings(){
     if(s.startingCapital) document.getElementById('startingCapital').value=s.startingCapital;
     if(s.swingEnabled!==undefined) document.getElementById('swingEnabled').checked=s.swingEnabled;
     if(s.scalpEnabled!==undefined) document.getElementById('scalpEnabled').checked=s.scalpEnabled;
+    if(s.simEnabled!==undefined)   document.getElementById('simEnabled').checked=s.simEnabled;
     const smap={scalpTp:'%',scalpSl:'%',scalpHold:'m',scalpMax:'',scalpPosPct:'%',scalpMinScore:''};
     Object.entries(smap).forEach(([id,sfx])=>{ if(s[id]!==undefined){ document.getElementById(id).value=s[id]; document.getElementById(id+'V').textContent=s[id]+sfx; }});
     if(s.scalpSymbols) document.getElementById('scalpSymbols').value=s.scalpSymbols;
@@ -574,6 +590,7 @@ async function saveSettings(){
     alertBuy:document.getElementById('alertBuy').checked, alertSell:document.getElementById('alertSell').checked,
     alertDaily:document.getElementById('alertDaily').checked,
     swingEnabled:document.getElementById('swingEnabled').checked, scalpEnabled:document.getElementById('scalpEnabled').checked,
+    simEnabled:  document.getElementById('simEnabled').checked,
     scalpTp:+document.getElementById('scalpTp').value, scalpSl:+document.getElementById('scalpSl').value,
     scalpHold:+document.getElementById('scalpHold').value, scalpMax:+document.getElementById('scalpMax').value,
     scalpPosPct:+document.getElementById('scalpPosPct').value, scalpMinScore:+document.getElementById('scalpMinScore').value,
@@ -587,7 +604,7 @@ async function saveSettings(){
       await fetch(`${sbUrl}/rest/v1/tc_settings?id=eq.1`,{method:'DELETE',headers:{'apikey':sbKey,'Authorization':`Bearer ${sbKey}`}});
       const res=await fetch(`${sbUrl}/rest/v1/tc_settings`,{method:'POST',
         headers:{'apikey':sbKey,'Authorization':`Bearer ${sbKey}`,'Content-Type':'application/json','Prefer':'return=minimal'},
-        body:JSON.stringify({id:1,symbols:s.symbols.join(','),strategy:s.strategy,rsi_period:s.rsiPeriod,rsi_oversold:s.rsiOversold,rsi_overbought:s.rsiOverbought,scan_interval:s.scanInterval,stop_loss_pct:s.stopLoss,take_profit_pct:s.takeProfit,trailing_stop_pct:s.trailingStop,max_daily_loss:s.maxDailyLoss,max_positions:s.maxPositions,max_position_pct:s.maxPosPct,discord_webhook:s.discord,trend_filter:true,volume_filter:true,regime_filter:true,correlation_filter:true,swing_enabled:s.swingEnabled,scalp_mode:s.scalpEnabled,scalp_tp_pct:s.scalpTp,scalp_sl_pct:s.scalpSl,scalp_max_hold_mins:s.scalpHold,scalp_max_positions:s.scalpMax,scalp_position_pct:s.scalpPosPct,scalp_min_score:s.scalpMinScore,scalp_symbols:s.scalpSymbols,updated_at:new Date().toISOString()})
+        body:JSON.stringify({id:1,symbols:s.symbols.join(','),strategy:s.strategy,rsi_period:s.rsiPeriod,rsi_oversold:s.rsiOversold,rsi_overbought:s.rsiOverbought,scan_interval:s.scanInterval,stop_loss_pct:s.stopLoss,take_profit_pct:s.takeProfit,trailing_stop_pct:s.trailingStop,max_daily_loss:s.maxDailyLoss,max_positions:s.maxPositions,max_position_pct:s.maxPosPct,discord_webhook:s.discord,trend_filter:true,volume_filter:true,regime_filter:true,correlation_filter:true,swing_enabled:s.swingEnabled,scalp_mode:s.scalpEnabled,sim_mode:s.simEnabled,scalp_tp_pct:s.scalpTp,scalp_sl_pct:s.scalpSl,scalp_max_hold_mins:s.scalpHold,scalp_max_positions:s.scalpMax,scalp_position_pct:s.scalpPosPct,scalp_min_score:s.scalpMinScore,scalp_symbols:s.scalpSymbols,updated_at:new Date().toISOString()})
       });
       showToast(res.ok||res.status===201 ? '✓ Saved — bot picks up next scan' : '✓ Local only');
     }catch(e){ showToast('✓ Saved locally'); }
@@ -595,16 +612,24 @@ async function saveSettings(){
 }
 
 function onModeChange(){
-  const swOn=document.getElementById('swingEnabled').checked;
-  const scOn=document.getElementById('scalpEnabled').checked;
-  const sw=document.getElementById('swingCard'), sc=document.getElementById('scalpCard');
-  sw.style.borderColor=swOn?'var(--accent2)':'var(--border)';
-  sw.style.background=swOn?'rgba(127,255,110,0.05)':'';
-  sc.style.borderColor=scOn?'var(--accent)':'var(--border)';
-  sc.style.background=scOn?'rgba(0,229,255,0.05)':'';
-  document.getElementById('scalpSettings').style.display=scOn?'block':'none';
-  const m=[]; if(swOn) m.push('📈 Swing'); if(scOn) m.push('⚡ Scalp');
-  document.getElementById('modeStatusText').textContent=m.length?`Active: ${m.join(' + ')}`:'⚠ No mode — bot will idle';
+  const swOn  = document.getElementById('swingEnabled').checked;
+  const scOn  = document.getElementById('scalpEnabled').checked;
+  const simOn = document.getElementById('simEnabled').checked;
+
+  const sw = document.getElementById('swingCard'), sc = document.getElementById('scalpCard');
+  sw.style.borderColor = swOn  ? 'var(--accent2)' : 'var(--border)';
+  sw.style.background  = swOn  ? 'rgba(127,255,110,0.05)' : '';
+  sc.style.borderColor = scOn  ? 'var(--accent)' : 'var(--border)';
+  sc.style.background  = scOn  ? 'rgba(0,229,255,0.05)'  : '';
+
+  document.getElementById('scalpSettings').style.display = scOn ? 'block' : 'none';
+
+  const m = [];
+  if (swOn)  m.push('📈 Swing');
+  if (scOn)  m.push('⚡ Scalp');
+  if (simOn) m.push('🎮 Sim');
+  document.getElementById('modeStatusText').textContent =
+    m.length ? `Active: ${m.join(' + ')}` : '⚠ No mode — bot will idle';
 }
 
 function rng(el,valId,sfx){ document.getElementById(valId).textContent=el.value+sfx; }
@@ -708,7 +733,12 @@ function updateKPIs(p, positions, trades){
   document.getElementById('circuitStatus').className='kpi-sub '+(p.circuit_breaker?'red':'green');
 
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
-  if(p.session) document.getElementById('sessionBadge').textContent=p.session;
+  if(p.session)   document.getElementById('sessionBadge').textContent=p.session;
+
+  // Show sim mode badge in header if active
+  const simOn = document.getElementById('simEnabled')?.checked;
+  const modeEl = document.getElementById('modeBadge');
+  if(modeEl){ modeEl.textContent = simOn ? '🎮 SIM MODE' : ''; modeEl.style.display = simOn ? '' : 'none'; }
 
   const lastVal=equityHistory[equityHistory.length-1];
   if(!lastVal||Math.abs(equity-lastVal)>0.01){
