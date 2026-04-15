@@ -671,13 +671,22 @@ async function testDiscord(){ const wh=document.getElementById('discordWebhook')
 // ══════════════════════════════════════════
 let equityHistory=[], equityLoaded=false, lastTradeIds=new Set(), lastLogIds=new Set(), chartCtx=null;
 
+let lastTradeCount = 0, lastLogCount = 0, lastPositionHash = '', pollCount = 0;
+
 async function poll(){
-  const [portfolio, positions, trades, logs] = await Promise.all([
+  pollCount++;
+  const fetchTrades = pollCount % 3 === 0; // trades every 15s
+  const fetchLogs   = pollCount % 4 === 0; // logs every 20s
+
+  // Always fetch portfolio + positions (lightweight, change frequently)
+  const fetches = [
     sbGet('tc_portfolio','?id=eq.1'),
     sbGet('tc_positions','?order=updated_at.desc'),
-    sbGet('tc_trades','?order=created_at.desc&limit=100'),
-    sbGet('tc_logs','?order=created_at.desc&limit=150'),
-  ]);
+    fetchTrades ? sbGet('tc_trades','?order=created_at.desc&limit=100') : Promise.resolve(null),
+    fetchLogs   ? sbGet('tc_logs','?order=created_at.desc&limit=100')   : Promise.resolve(null),
+  ];
+
+  const [portfolio, positions, trades, logs] = await Promise.all(fetches);
 
   if(!portfolio||portfolio.length===0){ setOffline(); return; }
 
@@ -686,11 +695,25 @@ async function poll(){
     equityLoaded=true;
   }
 
-  const p=portfolio[0], posData=positions||[], tradeData=trades||[];
-  updateKPIs(p, posData, tradeData);
-  updatePositions(posData);
-  updateTrades(tradeData);
-  updateLogs(logs||[]);
+  const p=portfolio[0], posData=positions||[];
+
+  // Always update KPIs and positions (fast, important)
+  updateKPIs(p, posData, []);
+  
+  // Only re-render positions if they changed
+  const posHash = JSON.stringify(posData.map(p=>p.symbol+p.pnl+p.current_price));
+  if(posHash !== lastPositionHash){ lastPositionHash = posHash; updatePositions(posData); }
+
+  // Only re-render trades/logs if new data fetched and count changed
+  if(trades !== null){
+    const tradeData = trades || [];
+    if(tradeData.length !== lastTradeCount){ lastTradeCount = tradeData.length; updateTrades(tradeData); }
+  }
+  if(logs !== null){
+    const logData = logs || [];
+    if(logData.length !== lastLogCount){ lastLogCount = logData.length; updateLogs(logData); }
+  }
+
   updateScreener(p);
   setOnline();
   document.getElementById('syncInfo').textContent='Updated '+new Date().toLocaleTimeString();
@@ -936,7 +959,7 @@ if(!getSbUrl()||!getSbKey()){
   document.getElementById('sbUrlInput').value=getSbUrl();
   document.getElementById('sbKeyInput').value=getSbKey();
   poll();
-  setInterval(poll, 5000);
+  setInterval(poll, 8000);
 }
 </script>
 </body>
