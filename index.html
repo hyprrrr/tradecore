@@ -663,19 +663,26 @@ function onModeChange(){
   if(modeBadge) modeBadge.style.display = simOn ? '' : 'none';
   if(simProg)   simProg.style.display   = simOn ? 'block' : 'none';
 
-  // If turning sim OFF — immediately show syncing state so user knows something is happening
+  // If turning sim OFF — immediately clear sim values and reload real data
   if (!simOn) {
+    // Clear visual state immediately
     const pnlEl  = document.getElementById('todayPnl');
     const portEl = document.getElementById('portfolioVal');
     if(pnlEl)  { pnlEl.textContent = '…'; pnlEl.className = 'kpi-value'; }
     if(portEl)   portEl.textContent = 'Syncing…';
     document.getElementById('syncInfo').textContent = 'Switching to live mode…';
-    // Poll aggressively for 10 seconds after switching to pick up real values fast
+
+    // Reset equity chart — sim wrote fake values, need to reload real ones
+    equityHistory = [];
+    equityLoaded  = false; // forces reload from tc_equity on next poll
+    drawChart();
+
+    // Poll aggressively for 15 seconds to pick up real values fast
     let fastPolls = 0;
     const fastPoll = setInterval(async () => {
       await poll();
-      if(++fastPolls >= 5) clearInterval(fastPoll);
-    }, 2000);
+      if(++fastPolls >= 6) clearInterval(fastPoll);
+    }, 2500);
   }
 
   // Save to Supabase — bot picks up within 5 seconds via fast config poll
