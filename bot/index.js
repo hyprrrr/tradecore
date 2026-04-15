@@ -100,6 +100,10 @@ const CONFIG = {
   // Supabase
   supabaseUrl: process.env.SUPABASE_URL || '',
   supabaseKey: process.env.SUPABASE_ANON_KEY || '',
+
+  // Discord slash command support
+  discordAppId:    process.env.DISCORD_APP_ID    || '', // from Discord Developer Portal
+  discordPublicKey:process.env.DISCORD_PUBLIC_KEY|| '', // from Discord Developer Portal
 };
 
 // ─────────────────────────────────────────────
@@ -2849,39 +2853,274 @@ loadRemoteConfig().then(async () => {
 setTimeout(syncPricesOnly, 5000);
 
 // ─────────────────────────────────────────────
-// HEALTH ENDPOINT
+// HTTP SERVER + DISCORD SLASH COMMANDS
 // ─────────────────────────────────────────────
-http.createServer((req, res) => {
-  // Manual circuit breaker reset: GET /reset-cb
-  if (req.url === '/reset-cb') {
+//
+// Discord sends a POST to your Render URL whenever someone types
+// a slash command in Discord. We verify the request signature,
+// parse the command, execute it, and respond — all in <300ms.
+//
+// Slash commands supported:
+//   /exit [symbol]     — exit a long or short position immediately
+//   /status            — show all open positions + P&L
+//   /pause             — engage circuit breaker (stops new trades)
+//   /resume            — reset circuit breaker
+//   /sim               — toggle simulation mode
+//   /positions         — list all open positions
+//
+
+const nacl = require('tweetnacl');
+
+// Verify Discord's Ed25519 signature — required or Discord rejects the endpoint
+function verifyDiscordRequest(rawBody, signature, timestamp) {
+  if (!CONFIG.discordPublicKey) return true; // skip if not configured
+  try {
+    const key = Buffer.from(CONFIG.discordPublicKey, 'hex');
+    const msg = Buffer.from(timestamp + rawBody);
+    const sig = Buffer.from(signature, 'hex');
+    return nacl.sign.detached.verify(msg, sig, key);
+  } catch(e) {
+    return false;
+  }
+}
+
+// Format a position as a Discord embed field value
+function formatPosition(sym, pos, isShort = false) {
+  const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+  const pnl    = isShort
+    ? (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty)
+    : (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
+  const pct    = ((Math.abs(pnl) / pos.cost || 1) * 100).toFixed(2);
+  const held   = Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 60000);
+  const dir    = isShort ? '🔴 SHORT' : '🟢 LONG';
+  return `${dir} ${pos.qtyRemaining || pos.qty}x @ $${pos.entryPrice.toFixed(2)} → $${cur.toFixed(2)}\nP&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnl>=0?'+':''}${pct}%) | Held: ${held}m`;
+}
+
+// Execute a slash command — returns a Discord interaction response object
+async function handleSlashCommand(commandName, options) {
+  const opt = (name) => options?.find(o => o.name === name)?.value;
+
+  // ── /exit [symbol] ──
+  if (commandName === 'exit') {
+    const sym = (opt('symbol') || '').toUpperCase().trim();
+    if (!sym) return { content: '⚠ Usage: `/exit AAPL`' };
+
+    // Check all position types
+    if (positions[sym]) {
+      const pos   = positions[sym];
+      const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      await exitPosition(sym, price, 'MANUAL_DISCORD');
+      const pnl = (price - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
+      return { content: `✅ **${sym}** long position exited @ $${price.toFixed(2)}\nP&L: ${pnl>=0?'**+':'**'}$${pnl.toFixed(2)}**\nReason: Manual Discord command` };
+    }
+
+    if (shortPositions[sym]) {
+      const pos   = shortPositions[sym];
+      const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      await coverShort(sym, price, 'MANUAL_DISCORD');
+      const pnl = (pos.entryPrice - price) * (pos.qtyRemaining || pos.qty);
+      return { content: `✅ **${sym}** short position covered @ $${price.toFixed(2)}\nP&L: ${pnl>=0?'**+':'**'}$${pnl.toFixed(2)}**\nReason: Manual Discord command` };
+    }
+
+    if (scalpPositions[sym]) {
+      const pos   = scalpPositions[sym];
+      const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      await exitScalp(sym, price, 'SCALP_MANUAL');
+      const pnl = pos.direction === 'long'
+        ? (price - pos.entryPrice) * pos.qty
+        : (pos.entryPrice - price) * pos.qty;
+      return { content: `✅ **${sym}** scalp exited @ $${price.toFixed(2)}\nP&L: ${pnl>=0?'**+':'**'}$${pnl.toFixed(2)}**` };
+    }
+
+    return { content: `⚠ No open position found for **${sym}**\nOpen positions: ${[...Object.keys(positions), ...Object.keys(shortPositions), ...Object.keys(scalpPositions)].join(', ') || 'none'}` };
+  }
+
+  // ── /status ──
+  if (commandName === 'status') {
+    const openPnl = Object.entries(positions).reduce((a, [s, p]) => {
+      const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || p.entryPrice;
+      return a + (cur - p.entryPrice) * (p.qtyRemaining || p.qty);
+    }, 0);
+    const equity = realEquity || portfolio + openPnl;
+    const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
+    const allPos = [
+      ...Object.entries(positions).map(([s,p])      => `• **${s}** ${formatPosition(s,p,false)}`),
+      ...Object.entries(shortPositions).map(([s,p]) => `• **${s}** ${formatPosition(s,p,true)}`),
+      ...Object.entries(scalpPositions).map(([s,p]) => `• **${s}** ⚡SCALP ${p.direction} ${p.qty}x @ $${p.entryPrice.toFixed(2)}`),
+    ];
+    const modeStr = isSimMode() ? '🎮 SIM' : CONFIG.alpacaPaper ? '📄 PAPER' : '💰 LIVE';
+    return { content: [
+      `**TradeCore Status** | ${modeStr} | ${getCurrentSession()}`,
+      `Portfolio: **$${equity.toFixed(2)}** | Day P&L: **${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}**`,
+      `Wins: ${totalWins} | Losses: ${totalLosses} | Circuit: ${circuitBreakerOn?'🔴 ON':'🟢 OFF'}`,
+      allPos.length ? `\n**Open Positions (${allPos.length}):**\n${allPos.join('\n')}` : '\nNo open positions.',
+    ].join('\n') };
+  }
+
+  // ── /positions ──
+  if (commandName === 'positions') {
+    const all = [
+      ...Object.entries(positions).map(([s,p])      => `🟢 **${s}** (LONG)\n${formatPosition(s,p,false)}`),
+      ...Object.entries(shortPositions).map(([s,p]) => `🔴 **${s}** (SHORT)\n${formatPosition(s,p,true)}`),
+      ...Object.entries(scalpPositions).map(([s,p]) => {
+        const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || p.entryPrice;
+        const pnl = p.direction==='long' ? (cur-p.entryPrice)*p.qty : (p.entryPrice-cur)*p.qty;
+        return `⚡ **${s}** (SCALP ${p.direction.toUpperCase()})\n${p.qty}x @ $${p.entryPrice.toFixed(2)} → $${cur.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`;
+      }),
+    ];
+    if (!all.length) return { content: '📭 No open positions right now.' };
+    return { content: `**Open Positions (${all.length}):**\n\n${all.join('\n\n')}` };
+  }
+
+  // ── /pause ──
+  if (commandName === 'pause') {
+    circuitBreakerOn = true;
+    await syncLog('warn', '⏸ Bot paused via Discord command');
+    return { content: '⏸ **Bot paused.** No new trades will be placed.\nUse `/resume` to restart trading.' };
+  }
+
+  // ── /resume ──
+  if (commandName === 'resume') {
+    circuitBreakerOn     = false;
+    realDailyStartEquity = realEquity || CONFIG.startingCapital;
+    await syncLog('sys', '▶️ Bot resumed via Discord command');
+    return { content: '▶️ **Bot resumed.** Circuit breaker cleared — trading is active.' };
+  }
+
+  // ── /sim ──
+  if (commandName === 'sim') {
+    const wasSimMode = isSimMode();
+    CONFIG.mode = wasSimMode ? (process.env.MODE || 'alpaca') : 'sim';
+    if (!wasSimMode) simState.loaded = false; // reload bars on next scan
+    await syncLog('sys', `🎮 Sim mode ${isSimMode()?'enabled':'disabled'} via Discord`);
+    return { content: isSimMode()
+      ? '🎮 **Simulation mode enabled.** Bot will replay historical bars. No real orders.'
+      : '✅ **Simulation mode disabled.** Returning to live/paper trading.' };
+  }
+
+  return { content: `❓ Unknown command: \`/${commandName}\`` };
+}
+
+// Read request body
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', chunk => data += chunk);
+    req.on('end',  ()    => resolve(data));
+    req.on('error', reject);
+  });
+}
+
+http.createServer(async (req, res) => {
+  const url = req.url.split('?')[0];
+
+  // ── GET /reset-cb ──
+  if (req.method === 'GET' && url === '/reset-cb') {
     circuitBreakerOn     = false;
     realDailyStartEquity = realEquity;
-    log('risk', '🟢 Circuit breaker manually reset via /reset-cb');
+    log('risk', '🟢 Circuit breaker reset via /reset-cb');
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, message: 'Circuit breaker reset', equity: realEquity }));
+    res.end(JSON.stringify({ ok: true, message: 'Circuit breaker reset' }));
     return;
   }
-  const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
-    return acc + (cur - pos.entryPrice) * pos.qty;
-  }, 0);
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    status: 'running',
-    session: getCurrentSession(),
-    market_open: isMarketOpen(),
-    portfolio: +portfolio.toFixed(2),
-    open_pnl: +openPnl.toFixed(2),
-    total_value: +(portfolio + openPnl).toFixed(2),
-    open_positions: Object.keys(positions).length,
-    scalp_positions: Object.keys(scalpPositions).length,
-    scalp_mode: CONFIG.scalpMode,
-    scalp_wins: scalpWins,
-    scalp_losses: scalpLosses,
-    wins: totalWins, losses: totalLosses,
-    win_rate: (totalWins + totalLosses) > 0 ? ((totalWins / (totalWins + totalLosses)) * 100).toFixed(1) + '%' : 'N/A',
-    circuit_breaker: circuitBreakerOn,
-    last_scan: lastScanTime,
-    uptime_min: Math.round(process.uptime() / 60),
-  }, null, 2));
-}).listen(process.env.PORT || 3000, () => log('sys', `Health → port ${process.env.PORT || 3000}`));
+
+  // ── GET / — health check ──
+  if (req.method === 'GET' && url === '/') {
+    const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      return acc + (cur - pos.entryPrice) * pos.qty;
+    }, 0);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'running',
+      mode: CONFIG.mode,
+      session: getCurrentSession(),
+      market_open: isMarketOpen(),
+      portfolio: +portfolio.toFixed(2),
+      equity: +(realEquity || portfolio + openPnl).toFixed(2),
+      open_positions: Object.keys(positions).length,
+      short_positions: Object.keys(shortPositions).length,
+      scalp_positions: Object.keys(scalpPositions).length,
+      scalp_mode: CONFIG.scalpMode,
+      scalp_wins: scalpWins,
+      scalp_losses: scalpLosses,
+      wins: totalWins, losses: totalLosses,
+      circuit_breaker: circuitBreakerOn,
+      last_scan: lastScanTime,
+      uptime_min: Math.round(process.uptime() / 60),
+    }, null, 2));
+    return;
+  }
+
+  // ── POST /discord — Discord Interactions endpoint ──
+  if (req.method === 'POST' && url === '/discord') {
+    let rawBody;
+    try { rawBody = await readBody(req); } catch(e) {
+      res.writeHead(400); res.end('Bad request'); return;
+    }
+
+    const signature = req.headers['x-signature-ed25519'];
+    const timestamp = req.headers['x-signature-timestamp'];
+
+    // Discord requires signature verification
+    if (!verifyDiscordRequest(rawBody, signature, timestamp)) {
+      log('warn', 'Discord: invalid signature rejected');
+      res.writeHead(401); res.end('Invalid signature'); return;
+    }
+
+    let interaction;
+    try { interaction = JSON.parse(rawBody); } catch(e) {
+      res.writeHead(400); res.end('Invalid JSON'); return;
+    }
+
+    // Discord PING — must respond with type 1 to verify endpoint
+    if (interaction.type === 1) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 1 }));
+      log('sys', 'Discord endpoint verified ✅');
+      return;
+    }
+
+    // Slash command (type 2)
+    if (interaction.type === 2) {
+      const commandName = interaction.data?.name;
+      const options     = interaction.data?.options || [];
+
+      log('sys', `Discord command: /${commandName} from ${interaction.member?.user?.username || interaction.user?.username || 'unknown'}`);
+
+      try {
+        const result = await handleSlashCommand(commandName, options);
+
+        // Respond immediately (Discord requires response within 3 seconds)
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+          data: {
+            content: result.content,
+            flags: 0, // 64 = ephemeral (only visible to user who ran command)
+          },
+        }));
+      } catch(e) {
+        log('error', `Discord command error: ${e.message}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 4,
+          data: { content: `❌ Error: ${e.message}`, flags: 64 },
+        }));
+      }
+      return;
+    }
+
+    res.writeHead(400); res.end('Unknown interaction type');
+    return;
+  }
+
+  // 404 for anything else
+  res.writeHead(404); res.end('Not found');
+
+}).listen(process.env.PORT || 3000, () => {
+  log('sys', `Server on port ${process.env.PORT || 3000}`);
+  log('sys', `Discord endpoint: POST /discord`);
+  if (CONFIG.discordPublicKey) log('sys', `Discord signature verification: ✅ enabled`);
+  else log('warn', `Discord signature verification: ⚠ DISCORD_PUBLIC_KEY not set`);
+});
