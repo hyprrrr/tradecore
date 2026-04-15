@@ -373,8 +373,10 @@ async function syncPortfolio() {
     updated_at:      new Date().toISOString(),
   });
 
-  // Equity snapshot for chart
-  if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10) {
+  // Equity snapshot for chart — only every 2 minutes to reduce Supabase writes
+  const now = Date.now();
+  if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10 && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
+    lastEquitySnapshot = now;
     await sbFetch('tc_equity', 'POST', {
       value:      +equityValue.toFixed(2),
       created_at: new Date().toISOString(),
@@ -683,7 +685,7 @@ function shouldScanSymbol(symbol) {
 const ALPACA_BASE      = () => CONFIG.alpacaPaper ? 'https://paper-api.alpaca.markets' : 'https://api.alpaca.markets';
 const ALPACA_DATA_BASE = 'https://data.alpaca.markets';
 
-async function alpacaFetch(url, opts = {}) {
+async function alpacaFetch(url, opts = {}, retries = 2) {
   const fetch = await getFetch();
   const res = await fetch(url, {
     ...opts,
@@ -694,6 +696,15 @@ async function alpacaFetch(url, opts = {}) {
       ...(opts.headers || {}),
     },
   });
+
+  // Rate limit hit — wait and retry
+  if (res.status === 429 && retries > 0) {
+    const retryAfter = +(res.headers.get('retry-after') || 2) * 1000;
+    log('warn', `Alpaca rate limit hit — waiting ${retryAfter}ms then retrying`);
+    await new Promise(r => setTimeout(r, retryAfter));
+    return alpacaFetch(url, opts, retries - 1);
+  }
+
   return res.json();
 }
 
@@ -2166,17 +2177,15 @@ async function syncPricesOnly() {
           realDailyStartEquity = lastEquity;
         }
 
-        // Calculate day P&L from Alpaca's own numbers — most accurate
         const dayPnl = lastEquity > 0 ? +(equity - lastEquity).toFixed(2) : 0;
 
+        // Only write total_value and day_pnl — not equity snapshot (that's in syncPortfolio)
         await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
           cash:        cash ? +cash.toFixed(2) : undefined,
           total_value: +equity.toFixed(2),
           day_pnl:     +dayPnl.toFixed(2),
           updated_at:  new Date().toISOString(),
         });
-
-        log('price', `Equity=$${equity.toFixed(2)} Cash=$${cash?.toFixed(2)} DayP&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
       }
     }
   } catch (e) {
@@ -2986,9 +2995,11 @@ let scanInProgress = false;
 let lastFullScan = 0;
 const FULL_SCAN_INTERVAL_MS = Math.max(
   +(process.env.SCAN_INTERVAL_SEC || 30) * 1000,
-  10000 // never faster than 10s
+  15000 // never faster than 15s
 );
-const PRICE_SYNC_INTERVAL_MS = 10000; // price updates every 10s
+const PRICE_SYNC_INTERVAL_MS = 15000; // price updates every 15s (was 10s)
+const EQUITY_SNAPSHOT_INTERVAL_MS = 2 * 60 * 1000; // equity curve point every 2 min
+let lastEquitySnapshot = 0;
 
 log('sys', `Full scan every ${FULL_SCAN_INTERVAL_MS/1000}s | Price sync every ${PRICE_SYNC_INTERVAL_MS/1000}s`);
 
