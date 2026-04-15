@@ -264,6 +264,30 @@ async function syncPortfolio() {
     } catch(e) {}
   }
 
+  // Sanity check: Alpaca's equity can lag after a new order fills —
+  // during that window equity = just cash (position not yet valued).
+  // If equity is suspiciously low (< cash + estimated position value), 
+  // calculate it ourselves from cash + current market value of all positions.
+  const positionMarketValue = Object.entries(positions).reduce((acc, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    return acc + cur * (pos.qtyRemaining || pos.qty);
+  }, 0) + Object.entries(shortPositions).reduce((acc, [sym, pos]) => {
+    // Short positions don't add market value (cash already received from short sale)
+    return acc;
+  }, 0) + Object.entries(scalpPositions).reduce((acc, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    return acc + (pos.direction === 'long' ? cur * pos.qty : 0);
+  }, 0);
+
+  const calculatedEquity = cashValue + positionMarketValue;
+
+  // Use whichever is higher — Alpaca's number or our calculation.
+  // This prevents the "position just opened" lag from showing as a loss.
+  if (calculatedEquity > equityValue + 100) {
+    log('sys', `Equity lag detected: Alpaca=$${equityValue.toFixed(2)} Calculated=$${calculatedEquity.toFixed(2)} — using calculated`);
+    equityValue = +calculatedEquity.toFixed(2);
+  }
+
   // Keep real equity updated for accurate circuit breaker
   if (equityValue > 0) {
     realEquity = equityValue;
@@ -274,10 +298,13 @@ async function syncPortfolio() {
   }
 
   // Day P&L = today's equity vs yesterday's close
+  // If lastEquity is 0 (paper account first day), fall back to realized trades
   const dayPnl = lastEquity > 0
     ? +(equityValue - lastEquity).toFixed(2)
-    : trades.filter(t => t.side === 'SELL' && t.pnl !== null && new Date(t.time).toDateString() === new Date().toDateString())
-            .reduce((a, t) => a + t.pnl, 0);
+    : trades
+        .filter(t => ['SELL','COVER','SCALP_EXIT'].includes(t.side) && t.pnl !== null
+          && new Date(t.time).toDateString() === new Date().toDateString())
+        .reduce((a, t) => a + t.pnl, 0);
 
   await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
     cash:            +cashValue.toFixed(2),
@@ -291,7 +318,7 @@ async function syncPortfolio() {
     updated_at:      new Date().toISOString(),
   });
 
-  // Equity snapshot for chart (only if value looks valid)
+  // Equity snapshot for chart
   if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10) {
     await sbFetch('tc_equity', 'POST', {
       value:      +equityValue.toFixed(2),
