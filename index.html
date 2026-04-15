@@ -392,6 +392,12 @@ canvas{width:100%!important;display:block;}
           </div>
           <div class="mode-card-desc">Holds: Seconds → 8min<br>Targets: +0.2% → +0.5%<br>Bars: 1min precision<br>Scan: every 5 seconds</div>
         </div>
+        <div class="mode-card" id="shortsCard" onclick="document.getElementById('shortsEnabled').click()">
+          <div class="mode-card-title">🔴 Short Selling
+            <label class="toggle" onclick="event.stopPropagation()"><input type="checkbox" id="shortsEnabled" onchange="onModeChange()"><span class="tog-slider"></span></label>
+          </div>
+          <div class="mode-card-desc">Profit from falling prices<br>Requires strong confluence<br>5 confirmations needed<br>Default: OFF (high risk)</div>
+        </div>
       </div>
       <div id="scalpSettings" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
         <div style="font-size:10px;font-weight:700;letter-spacing:2px;color:var(--accent);margin-bottom:10px;text-transform:uppercase">⚡ Scalp Settings</div>
@@ -618,6 +624,7 @@ async function saveSettings(){
     alertDaily:document.getElementById('alertDaily').checked,
     swingEnabled:document.getElementById('swingEnabled').checked, scalpEnabled:document.getElementById('scalpEnabled').checked,
     simEnabled:  document.getElementById('simEnabled').checked,
+    shortsEnabled:document.getElementById('shortsEnabled').checked,
     scalpTp:+document.getElementById('scalpTp').value, scalpSl:+document.getElementById('scalpSl').value,
     scalpHold:+document.getElementById('scalpHold').value, scalpMax:+document.getElementById('scalpMax').value,
     scalpPosPct:+document.getElementById('scalpPosPct').value, scalpMinScore:+document.getElementById('scalpMinScore').value,
@@ -631,7 +638,7 @@ async function saveSettings(){
       await fetch(`${sbUrl}/rest/v1/tc_settings?id=eq.1`,{method:'DELETE',headers:{'apikey':sbKey,'Authorization':`Bearer ${sbKey}`}});
       const res=await fetch(`${sbUrl}/rest/v1/tc_settings`,{method:'POST',
         headers:{'apikey':sbKey,'Authorization':`Bearer ${sbKey}`,'Content-Type':'application/json','Prefer':'return=minimal'},
-        body:JSON.stringify({id:1,symbols:s.symbols.join(','),strategy:s.strategy,rsi_period:s.rsiPeriod,rsi_oversold:s.rsiOversold,rsi_overbought:s.rsiOverbought,scan_interval:s.scanInterval,stop_loss_pct:s.stopLoss,take_profit_pct:s.takeProfit,trailing_stop_pct:s.trailingStop,max_daily_loss:s.maxDailyLoss,max_positions:s.maxPositions,max_position_pct:s.maxPosPct,discord_webhook:s.discord,trend_filter:true,volume_filter:true,regime_filter:true,correlation_filter:true,swing_enabled:s.swingEnabled,scalp_mode:s.scalpEnabled,sim_mode:s.simEnabled,scalp_tp_pct:s.scalpTp,scalp_sl_pct:s.scalpSl,scalp_max_hold_mins:s.scalpHold,scalp_max_positions:s.scalpMax,scalp_position_pct:s.scalpPosPct,scalp_min_score:s.scalpMinScore,scalp_symbols:s.scalpSymbols,updated_at:new Date().toISOString()})
+        body:JSON.stringify({id:1,symbols:s.symbols.join(','),strategy:s.strategy,rsi_period:s.rsiPeriod,rsi_oversold:s.rsiOversold,rsi_overbought:s.rsiOverbought,scan_interval:s.scanInterval,stop_loss_pct:s.stopLoss,take_profit_pct:s.takeProfit,trailing_stop_pct:s.trailingStop,max_daily_loss:s.maxDailyLoss,max_positions:s.maxPositions,max_position_pct:s.maxPosPct,discord_webhook:s.discord,trend_filter:true,volume_filter:true,regime_filter:true,correlation_filter:true,swing_enabled:s.swingEnabled,scalp_mode:s.scalpEnabled,sim_mode:s.simEnabled,shorts_enabled:s.shortsEnabled,scalp_tp_pct:s.scalpTp,scalp_sl_pct:s.scalpSl,scalp_max_hold_mins:s.scalpHold,scalp_max_positions:s.scalpMax,scalp_position_pct:s.scalpPosPct,scalp_min_score:s.scalpMinScore,scalp_symbols:s.scalpSymbols,updated_at:new Date().toISOString()})
       });
       showToast(res.ok||res.status===201 ? '✓ Saved — bot picks up next scan' : '✓ Local only');
     }catch(e){ showToast('✓ Saved locally'); }
