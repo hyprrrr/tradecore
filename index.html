@@ -648,7 +648,6 @@ function onModeChange(){
   sw.style.background  = swOn  ? 'rgba(127,255,110,0.05)' : '';
   sc.style.borderColor = scOn  ? 'var(--accent)' : 'var(--border)';
   sc.style.background  = scOn  ? 'rgba(0,229,255,0.05)'  : '';
-
   document.getElementById('scalpSettings').style.display = scOn ? 'block' : 'none';
 
   const m = [];
@@ -658,11 +657,31 @@ function onModeChange(){
   document.getElementById('modeStatusText').textContent =
     m.length ? `Active: ${m.join(' + ')}` : '⚠ No mode — bot will idle';
 
-  // Auto-save immediately when any mode toggle changes
+  // Immediately update sim badge
+  const modeBadge = document.getElementById('modeBadge');
+  const simProg   = document.getElementById('simProgress');
+  if(modeBadge) modeBadge.style.display = simOn ? '' : 'none';
+  if(simProg)   simProg.style.display   = simOn ? 'block' : 'none';
+
+  // If turning sim OFF — immediately show syncing state so user knows something is happening
+  if (!simOn) {
+    const pnlEl  = document.getElementById('todayPnl');
+    const portEl = document.getElementById('portfolioVal');
+    if(pnlEl)  { pnlEl.textContent = '…'; pnlEl.className = 'kpi-value'; }
+    if(portEl)   portEl.textContent = 'Syncing…';
+    document.getElementById('syncInfo').textContent = 'Switching to live mode…';
+    // Poll aggressively for 10 seconds after switching to pick up real values fast
+    let fastPolls = 0;
+    const fastPoll = setInterval(async () => {
+      await poll();
+      if(++fastPolls >= 5) clearInterval(fastPoll);
+    }, 2000);
+  }
+
+  // Save to Supabase — bot picks up within 5 seconds via fast config poll
   saveSettings().then(() => {
-    if (simOn) showToast('🎮 Sim mode ON — bot picks up next scan');
-    else       showToast('✅ Sim mode OFF — live/paper mode active');
-  }).catch(() => showToast('✓ Saved locally'));
+    showToast(simOn ? '🎮 Sim mode ON — bot replaying bars' : '✅ Live mode — syncing account…');
+  }).catch(() => showToast('✓ Saved'));
 }
 
 function rng(el,valId,sfx){ document.getElementById(valId).textContent=el.value+sfx; }
