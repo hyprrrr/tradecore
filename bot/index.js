@@ -166,20 +166,25 @@ async function loadRemoteConfig() {
           log('sim', '✅ Simulation mode DISABLED — restoring live account');
           await syncLog('sys', '✅ Exited sim mode — restoring live Alpaca account…');
 
-          // 1. Clear all sim positions from memory
+          // 1. Clear ALL sim state from memory — nothing carries over to live
           Object.keys(positions).forEach(k => delete positions[k]);
           Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
           Object.keys(scalpPositions).forEach(k => delete scalpPositions[k]);
           pendingSignals.clear();
           totalWins = 0; totalLosses = 0;
+          tradePerformanceLog = [];
+
+          // Reset circuit breaker — sim losses must never affect live trading
+          circuitBreakerOn     = false;
+          realEquity           = 0; // force re-fetch from Alpaca
+          realDailyStartEquity = 0; // force re-fetch from Alpaca
 
           // 2. Wipe sim positions from Supabase
           await sbFetch('tc_positions?symbol=neq.____NONE____', 'DELETE');
 
-          // 2b. Delete sim equity snapshots — they're fake values that pollute the chart
-          // We delete all equity rows and let real Alpaca values rebuild the chart
+          // 2b. Delete sim equity snapshots — fake values pollute the chart
           await sbFetch('tc_equity?id=gt.0', 'DELETE');
-          log('sys', '✅ Sim equity snapshots cleared from chart');
+          log('sys', '✅ Sim data cleared from Supabase');
 
           // 3. Fetch real Alpaca account values RIGHT NOW
           let liveEquity = 0, liveCash = 0, liveLastEquity = 0;
@@ -190,14 +195,13 @@ async function loadRemoteConfig() {
             if (acct?.last_equity) liveLastEquity  = +parseFloat(acct.last_equity).toFixed(2);
           } catch(e) { log('warn', `Could not fetch Alpaca account: ${e.message}`); }
 
-          // Use live values if valid, otherwise keep startingCapital
           if (liveEquity > 0) {
             portfolio            = liveEquity;
             realEquity           = liveEquity;
             realDailyStartEquity = liveLastEquity > 0 ? liveLastEquity : liveEquity;
             const dayPnl         = liveLastEquity > 0 ? liveEquity - liveLastEquity : 0;
 
-            // 4. Write live values directly to Supabase immediately
+            // 4. Write real live values to Supabase immediately
             await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
               cash:            +liveCash.toFixed(2),
               total_value:     +liveEquity.toFixed(2),
@@ -210,17 +214,17 @@ async function loadRemoteConfig() {
             });
             log('sys', `✅ Live account restored: equity=$${liveEquity.toFixed(2)} dayPnl=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
           } else {
-            // Alpaca fetch failed — at minimum reset to safe defaults
-            // so sim values don't keep showing
+            // Alpaca fetch failed — write safe defaults so sim values don't persist
             await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
               total_value:     CONFIG.startingCapital,
               day_pnl:         0,
               total_wins:      0,
               total_losses:    0,
+              circuit_breaker: false,
               session:         getCurrentSession(),
               updated_at:      new Date().toISOString(),
             });
-            log('warn', 'Could not fetch live equity — reset to starting capital until next sync');
+            log('warn', 'Alpaca fetch failed — reset to starting capital, will re-sync on next scan');
           }
 
           // 5. Restore real open positions from Alpaca
@@ -228,7 +232,13 @@ async function loadRemoteConfig() {
           await syncPositions();
 
         } else {
+          // Entering sim — snapshot current live state so we can restore it
           log('sim', '🎮 Simulation mode ENABLED — loading bar data on next scan');
+          // Reset sim portfolio to starting capital for clean test
+          portfolio            = CONFIG.startingCapital;
+          realEquity           = CONFIG.startingCapital;
+          realDailyStartEquity = CONFIG.startingCapital;
+          circuitBreakerOn     = false;
         }
       }
     }
@@ -1710,6 +1720,9 @@ let realDailyStartEquity = 0;
 
 function checkCircuitBreaker() {
   if (circuitBreakerOn) return true;
+
+  // Never trip circuit breaker in sim mode — sim losses are not real
+  if (isSimMode()) return false;
 
   // Use real Alpaca equity if available, otherwise skip the check
   // (avoids false triggers after restarts when in-memory state is wrong)
