@@ -474,55 +474,66 @@ async function syncAll() {
 // Sync live prices every 60s using Alpaca's own position data
 // Alpaca gives us current_price, unrealized_pl directly — most accurate source
 async function syncPricesOnly() {
+  if (isSimMode()) {
+    for (const [sym, pos] of Object.entries(positions)) {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+      if (cur && cur > pos.highWater) positions[sym].highWater = cur;
+    }
+    await syncPositions();
+    return;
+  }
+
   if (!CONFIG.alpacaKey) return;
-  if (Object.keys(positions).length === 0) return;
 
   try {
-    const alpacaPos = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
-    if (!Array.isArray(alpacaPos)) return;
+    // Fetch account and positions in parallel
+    const [alpacaPos, acct] = await Promise.all([
+      alpacaFetch(`${ALPACA_BASE()}/v2/positions`),
+      getAccount(),
+    ]);
 
-    for (const ap of alpacaPos) {
-      const sym         = ap.symbol;
-      const cur         = +ap.current_price;
-      const qty         = +ap.qty;
-      const entryPrice  = +ap.avg_entry_price;
-      const pnl         = +ap.unrealized_pl;
-      const pnlPct      = +ap.unrealized_plpc * 100;
+    // Update in-memory price history from Alpaca live prices
+    if (Array.isArray(alpacaPos)) {
+      for (const ap of alpacaPos) {
+        const sym = ap.symbol;
+        const cur = +ap.current_price;
+        if (!cur || cur <= 0) continue;
 
-      // Update in-memory price history
-      if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
-      priceHistory5m[sym].push(cur);
-      if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
+        if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
+        priceHistory5m[sym].push(cur);
+        if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
 
-      // Update high water mark
-      if (positions[sym] && cur > positions[sym].highWater) {
-        positions[sym].highWater = cur;
+        if (positions[sym]      && cur > positions[sym].highWater)     positions[sym].highWater     = cur;
+        if (shortPositions[sym] && cur < shortPositions[sym].lowWater) shortPositions[sym].lowWater = cur;
       }
-
-      // Push live price to Supabase via PATCH
-      const patchResult = await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
-        current_price: +cur.toFixed(4),
-        pnl:           +pnl.toFixed(2),
-        pnl_pct:       +pnlPct.toFixed(4),
-        high_water:    positions[sym] ? +positions[sym].highWater.toFixed(4) : +cur.toFixed(4),
-        updated_at:    new Date().toISOString(),
-      });
-
-      log('price', `${sym} live price: $${cur.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
     }
 
-    // Also update portfolio cash in Supabase
-    const acct = await getAccount();
-    if (acct?.cash) {
+    // Single write to Supabase — P&L calculated consistently in syncPositions
+    // This prevents the flicker from two different P&L sources racing each other
+    await syncPositions();
+
+    // Update portfolio totals from Alpaca account
+    if (acct?.equity && +acct.equity > 0) {
+      const equity     = +parseFloat(acct.equity).toFixed(2);
+      const cash       = acct.cash ? +parseFloat(acct.cash).toFixed(2) : equity;
+      const lastEquity = acct.last_equity ? +parseFloat(acct.last_equity).toFixed(2) : 0;
+      const dayPnl     = lastEquity > 0 ? +(equity - lastEquity).toFixed(2) : 0;
+
+      realEquity = equity;
+      if (!realDailyStartEquity && lastEquity > 0) realDailyStartEquity = lastEquity;
+
       await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
-        cash:        +parseFloat(acct.cash).toFixed(2),
-        last_scan:   new Date().toISOString(),
+        cash:        +cash.toFixed(2),
+        total_value: +equity.toFixed(2),
+        day_pnl:     +dayPnl.toFixed(2),
         updated_at:  new Date().toISOString(),
       });
+
+      log('price', `Equity=$${equity.toFixed(2)} DayP&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)} Positions:${Object.keys(positions).length}`);
     }
 
   } catch (e) {
-    log('error', `syncPricesOnly failed: ${e.message}`);
+    log('error', `syncPricesOnly: ${e.message}`);
   }
 }
 
