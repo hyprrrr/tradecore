@@ -2104,39 +2104,55 @@ async function syncPricesOnly() {
   if (!CONFIG.alpacaKey) return;
 
   try {
-    const alpacaPos = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
-    if (!Array.isArray(alpacaPos)) return;
+    // Fetch account AND positions in parallel for maximum speed
+    const [alpacaPos, acct] = await Promise.all([
+      alpacaFetch(`${ALPACA_BASE()}/v2/positions`),
+      getAccount(),
+    ]);
 
-    for (const ap of alpacaPos) {
-      const sym = ap.symbol;
-      const cur = +ap.current_price;
-      if (!cur || cur <= 0) continue;
+    // Update price history from live Alpaca positions
+    if (Array.isArray(alpacaPos)) {
+      for (const ap of alpacaPos) {
+        const sym = ap.symbol;
+        const cur = +ap.current_price;
+        if (!cur || cur <= 0) continue;
 
-      // Update price history
-      if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
-      priceHistory5m[sym].push(cur);
-      if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
+        if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
+        priceHistory5m[sym].push(cur);
+        if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
 
-      // Update high water mark for longs
-      if (positions[sym] && cur > positions[sym].highWater) {
-        positions[sym].highWater = cur;
-      }
-      // Update low water mark for shorts
-      if (shortPositions[sym] && cur < shortPositions[sym].lowWater) {
-        shortPositions[sym].lowWater = cur;
+        if (positions[sym]     && cur > positions[sym].highWater)     positions[sym].highWater     = cur;
+        if (shortPositions[sym] && cur < shortPositions[sym].lowWater) shortPositions[sym].lowWater = cur;
       }
     }
 
-    // Batch-update all positions to Supabase (single write)
+    // Sync all position data (prices + P&L) to Supabase
     await syncPositions();
 
-    // Update portfolio cash from Alpaca account
-    const acct = await getAccount();
-    if (acct?.cash) {
-      await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
-        cash:       +parseFloat(acct.cash).toFixed(2),
-        updated_at: new Date().toISOString(),
-      });
+    // Update portfolio with REAL Alpaca values every price sync
+    if (acct) {
+      const cash       = acct.cash       ? +parseFloat(acct.cash).toFixed(2)       : null;
+      const equity     = acct.equity     ? +parseFloat(acct.equity).toFixed(2)     : null;
+      const lastEquity = acct.last_equity? +parseFloat(acct.last_equity).toFixed(2): null;
+
+      if (equity && equity > 0) {
+        realEquity = equity;
+        if (!realDailyStartEquity && lastEquity > 0) {
+          realDailyStartEquity = lastEquity;
+        }
+
+        // Calculate day P&L from Alpaca's own numbers — most accurate
+        const dayPnl = lastEquity > 0 ? +(equity - lastEquity).toFixed(2) : 0;
+
+        await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+          cash:        cash ? +cash.toFixed(2) : undefined,
+          total_value: +equity.toFixed(2),
+          day_pnl:     +dayPnl.toFixed(2),
+          updated_at:  new Date().toISOString(),
+        });
+
+        log('price', `Equity=$${equity.toFixed(2)} Cash=$${cash?.toFixed(2)} DayP&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
+      }
     }
   } catch (e) {
     log('error', `syncPricesOnly: ${e.message}`);
