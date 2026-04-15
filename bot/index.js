@@ -46,6 +46,7 @@ const CONFIG = {
   alpacaKey:    process.env.ALPACA_KEY    || '',
   alpacaSecret: process.env.ALPACA_SECRET || '',
   alpacaPaper:  process.env.ALPACA_PAPER  !== 'false',
+  // mode: 'alpaca' = real paper/live trading | 'sim' = simulation (no orders sent, instant fills)
   mode:         (process.env.MODE || 'alpaca').toLowerCase(),
 
   discordWebhook: process.env.DISCORD_WEBHOOK || '',
@@ -147,6 +148,7 @@ async function loadRemoteConfig() {
     // Mode flags — controlled from dashboard
     if (s.swing_enabled !== undefined) CONFIG.swingEnabled = !!s.swing_enabled;
     if (s.scalp_mode    !== undefined) CONFIG.scalpMode    = !!s.scalp_mode;
+    if (s.sim_mode      !== undefined) CONFIG.mode         = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
 
     // Scalp settings
     if (s.scalp_tp_pct)        CONFIG.scalpTpPct        = +s.scalp_tp_pct        / 100;
@@ -209,6 +211,32 @@ async function sbFetch(path, method = 'GET', body = null) {
 }
 
 async function syncPortfolio() {
+  // In sim mode — use in-memory portfolio, no Alpaca account needed
+  if (isSimMode()) {
+    const openVal = Object.values(positions).reduce((a, p) => {
+      const cur = priceHistory5m[p.sym || '']?.[priceHistory5m[p.sym||'']?.length - 1] || p.entryPrice;
+      return a + (cur * (p.qtyRemaining || p.qty));
+    }, 0);
+    const equity  = portfolio + openVal;
+    const dayPnl  = equity - (realDailyStartEquity || CONFIG.startingCapital);
+    if (equity > 0) {
+      realEquity = equity;
+      if (!realDailyStartEquity) realDailyStartEquity = CONFIG.startingCapital;
+    }
+    await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+      cash:            +portfolio.toFixed(2),
+      total_value:     +equity.toFixed(2),
+      day_pnl:         +dayPnl.toFixed(2),
+      total_wins:      totalWins,
+      total_losses:    totalLosses,
+      circuit_breaker: circuitBreakerOn,
+      last_scan:       new Date().toISOString(),
+      session:         getCurrentSession(),
+      updated_at:      new Date().toISOString(),
+    });
+    if (equity > 0) await sbFetch('tc_equity', 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+    return;
+  }
   let cashValue   = portfolio;
   let equityValue = portfolio;
   let lastEquity  = 0;
@@ -709,13 +737,30 @@ function buildScanList() {
 // END MARKET SCREENER
 // ═══════════════════════════════════════════════════════════════════
 
-async function placeOrder(symbol, qty, side) {
+async function placeOrder(symbol, qty, side, currentPrice = null) {
+  // Sim mode — instant fake fill, no Alpaca request
+  if (isSimMode()) {
+    const price = currentPrice || (priceHistory5m[symbol]?.[priceHistory5m[symbol].length - 1] || 100);
+    return simOrder(symbol, qty, side, price);
+  }
   const data = await alpacaFetch(`${ALPACA_BASE()}/v2/orders`, {
     method: 'POST',
     body: JSON.stringify({ symbol, qty: String(qty), side, type: 'market', time_in_force: 'day' }),
   });
   if (data.id) { log('order', `${side.toUpperCase()} order placed: ${qty}x ${symbol} | ID: ${data.id}`); return data; }
   throw new Error(data.message || JSON.stringify(data));
+}
+
+// ── Simulation mode ──
+// When MODE=sim (or toggled from dashboard), all orders are simulated.
+// No requests go to Alpaca. Fills happen instantly at current price.
+// Everything else works: Supabase sync, Discord, equity curve, P&L.
+function isSimMode() { return CONFIG.mode === 'sim'; }
+
+function simOrder(symbol, qty, side, price) {
+  const id = `SIM-${Date.now()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
+  log('sim', `🎮 SIM ${side.toUpperCase()} ${qty}x ${symbol} @ $${price.toFixed(2)} [ID: ${id}]`);
+  return { id, status: 'filled', filled_avg_price: String(price), symbol, qty: String(qty), side };
 }
 
 async function getAccount() {
@@ -1048,7 +1093,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     const pctStop  = price * (1 - CONFIG.stopLossPct);
     const stopPrice = Math.max(atrStop, pctStop);
 
-    if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+    if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       try { await placeSmartOrder(sym, qty, 'buy', false); }
       catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
     }
@@ -1074,7 +1119,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     const pctStop   = price * (1 + CONFIG.stopLossPct);
     const stopPrice = Math.min(atrStop, pctStop);
 
-    if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+    if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       try { await placeSmartOrder(sym, qty, 'sell', false); } // sell to open short
       catch (e) { log('error', `SHORT failed ${sym}: ${e.message}`); return; }
     }
@@ -1103,7 +1148,7 @@ async function coverShort(sym, price, reason) {
   if (!pos) return;
   const qty = pos.qtyRemaining || pos.qty;
 
-  if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+  if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
     try { await placeOrder(sym, qty, 'buy'); } // buy back to cover
     catch (e) { log('error', `Cover failed ${sym}: ${e.message}`); return; }
   }
@@ -1188,7 +1233,7 @@ async function manageShort(sym, price, bars) {
 async function coverPartialShort(sym, price, qty, reason) {
   const pos = shortPositions[sym];
   if (!pos || qty < 1) return;
-  if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+  if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
     try { await placeOrder(sym, qty, 'buy'); }
     catch(e) { log('error', `Partial cover failed: ${e.message}`); return; }
   }
@@ -1206,7 +1251,7 @@ async function coverPartialShort(sym, price, qty, reason) {
 async function partialExit(sym, price, qtyToSell, reason) {
   const pos = positions[sym];
   if (!pos || qtyToSell < 1) return;
-  if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+  if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
     try { await placeOrder(sym, qtyToSell, 'sell'); }
     catch (e) { log('error', `Partial sell failed ${sym}: ${e.message}`); return; }
   }
@@ -1233,7 +1278,7 @@ async function exitPosition(sym, price, reason) {
   const pos = positions[sym];
   if (!pos) return;
   const qtyToSell = pos.qtyRemaining || pos.qty;
-  if (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey) {
+  if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
     try { await placeOrder(sym, qtyToSell, 'sell'); }
     catch (e) { log('error', `Sell failed ${sym}: ${e.message}`); return; }
   }
@@ -1548,6 +1593,7 @@ let alpacaShorts    = new Set();
 const SHORTING_ENABLED = process.env.ENABLE_SHORTS !== 'false'; // default on
 
 async function syncAlpacaPositions() {
+  if (isSimMode()) return; // sim tracks positions in memory — no Alpaca sync needed
   if (!CONFIG.alpacaKey) return;
   try {
     const data = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
@@ -1632,8 +1678,36 @@ async function storePrevClose() {
   }
 }
 
-// Sync live prices every 60s using Alpaca positions API
 async function syncPricesOnly() {
+  // In sim mode — update prices from cached bar data, no Alpaca needed
+  if (isSimMode()) {
+    // Update unrealized P&L on all simulated positions using latest cached prices
+    for (const [sym, pos] of Object.entries(positions)) {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+      if (!cur) continue;
+      if (cur > pos.highWater) positions[sym].highWater = cur;
+      const pnl    = (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
+      const pnlPct = pnl / pos.cost;
+      await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
+        current_price: +cur.toFixed(4),
+        pnl:           +pnl.toFixed(2),
+        pnl_pct:       +pnlPct.toFixed(4),
+        updated_at:    new Date().toISOString(),
+      });
+    }
+    // Sync simulated portfolio
+    const openVal  = Object.values(positions).reduce((a, p) => {
+      const cur = priceHistory5m[p.entryPrice]?.[priceHistory5m[p.entryPrice]?.length-1] || p.entryPrice;
+      return a + cur * (p.qtyRemaining || p.qty);
+    }, 0);
+    await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+      cash:       +portfolio.toFixed(2),
+      total_value:+(portfolio + openVal).toFixed(2),
+      updated_at: new Date().toISOString(),
+    });
+    return;
+  }
+
   if (!CONFIG.alpacaKey) return;
   try {
     const alpacaPos = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
@@ -1645,13 +1719,11 @@ async function syncPricesOnly() {
       const pnl    = +ap.unrealized_pl;
       const pnlPct = +ap.unrealized_plpc * 100;
 
-      // Update in-memory
       if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
       priceHistory5m[sym].push(cur);
       if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
       if (positions[sym] && cur > positions[sym].highWater) positions[sym].highWater = cur;
 
-      // Push to Supabase
       await sbFetch(`tc_positions?symbol=eq.${sym}`, 'PATCH', {
         current_price: +cur.toFixed(4),
         pnl:           +pnl.toFixed(2),
@@ -1661,7 +1733,6 @@ async function syncPricesOnly() {
       log('price', `${sym} $${cur.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
     }
 
-    // Update cash from Alpaca account
     const acct = await getAccount();
     if (acct?.cash) {
       await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
@@ -2023,7 +2094,7 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
 
   // Place order
   const side = direction === 'long' ? 'buy' : 'sell';
-  if (CONFIG.alpacaKey && CONFIG.mode === 'alpaca') {
+  if (isSimMode() || (CONFIG.alpacaKey && CONFIG.mode === 'alpaca')) {
     try { await placeOrder(sym, qty, side); }
     catch(e) { log('error', `Scalp order failed ${sym}: ${e.message}`); return; }
   }
@@ -2063,7 +2134,7 @@ async function exitScalp(sym, price, reason) {
   const { qty, entryPrice, direction } = pos;
   const side = direction === 'long' ? 'sell' : 'buy';
 
-  if (CONFIG.alpacaKey && CONFIG.mode === 'alpaca') {
+  if (isSimMode() || (CONFIG.alpacaKey && CONFIG.mode === 'alpaca')) {
     try { await placeOrder(sym, qty, side); }
     catch(e) { log('error', `Scalp exit failed ${sym}: ${e.message}`); return; }
   }
@@ -2215,6 +2286,7 @@ log('sys', '   TradeCore Pro — Upgraded Engine v4     ');
 log('sys', '   + 10s scan + live dashboard refresh    ');
 log('sys', '══════════════════════════════════════════');
 log('sys', `Mode: ${CONFIG.mode.toUpperCase()} | Paper: ${CONFIG.alpacaPaper} | Strategy: ${CONFIG.strategy}`);
+if (isSimMode()) log('sys', '🎮 SIMULATION MODE — orders are simulated, no real/paper trades placed');
 if (BYPASS_HOURS) log('sys', '⚠️  BYPASS_HOURS=true — trading outside market hours (TEST MODE)');
 if (CONFIG.scalpMode) log('sys', `⚡ SCALP MODE ACTIVE — symbols: ${CONFIG.scalpSymbols.join(',')} | TP:${CONFIG.scalpTpPct*100}% SL:${CONFIG.scalpSlPct*100}% MaxHold:${CONFIG.scalpMaxHoldMins}m`);
 log('sys', `Symbols: ${CONFIG.symbols.join(', ')}`);
@@ -2403,7 +2475,11 @@ function orbScoreBonus(symbol, price, direction) {
 // for better fill price. Falls back to market after 4 seconds.
 // For scalps: always market (speed > price improvement).
 async function placeSmartOrder(symbol, qty, side, isScalp = false) {
-  // Scalps always market — speed is everything
+  // Sim mode — instant fill, no Alpaca
+  if (isSimMode()) {
+    const price = priceHistory5m[symbol]?.[priceHistory5m[symbol].length - 1] || 100;
+    return simOrder(symbol, qty, side, price);
+  }
   if (isScalp || !CONFIG.alpacaKey) return placeOrder(symbol, qty, side);
 
   try {
