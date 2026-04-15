@@ -402,11 +402,17 @@ canvas{width:100%!important;display:block;}
           <div>
             <div style="font-weight:800;font-size:13px">🎮 Simulation Mode</div>
             <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px;line-height:1.7">
-              Runs the full bot logic — signals, entries, exits, P&amp;L — but<br>
-              no real orders sent to Alpaca. Works 24/7, any day of week.
+              Replays last 5 days of real 5-min bars — works 24/7.<br>
+              Fills at next bar open (realistic, no lookahead).
             </div>
           </div>
           <label class="toggle"><input type="checkbox" id="simEnabled" onchange="onModeChange()"><span class="tog-slider"></span></label>
+        </div>
+        <div id="simProgress" style="display:none;margin-top:10px">
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:4px" id="simProgressLabel">Loading…</div>
+          <div style="height:4px;background:var(--border);border-radius:2px">
+            <div id="simProgressBar" style="height:100%;width:0%;background:var(--warn);border-radius:2px;transition:width .5s"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -735,10 +741,17 @@ function updateKPIs(p, positions, trades){
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
   if(p.session)   document.getElementById('sessionBadge').textContent=p.session;
 
-  // Show sim mode badge in header if active
+  // Sim mode badge + progress bar
   const simOn = document.getElementById('simEnabled')?.checked;
-  const modeEl = document.getElementById('modeBadge');
-  if(modeEl){ modeEl.textContent = simOn ? '🎮 SIM MODE' : ''; modeEl.style.display = simOn ? '' : 'none'; }
+  const modeBadge = document.getElementById('modeBadge');
+  const simProg   = document.getElementById('simProgress');
+  if(modeBadge){ modeBadge.textContent = simOn ? '🎮 SIM MODE' : ''; modeBadge.style.display = simOn ? '' : 'none'; }
+  if(simProg){
+    simProg.style.display = simOn ? 'block' : 'none';
+    if(simOn && p.session && p.session.includes('SIM')) {
+      document.getElementById('simProgressLabel').textContent = `Replaying: ${p.session}`;
+    }
+  }
 
   const lastVal=equityHistory[equityHistory.length-1];
   if(!lastVal||Math.abs(equity-lastVal)>0.01){
