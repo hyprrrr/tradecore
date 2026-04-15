@@ -161,16 +161,35 @@ async function loadRemoteConfig() {
         log('sim', entering
           ? '🎮 Simulation mode ENABLED — loading bar data on next scan'
           : '✅ Simulation mode DISABLED — back to live/paper trading');
-        // Immediately clear positions display when leaving sim mode
+        // Immediately clear all sim state when leaving sim mode
         if (!entering) {
+          // Clear all in-memory sim positions
           Object.keys(positions).forEach(k => delete positions[k]);
           Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
           Object.keys(scalpPositions).forEach(k => delete scalpPositions[k]);
-          portfolio = CONFIG.startingCapital;
+          pendingSignals.clear();
           totalWins = 0; totalLosses = 0;
-          await sbFetch('tc_positions?id=gt.0', 'DELETE');
-          await syncLog('sys', '✅ Exited sim mode — positions cleared, syncing live data');
-          setTimeout(() => syncPricesOnly().catch(() => {}), 1000);
+
+          // Wipe ALL positions from Supabase
+          await sbFetch('tc_positions?symbol=neq.____NONE____', 'DELETE');
+
+          log('sys', '✅ Sim positions cleared from Supabase');
+          await syncLog('sys', '✅ Exited sim mode — syncing real Alpaca account…');
+
+          // Restore real portfolio value from Alpaca immediately
+          try {
+            const acct = await getAccount();
+            if (acct?.equity) {
+              portfolio          = +parseFloat(acct.equity).toFixed(2);
+              realEquity         = portfolio;
+              realDailyStartEquity = acct.last_equity ? +parseFloat(acct.last_equity).toFixed(2) : portfolio;
+              log('sys', `Portfolio restored from Alpaca: $${portfolio.toFixed(2)}`);
+            }
+          } catch(e) {}
+
+          // Restore real open positions from Alpaca
+          await syncAlpacaPositions();
+          await syncAll();
         }
       }
     }
@@ -410,11 +429,10 @@ async function syncPositions() {
     });
   }
 
-  // Delete all existing rows then batch insert current state
-  // Use ?id=neq.0 trick so Supabase doesn't complain about deleting without a filter
-  await sbFetch('tc_positions?id=gt.0', 'DELETE');
+  // Wipe and rewrite all positions atomically
+  // Use symbol=neq.ZZZZ as a "match all" filter since Supabase requires a filter for DELETE
+  await sbFetch('tc_positions?symbol=neq.____NONE____', 'DELETE');
   if (allPositions.length > 0) {
-    // Batch POST — insert all positions in one request
     await sbFetch('tc_positions', 'POST', allPositions);
   }
 }
