@@ -176,6 +176,11 @@ async function loadRemoteConfig() {
           // 2. Wipe sim positions from Supabase
           await sbFetch('tc_positions?symbol=neq.____NONE____', 'DELETE');
 
+          // 2b. Delete sim equity snapshots — they're fake values that pollute the chart
+          // We delete all equity rows and let real Alpaca values rebuild the chart
+          await sbFetch('tc_equity?id=gt.0', 'DELETE');
+          log('sys', '✅ Sim equity snapshots cleared from chart');
+
           // 3. Fetch real Alpaca account values RIGHT NOW
           let liveEquity = 0, liveCash = 0, liveLastEquity = 0;
           try {
@@ -204,6 +209,18 @@ async function loadRemoteConfig() {
               updated_at:      new Date().toISOString(),
             });
             log('sys', `✅ Live account restored: equity=$${liveEquity.toFixed(2)} dayPnl=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
+          } else {
+            // Alpaca fetch failed — at minimum reset to safe defaults
+            // so sim values don't keep showing
+            await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+              total_value:     CONFIG.startingCapital,
+              day_pnl:         0,
+              total_wins:      0,
+              total_losses:    0,
+              session:         getCurrentSession(),
+              updated_at:      new Date().toISOString(),
+            });
+            log('warn', 'Could not fetch live equity — reset to starting capital until next sync');
           }
 
           // 5. Restore real open positions from Alpaca
@@ -1330,7 +1347,7 @@ async function runSimScan() {
     session:         `🎮 SIM [${barTime?.slice(11,16)||'?'}]`,
     updated_at:      new Date().toISOString(),
   });
-  await sbFetch('tc_equity', 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+  // NOTE: sim does NOT write to tc_equity — would pollute real equity chart
   await syncLog('sim', `🎮 SIM bar ${simState.cursor}/${simState.totalBars} | Equity=$${equity.toFixed(2)} P&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
 }
 
