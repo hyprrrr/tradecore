@@ -1003,7 +1003,7 @@ const UNIVERSE = [
 
 let screenerCandidates = [];
 let lastScreenerRun    = 0;
-const SCREENER_INTERVAL_MS = 3 * 60 * 1000; // re-screen every 3 minutes
+const SCREENER_INTERVAL_MS = 2 * 60 * 1000; // re-screen every 2 minutes
 
 function scoreSnapshot(sym, snap) {
   let score = 0;
@@ -3377,11 +3377,11 @@ async function prewarmData() {
 let scanInProgress = false;
 let lastFullScan = 0;
 const FULL_SCAN_INTERVAL_MS = Math.max(
-  +(process.env.SCAN_INTERVAL_SEC || 30) * 1000,
-  15000 // never faster than 15s
+  +(process.env.SCAN_INTERVAL_SEC || 15) * 1000,
+  10000 // never faster than 10s
 );
-const PRICE_SYNC_INTERVAL_MS = 15000; // price updates every 15s (was 10s)
-const EQUITY_SNAPSHOT_INTERVAL_MS = 2 * 60 * 1000; // equity curve point every 2 min
+const PRICE_SYNC_INTERVAL_MS      = 8000;          // price updates every 8s
+const EQUITY_SNAPSHOT_INTERVAL_MS = 90 * 1000;     // equity curve point every 90s
 let lastEquitySnapshot = 0;
 
 log('sys', `Full scan every ${FULL_SCAN_INTERVAL_MS/1000}s | Price sync every ${PRICE_SYNC_INTERVAL_MS/1000}s`);
@@ -3437,18 +3437,17 @@ setInterval(tick, PRICE_SYNC_INTERVAL_MS);
 let lastConfigCheck = 0;
 setInterval(async () => {
   const now = Date.now();
-  if (now - lastConfigCheck < 4500) return;
+  if (now - lastConfigCheck < 2800) return;
   lastConfigCheck = now;
   try {
     const prev = CONFIG.mode;
     await loadRemoteConfig();
-    // If mode just changed, trigger immediate sync
     if (CONFIG.mode !== prev) {
       log('sys', `Mode changed: ${prev} → ${CONFIG.mode}`);
-      lastFullScan = 0; // force next tick to run full scan immediately
+      lastFullScan = 0;
     }
   } catch(e) {}
-}, 5000);
+}, 3000);
 
 // Dedicated scalp exit monitor — runs every 2 seconds independently
 // Much faster than the main tick so TP/SL exits happen near-instantly
