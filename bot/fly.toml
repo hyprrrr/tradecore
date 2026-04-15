@@ -1,0 +1,31 @@
+# fly.toml — TradeCore Bot configuration
+# Generated for Fly.io deployment
+
+app = "tradecore-bot"
+primary_region = "iad"  # US East (closest to NYSE/NASDAQ)
+
+[build]
+  # Uses the Dockerfile in this directory (bot/)
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # IMPORTANT: never sleep — bot must run 24/7
+  auto_start_machines = true
+  min_machines_running = 1     # always keep 1 machine running
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
