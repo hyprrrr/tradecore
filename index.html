@@ -16,6 +16,7 @@ header{height:52px;background:rgba(8,12,16,0.95);backdrop-filter:blur(16px);bord
 .logo{font-family:'Space Mono',monospace;font-size:16px;font-weight:700;color:var(--accent);letter-spacing:2px;display:flex;align-items:center;gap:8px;}
 .logo-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);animation:pulse 1.5s infinite;}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.8)}}
+@keyframes simPulse{0%,100%{opacity:0.3}50%{opacity:1}}
 .hdr-right{display:flex;align-items:center;gap:8px;}
 .status-pill{display:flex;align-items:center;gap:5px;font-family:'Space Mono',monospace;font-size:10px;padding:3px 10px;border-radius:20px;border:1px solid;}
 .status-pill.live{border-color:var(--accent2);color:var(--accent2);}
@@ -423,9 +424,9 @@ canvas{width:100%!important;display:block;}
           <label class="toggle"><input type="checkbox" id="simEnabled" onchange="onModeChange()"><span class="tog-slider"></span></label>
         </div>
         <div id="simProgress" style="display:none;margin-top:10px">
-          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:4px" id="simProgressLabel">Loading…</div>
-          <div style="height:4px;background:var(--border);border-radius:2px">
-            <div id="simProgressBar" style="height:100%;width:0%;background:var(--warn);border-radius:2px;transition:width .5s"></div>
+          <div style="font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:4px" id="simProgressLabel">🎮 Sim active — bot is replaying bars</div>
+          <div style="height:3px;background:var(--warn);border-radius:2px;opacity:0.6">
+            <div style="height:100%;width:100%;background:var(--warn);border-radius:2px;animation:simPulse 2s ease-in-out infinite"></div>
           </div>
         </div>
       </div>
@@ -839,7 +840,19 @@ function updateKPIs(p, positions, trades){
   const modeBadge = document.getElementById('modeBadge');
   const simProg   = document.getElementById('simProgress');
   if(modeBadge){ modeBadge.textContent='🎮 SIM MODE'; modeBadge.style.display = simOn ? '' : 'none'; }
-  if(simProg)   simProg.style.display = simOn ? 'block' : 'none';
+  if(simProg) {
+    simProg.style.display = simOn ? 'block' : 'none';
+    if(simOn) {
+      const label = document.getElementById('simProgressLabel');
+      if(label) {
+        if(p.session && p.session.includes('SIM')) {
+          label.textContent = `🎮 Replaying ${p.session.replace('🎮 SIM','').trim()} — trades firing`;
+        } else {
+          label.textContent = '🎮 Sim active — loading bars…';
+        }
+      }
+    }
+  }
 
   const lastVal=equityHistory[equityHistory.length-1];
   if(!lastVal||Math.abs(equity-lastVal)>0.01){
