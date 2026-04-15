@@ -1947,9 +1947,9 @@ async function runScan() {
       // Capture opening range at 10:00 AM ET
       await captureOpeningRange(sym);
 
-      // Use real-time trade price if available, fall back to last bar close
-      const rtPrice    = await fetchLatestPrice(sym);
-      const price      = rtPrice || bars5m[bars5m.length - 1].c;
+      // Use last bar close as price — accurate enough for swing entries
+      // (fetchLatestPrice per symbol was burning too many API calls)
+      const price = bars5m[bars5m.length - 1].c;
       priceHistory5m[sym]  = bars5m.map(b => b.c);
       priceHistory15m[sym] = bars15m?.map(b => b.c) || [];
 
@@ -1993,7 +1993,10 @@ async function runScan() {
       }
 
       log('signal', `${sym} @ $${price.toFixed(2)} → ${sig.signal} (conf:${sig.confidence}% RSI:${sig.rsi?.toFixed(1)} score:${sig.score||0}) ${sessionLabel}`);
-      await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${sig.confidence}% RSI:${sig.rsi?.toFixed(1)} ${sessionLabel}`);
+      // Only write to Supabase logs for non-HOLD signals (reduces writes by ~90%)
+      if (sig.signal !== 'HOLD') {
+        await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${sig.confidence}% score:${sig.score||0} ${sessionLabel}`);
+      }
 
       const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
 
