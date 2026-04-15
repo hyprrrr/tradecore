@@ -636,6 +636,12 @@ function onModeChange(){
   if (simOn) m.push('🎮 Sim');
   document.getElementById('modeStatusText').textContent =
     m.length ? `Active: ${m.join(' + ')}` : '⚠ No mode — bot will idle';
+
+  // Auto-save immediately when any mode toggle changes
+  saveSettings().then(() => {
+    if (simOn) showToast('🎮 Sim mode ON — bot picks up next scan');
+    else       showToast('✅ Sim mode OFF — live/paper mode active');
+  }).catch(() => showToast('✓ Saved locally'));
 }
 
 function rng(el,valId,sfx){ document.getElementById(valId).textContent=el.value+sfx; }
@@ -765,14 +771,17 @@ function updateKPIs(p, positions, trades){
   if(p.last_scan) document.getElementById('lastScan').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
   if(p.session)   document.getElementById('sessionBadge').textContent=p.session;
 
-  // Sim mode badge + progress bar
-  const simOn = document.getElementById('simEnabled')?.checked;
-  const modeBadge = document.getElementById('modeBadge');
-  const simProg   = document.getElementById('simProgress');
-  if(modeBadge){ modeBadge.textContent = simOn ? '🎮 SIM MODE' : ''; modeBadge.style.display = simOn ? '' : 'none'; }
+  // Sim mode badge — read from bot's reported session, not just the checkbox
+  // This way if the bot is still in sim but the checkbox was toggled, it shows correctly
+  const simOn        = document.getElementById('simEnabled')?.checked;
+  const botInSim     = p.session && p.session.includes('SIM');
+  const showSimBadge = simOn || botInSim;
+  const modeBadge    = document.getElementById('modeBadge');
+  const simProg      = document.getElementById('simProgress');
+  if(modeBadge){ modeBadge.textContent = showSimBadge ? '🎮 SIM MODE' : ''; modeBadge.style.display = showSimBadge ? '' : 'none'; }
   if(simProg){
-    simProg.style.display = simOn ? 'block' : 'none';
-    if(simOn && p.session && p.session.includes('SIM')) {
+    simProg.style.display = showSimBadge ? 'block' : 'none';
+    if(showSimBadge && p.session && p.session.includes('SIM')) {
       document.getElementById('simProgressLabel').textContent = `Replaying: ${p.session}`;
     }
   }
