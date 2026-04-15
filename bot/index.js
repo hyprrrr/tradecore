@@ -180,7 +180,7 @@ async function loadRemoteConfig() {
           realDailyStartEquity = 0; // force re-fetch from Alpaca
 
           // 2. Wipe sim positions from Supabase
-          await sbFetch('tc_positions?symbol=neq.____NONE____', 'DELETE');
+          await sbFetch(tbl('tc_positions')+'?symbol=neq.____NONE____', 'DELETE');
 
           // 2b. Delete sim equity snapshots — fake values pollute the chart
           await sbFetch('tc_equity?id=gt.0', 'DELETE');
@@ -202,7 +202,7 @@ async function loadRemoteConfig() {
             const dayPnl         = liveLastEquity > 0 ? liveEquity - liveLastEquity : 0;
 
             // 4. Write real live values to Supabase immediately
-            await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+            await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
               cash:            +liveCash.toFixed(2),
               total_value:     +liveEquity.toFixed(2),
               day_pnl:         +dayPnl.toFixed(2),
@@ -215,7 +215,7 @@ async function loadRemoteConfig() {
             log('sys', `✅ Live account restored: equity=$${liveEquity.toFixed(2)} dayPnl=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
           } else {
             // Alpaca fetch failed — write safe defaults so sim values don't persist
-            await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+            await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
               total_value:     CONFIG.startingCapital,
               day_pnl:         0,
               total_wins:      0,
@@ -467,6 +467,16 @@ async function runAdaptiveTuning() {
 // ═══════════════════════════════════════════════════════════════════
 // END ADAPTIVE LEARNING ENGINE
 // ═══════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────
+// SUPABASE SYNC
+// ─────────────────────────────────────────────
+// Sim mode uses completely separate tables (sim_tc_*) so live data
+// is NEVER touched, overwritten, or polluted by simulation runs.
+function tbl(name) {
+  return isSimMode() ? `sim_${name}` : name;
+}
+
 async function sbFetch(path, method = 'GET', body = null) {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return null;
   try {
@@ -509,7 +519,7 @@ async function syncPortfolio() {
     const equity = portfolio + openVal;
     const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
     if (equity > 0) { realEquity = equity; if (!realDailyStartEquity) realDailyStartEquity = CONFIG.startingCapital; }
-    await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+    await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
       cash: +portfolio.toFixed(2), total_value: +equity.toFixed(2), day_pnl: +dayPnl.toFixed(2),
       total_wins: totalWins, total_losses: totalLosses, circuit_breaker: circuitBreakerOn,
       last_scan: new Date().toISOString(), session: getCurrentSession(), updated_at: new Date().toISOString(),
@@ -517,7 +527,7 @@ async function syncPortfolio() {
     const now = Date.now();
     if (equity > 0 && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
       lastEquitySnapshot = now;
-      await sbFetch('tc_equity', 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+      await sbFetch(tbl('tc_equity'), 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
     }
     return;
   }
@@ -568,7 +578,7 @@ async function syncPortfolio() {
         .reduce((a, t) => a + t.pnl, 0);
 
   // Step 4: Always write — never skip
-  await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+  await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
     cash:            +cashValue.toFixed(2),
     total_value:     +equityValue.toFixed(2),
     day_pnl:         +dayPnl.toFixed(2),
@@ -585,7 +595,7 @@ async function syncPortfolio() {
   if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10
       && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
     lastEquitySnapshot = now;
-    await sbFetch('tc_equity', 'POST', { value: +equityValue.toFixed(2), created_at: new Date().toISOString() });
+    await sbFetch(tbl('tc_equity'), 'POST', { value: +equityValue.toFixed(2), created_at: new Date().toISOString() });
   }
 
   log('port', `Portfolio: equity=$${equityValue.toFixed(2)} cash=$${cashValue.toFixed(2)} dayPnl=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
@@ -665,14 +675,14 @@ async function syncPositions() {
 
   // Wipe and rewrite all positions atomically
   // Use symbol=neq.ZZZZ as a "match all" filter since Supabase requires a filter for DELETE
-  await sbFetch('tc_positions?symbol=neq.____NONE____', 'DELETE');
+  await sbFetch(tbl('tc_positions')+'?symbol=neq.____NONE____', 'DELETE');
   if (allPositions.length > 0) {
-    await sbFetch('tc_positions', 'POST', allPositions);
+    await sbFetch(tbl('tc_positions'), 'POST', allPositions);
   }
 }
 
 async function syncTrade(trade) {
-  await sbFetch('tc_trades', 'POST', {
+  await sbFetch(tbl('tc_trades'), 'POST', {
     symbol: trade.sym,
     side: trade.side,
     qty: trade.qty,
@@ -685,7 +695,7 @@ async function syncTrade(trade) {
 }
 
 async function syncLog(type, msg) {
-  await sbFetch('tc_logs', 'POST', {
+  await sbFetch(tbl('tc_logs'), 'POST', {
     type,
     message: msg,
     created_at: new Date().toISOString(),
@@ -748,7 +758,7 @@ async function syncPricesOnly() {
       realEquity = equity;
       if (!realDailyStartEquity && lastEquity > 0) realDailyStartEquity = lastEquity;
 
-      await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+      await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
         cash:        +cash.toFixed(2),
         total_value: +equity.toFixed(2),
         day_pnl:     +dayPnl.toFixed(2),
@@ -1081,7 +1091,7 @@ async function runMarketScreener() {
 async function syncScreenerResults(candidates) {
   if (!candidates.length) return;
   try {
-    await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+    await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
       screener_candidates: JSON.stringify(candidates.slice(0, 15).map(c => ({
         symbol: c.symbol, score: c.score, price: (+c.price).toFixed(2),
         change: (c.dayChangePct * 100).toFixed(2) + '%',
@@ -1264,7 +1274,7 @@ async function runSimScan() {
     Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
     totalWins = 0; totalLosses = 0;
     realDailyStartEquity = CONFIG.startingCapital;
-    await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+    await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
       cash: portfolio, total_value: portfolio, day_pnl: 0,
       total_wins: 0, total_losses: 0, circuit_breaker: false,
       session: '🎮 SIM REPLAY', updated_at: new Date().toISOString(),
@@ -1346,7 +1356,7 @@ async function runSimScan() {
 
   realEquity = equity;
 
-  await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+  await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
     cash:            +portfolio.toFixed(2),
     total_value:     +equity.toFixed(2),
     day_pnl:         +dayPnl.toFixed(2),
@@ -2358,7 +2368,7 @@ async function syncAlpacaPositions() {
         // Remove from memory and Supabase
         delete positions[sym];
         alpacaPositions.delete(sym);
-        await sbFetch(`tc_positions?symbol=eq.${sym}`, 'DELETE');
+        await sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE');
 
         // Log and alert
         await syncTrade({ sym, side: 'SELL', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
@@ -2468,7 +2478,7 @@ async function syncPricesOnly() {
         const dayPnl = lastEquity > 0 ? +(equity - lastEquity).toFixed(2) : 0;
 
         // Only write total_value and day_pnl — not equity snapshot (that's in syncPortfolio)
-        await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
+        await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
           cash:        cash ? +cash.toFixed(2) : undefined,
           total_value: +equity.toFixed(2),
           day_pnl:     +dayPnl.toFixed(2),
