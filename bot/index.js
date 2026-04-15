@@ -274,93 +274,74 @@ async function sbFetch(path, method = 'GET', body = null) {
 }
 
 async function syncPortfolio() {
-  // In sim mode — use in-memory portfolio, no Alpaca account needed
+  // ── SIM MODE ──
   if (isSimMode()) {
-    const openVal = Object.values(positions).reduce((a, p) => {
-      const cur = priceHistory5m[p.sym || '']?.[priceHistory5m[p.sym||'']?.length - 1] || p.entryPrice;
-      return a + (cur * (p.qtyRemaining || p.qty));
+    const openVal = Object.entries(positions).reduce((a, [sym, pos]) => {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      return a + cur * (pos.qtyRemaining || pos.qty);
     }, 0);
-    const equity  = portfolio + openVal;
-    const dayPnl  = equity - (realDailyStartEquity || CONFIG.startingCapital);
-    if (equity > 0) {
-      realEquity = equity;
-      if (!realDailyStartEquity) realDailyStartEquity = CONFIG.startingCapital;
-    }
+    const equity = portfolio + openVal;
+    const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
+    if (equity > 0) { realEquity = equity; if (!realDailyStartEquity) realDailyStartEquity = CONFIG.startingCapital; }
     await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
-      cash:            +portfolio.toFixed(2),
-      total_value:     +equity.toFixed(2),
-      day_pnl:         +dayPnl.toFixed(2),
-      total_wins:      totalWins,
-      total_losses:    totalLosses,
-      circuit_breaker: circuitBreakerOn,
-      last_scan:       new Date().toISOString(),
-      session:         getCurrentSession(),
-      updated_at:      new Date().toISOString(),
+      cash: +portfolio.toFixed(2), total_value: +equity.toFixed(2), day_pnl: +dayPnl.toFixed(2),
+      total_wins: totalWins, total_losses: totalLosses, circuit_breaker: circuitBreakerOn,
+      last_scan: new Date().toISOString(), session: getCurrentSession(), updated_at: new Date().toISOString(),
     });
-    if (equity > 0) await sbFetch('tc_equity', 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+    const now = Date.now();
+    if (equity > 0 && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
+      lastEquitySnapshot = now;
+      await sbFetch('tc_equity', 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+    }
     return;
   }
-  let cashValue   = 0;
-  let equityValue = 0;
-  let lastEquity  = 0;
+
+  // ── LIVE / PAPER MODE ──
+  // Step 1: Try to get real values from Alpaca
+  let cashValue   = realEquity > 0 ? realEquity : CONFIG.startingCapital; // safe fallback
+  let equityValue = realEquity > 0 ? realEquity : CONFIG.startingCapital;
+  let lastEquity  = realDailyStartEquity || 0;
 
   if (CONFIG.alpacaKey) {
     try {
       const acct = await getAccount();
-      if (acct?.cash)        cashValue   = +parseFloat(acct.cash).toFixed(2);
-      if (acct?.equity)      equityValue = +parseFloat(acct.equity).toFixed(2);
-      if (acct?.last_equity) lastEquity  = +parseFloat(acct.last_equity).toFixed(2);
-    } catch(e) { log('warn', `getAccount failed: ${e.message}`); }
+      if (acct?.equity && +acct.equity > 0) {
+        equityValue = +parseFloat(acct.equity).toFixed(2);
+        cashValue   = acct.cash ? +parseFloat(acct.cash).toFixed(2) : equityValue;
+        if (acct.last_equity && +acct.last_equity > 0) lastEquity = +parseFloat(acct.last_equity).toFixed(2);
+        // Update in-memory state
+        realEquity = equityValue;
+        if (!realDailyStartEquity && lastEquity > 0) {
+          realDailyStartEquity = lastEquity;
+          log('risk', `Day baseline set: $${lastEquity.toFixed(2)}`);
+        }
+      }
+    } catch(e) { log('warn', `getAccount failed: ${e.message} — using last known value`); }
   }
 
-  // If Alpaca didn't return valid equity, skip this sync — don't write wrong values
-  if (equityValue <= 0) {
-    log('warn', 'syncPortfolio: no valid equity from Alpaca — skipping write');
-    return;
-  }
-
-  // Sanity check: Alpaca's equity can lag after a new order fills —
-  // during that window equity = just cash (position not yet valued).
-  // If equity is suspiciously low (< cash + estimated position value), 
-  // calculate it ourselves from cash + current market value of all positions.
-  const positionMarketValue = Object.entries(positions).reduce((acc, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
-    return acc + cur * (pos.qtyRemaining || pos.qty);
-  }, 0) + Object.entries(shortPositions).reduce((acc, [sym, pos]) => {
-    // Short positions don't add market value (cash already received from short sale)
-    return acc;
-  }, 0) + Object.entries(scalpPositions).reduce((acc, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
-    return acc + (pos.direction === 'long' ? cur * pos.qty : 0);
+  // Step 2: Fix Alpaca equity lag — if we just entered a position,
+  // Alpaca might show equity = cash only (position not valued yet).
+  // Calculate our own equity and use whichever is higher.
+  const posMarketVal = Object.entries(positions).reduce((a, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    return a + cur * (pos.qtyRemaining || pos.qty);
+  }, 0) + Object.entries(scalpPositions).reduce((a, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    return a + (pos.direction === 'long' ? cur * pos.qty : 0);
   }, 0);
 
-  const calculatedEquity = cashValue + positionMarketValue;
-
-  // Use whichever is higher — Alpaca's number or our calculation.
-  // This prevents the "position just opened" lag from showing as a loss.
-  if (calculatedEquity > equityValue + 100) {
-    log('sys', `Equity lag detected: Alpaca=$${equityValue.toFixed(2)} Calculated=$${calculatedEquity.toFixed(2)} — using calculated`);
-    equityValue = +calculatedEquity.toFixed(2);
+  if (cashValue + posMarketVal > equityValue + 100) {
+    equityValue = +(cashValue + posMarketVal).toFixed(2);
   }
 
-  // Keep real equity updated for accurate circuit breaker
-  if (equityValue > 0) {
-    realEquity = equityValue;
-    if (realDailyStartEquity === 0 && lastEquity > 0) {
-      realDailyStartEquity = lastEquity;
-      log('risk', `Circuit breaker baseline: $${lastEquity.toFixed(2)} (yesterday close)`);
-    }
-  }
-
-  // Day P&L = today's equity vs yesterday's close
-  // If lastEquity is 0 (paper account first day), fall back to realized trades
+  // Step 3: Day P&L
   const dayPnl = lastEquity > 0
     ? +(equityValue - lastEquity).toFixed(2)
-    : trades
-        .filter(t => ['SELL','COVER','SCALP_EXIT'].includes(t.side) && t.pnl !== null
-          && new Date(t.time).toDateString() === new Date().toDateString())
+    : trades.filter(t => ['SELL','COVER','SCALP_EXIT'].includes(t.side) && t.pnl != null
+        && new Date(t.time).toDateString() === new Date().toDateString())
         .reduce((a, t) => a + t.pnl, 0);
 
+  // Step 4: Always write — never skip
   await sbFetch('tc_portfolio?id=eq.1', 'PATCH', {
     cash:            +cashValue.toFixed(2),
     total_value:     +equityValue.toFixed(2),
@@ -373,15 +354,15 @@ async function syncPortfolio() {
     updated_at:      new Date().toISOString(),
   });
 
-  // Equity snapshot for chart — only every 2 minutes to reduce Supabase writes
+  // Step 5: Equity snapshot every 2 minutes
   const now = Date.now();
-  if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10 && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
+  if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10
+      && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
     lastEquitySnapshot = now;
-    await sbFetch('tc_equity', 'POST', {
-      value:      +equityValue.toFixed(2),
-      created_at: new Date().toISOString(),
-    });
+    await sbFetch('tc_equity', 'POST', { value: +equityValue.toFixed(2), created_at: new Date().toISOString() });
   }
+
+  log('port', `Portfolio: equity=$${equityValue.toFixed(2)} cash=$${cashValue.toFixed(2)} dayPnl=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
 }
 
 async function syncPositions() {
