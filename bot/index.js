@@ -2394,9 +2394,17 @@ async function managePosition(sym, price, bars) {
     positions[sym].entryAnalytics.mae = +mae.toFixed(3);
   }
 
-  // ── 1. Hard stop loss (initial stop before break-even locks in) ──
-  if (!pos.breakEvenSet && price <= pos.stopPrice) {
+  // ── 1. Hard stop loss ──
+  // This fires regardless of break-even state — absolute maximum loss per trade
+  const hardStop = pos.entryPrice * (1 - (isSimMode() ? 0.015 : 0.02));
+  if (price <= Math.max(pos.stopPrice, hardStop) && !pos.breakEvenSet) {
     log('risk', `${sym} stop hit @ $${price.toFixed(2)} (stop=$${pos.stopPrice.toFixed(2)})`);
+    return exitPosition(sym, price, 'STOP_LOSS');
+  }
+
+  // Hard max loss safety net — never lose more than 3% on any trade under any circumstance
+  if (chg <= -0.03) {
+    log('risk', `🛑 ${sym} hard max loss -3% triggered @ $${price.toFixed(2)}`);
     return exitPosition(sym, price, 'STOP_LOSS');
   }
 
@@ -2470,6 +2478,40 @@ async function managePosition(sym, price, bars) {
     const reason = price <= pos.entryPrice * 1.001 ? 'BREAK_EVEN_STOP' : 'TRAILING_STOP';
     log('risk', `${reason === 'BREAK_EVEN_STOP' ? '🔒' : '📉'} ${sym} ${reason} @ $${price.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct}%)`);
     return exitPosition(sym, price, reason);
+  }
+
+  // ── Momentum fade exit — catches peaks before full trail triggers ──
+  // Detects 3 consecutive red bars while already pulled back 1%+ from high water
+  if (pos.breakEvenSet && bars && bars.length >= 5 && chg > 0) {
+    const last3 = bars.slice(-3).map(b => b.c);
+    const fallingBars = last3[2] < last3[1] && last3[1] < last3[0];
+    const fromHW = (pos.highWater - price) / pos.highWater;
+    if (fallingBars && fromHW >= 0.010) {
+      log('sell', `📉 ${sym} momentum fade: ${(fromHW*100).toFixed(1)}% from peak, 3 red bars — exiting at profit`);
+      return exitPosition(sym, price, 'TRAILING_STOP');
+    }
+  }
+
+  // ── Take profit tiers ──
+  if (!pos.tp1Hit && chg >= CONFIG.tp1Pct) {
+    const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.33));
+    positions[sym].tp1Hit = true;
+    log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}%: selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
+    await partialExit(sym, price, sell, 'TP1');
+    if (!positions[sym]) return;
+    return;
+  }
+  if (pos.tp1Hit && !pos.tp2Hit && chg >= CONFIG.tp2Pct) {
+    const sell = Math.max(1, Math.floor(positions[sym].qtyRemaining * 0.5));
+    positions[sym].tp2Hit = true;
+    log('sell', `🎯🎯 TP2 +${(chg*100).toFixed(1)}%: selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
+    await partialExit(sym, price, sell, 'TP2');
+    if (!positions[sym]) return;
+    return;
+  }
+  if (pos.tp1Hit && pos.tp2Hit && chg >= CONFIG.tp3Pct) {
+    log('sell', `🎯🎯🎯 TP3 +${(chg*100).toFixed(1)}%: final exit ${sym} @ $${price.toFixed(2)}`);
+    return exitPosition(sym, price, 'TAKE_PROFIT');
   }
 
   // ── 9. Resistance exit — disabled in sim (SR levels unreliable with limited history) ──
