@@ -1810,7 +1810,9 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     if (cost > portfolio) { log('warn', `Not enough cash for ${sym}`); return; }
     const atrStop  = price - (atrVal * CONFIG.atrStopMult);
     const pctStop  = price * (1 - CONFIG.stopLossPct);
-    const stopPrice = Math.max(atrStop, pctStop);
+    // In sim use minimum 3% stop so normal bar noise doesn't immediately trigger exit
+    const minStop  = isSimMode() ? price * (1 - Math.max(CONFIG.stopLossPct, 0.03)) : pctStop;
+    const stopPrice = Math.max(atrStop, minStop);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       try { await placeSmartOrder(sym, qty, 'buy', false); }
@@ -1840,7 +1842,8 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     // Stop loss ABOVE entry for shorts
     const atrStop   = price + (atrVal * CONFIG.atrStopMult);
     const pctStop   = price * (1 + CONFIG.stopLossPct);
-    const stopPrice = Math.min(atrStop, pctStop);
+    const maxStop   = isSimMode() ? price * (1 + Math.max(CONFIG.stopLossPct, 0.03)) : pctStop;
+    const stopPrice = Math.min(atrStop, maxStop);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       try { await placeSmartOrder(sym, qty, 'sell', false); } // sell to open short
@@ -2152,8 +2155,8 @@ async function managePosition(sym, price, bars) {
     }
   }
 
-  // ── 9. Resistance exit ──
-  if (nearResistance(price, pos.srLevels) && chg > 0) {
+  // ── 9. Resistance exit — disabled in sim (SR levels unreliable with limited history) ──
+  if (!isSimMode() && nearResistance(price, pos.srLevels) && chg > 0) {
     log('sell', `🧱 Resistance exit: ${sym} approaching resistance @ $${price.toFixed(2)}`);
     return exitPosition(sym, price, 'RESISTANCE_EXIT');
   }
