@@ -2093,6 +2093,108 @@ function adx(bars, period = 14) {
 //   wyckoff         — Accumulation/distribution phases
 // ═══════════════════════════════════════════════════════════════════
 
+
+// ── Helper: BIG TRAP — Trapped Buyers/Sellers (from Pine Script) ──
+// Detects price levels where:
+//   - Trapped BUYERS: heavy buying happened but price closed BELOW that level
+//     → these buyers are underwater, will panic-sell if price returns = resistance
+//   - Trapped SELLERS: heavy selling happened but price closed ABOVE that level
+//     → these sellers are underwater, will panic-buy to cover = support
+//
+// Translated from: BIG TRAP by drop_trades
+// Uses volume delta per bar to simulate footprint analysis
+function findTraps(bars, lookback = 20) {
+  if (!bars || bars.length < 5) return { trappedBuyers: [], trappedSellers: [], nearestTrap: null };
+
+  const slice = bars.slice(-Math.min(lookback, bars.length));
+  const price  = bars[bars.length - 1].c; // current price
+  const IMBALANCE_RATIO = 3.0; // buy vol must be 3x sell vol (or vice versa) — matches Pine default
+  const MIN_TRAP_VOL    = 30;  // minimum volume to qualify as a trap
+
+  const trappedBuyers  = []; // buyers who bought above current price (underwater)
+  const trappedSellers = []; // sellers who sold below current price (underwater)
+
+  for (const bar of slice) {
+    const barRange = bar.h - bar.l;
+    if (barRange <= 0) continue;
+
+    // Estimate buy/sell volume split from bar structure
+    // This approximates footprint data using OHLCV:
+    // Close near high = mostly buying, close near low = mostly selling
+    const closeLocation = (bar.c - bar.l) / barRange; // 0=at low, 1=at high
+    const totalVol      = bar.v || 0;
+    const buyVol        = totalVol * closeLocation;
+    const sellVol       = totalVol * (1 - closeLocation);
+
+    const netDelta  = buyVol - sellVol;
+    const absDelta  = Math.abs(netDelta);
+
+    // Only consider bars with clear directional imbalance
+    const buyRatio  = sellVol > 0 ? buyVol / sellVol : buyVol;
+    const sellRatio = buyVol > 0 ? sellVol / buyVol : sellVol;
+
+    const isBuyImbalance  = buyRatio  >= IMBALANCE_RATIO;
+    const isSellImbalance = sellRatio >= IMBALANCE_RATIO;
+
+    // TRAPPED BUYERS: heavy buying + price closed below this bar's high
+    // (buyers bought aggressively but got trapped as price fell away)
+    if (isBuyImbalance && totalVol >= MIN_TRAP_VOL) {
+      const trapPrice = (bar.h + bar.c) / 2; // weighted trap level
+      // "Strict mode" — only count if in top 30% of candle (wick area)
+      const inTopWick = bar.h > bar.c + barRange * 0.7;
+      if (inTopWick && trapPrice > price) {
+        // Buyers are underwater — this is resistance
+        trappedBuyers.push({
+          price:   trapPrice,
+          vol:     totalVol,
+          delta:   absDelta,
+          barHigh: bar.h,
+          barLow:  bar.l,
+          dist:    (trapPrice - price) / price, // how far above current price
+        });
+      }
+    }
+
+    // TRAPPED SELLERS: heavy selling + price closed above this bar's low
+    // (sellers sold aggressively but price rallied above them — trapped shorts)
+    if (isSellImbalance && totalVol >= MIN_TRAP_VOL) {
+      const trapPrice = (bar.l + bar.c) / 2;
+      // "Strict mode" — only count if in bottom 30% of candle (wick area)
+      const inBottomWick = bar.l < bar.c - barRange * 0.7;
+      if (inBottomWick && trapPrice < price) {
+        // Sellers are underwater — this is support
+        trappedSellers.push({
+          price:   trapPrice,
+          vol:     totalVol,
+          delta:   absDelta,
+          barHigh: bar.h,
+          barLow:  bar.l,
+          dist:    (price - trapPrice) / price, // how far below current price
+        });
+      }
+    }
+  }
+
+  // Sort by volume (biggest traps first — most trapped = strongest level)
+  trappedBuyers.sort((a,b)  => b.vol - a.vol);
+  trappedSellers.sort((a,b) => b.vol - a.vol);
+
+  // Find nearest trap to current price (within 3%)
+  const allTraps = [
+    ...trappedBuyers.map(t  => ({ ...t, type:'buyer'  })),
+    ...trappedSellers.map(t => ({ ...t, type:'seller' })),
+  ].filter(t => t.dist < 0.03).sort((a,b) => a.dist - b.dist);
+
+  return {
+    trappedBuyers,
+    trappedSellers,
+    nearestTrap: allTraps[0] || null,
+    // Summary scores for signal engine
+    buyerTrapScore:  trappedBuyers.length  > 0 ? Math.min(3, trappedBuyers.length)  : 0,
+    sellerTrapScore: trappedSellers.length > 0 ? Math.min(3, trappedSellers.length) : 0,
+  };
+}
+
 // ── Helper: Detect Fair Value Gaps (FVG) ─────────────────────────
 // FVG = when price gaps past a candle leaving an "imbalance"
 // Price tends to return to fill these gaps
@@ -2309,6 +2411,11 @@ function signalSMC(sym, bars5m, bars15m) {
   if (curVol > avgVol * 1.2) { score+=1; reasons.push(`Volume surge (${(curVol/avgVol).toFixed(1)}x) ✅`); }
   if (adxVal.adx < 15) return { signal:'HOLD', confidence:0, reasons:[...reasons,'ADX too low — ranging'] };
 
+  // BIG TRAP — adds high conviction when institutional traps align with SMC
+  const trapsSMC = findTraps(bars5m, 20);
+  if (direction==='buy'  && trapsSMC.sellerTrapScore > 0) { score += trapsSMC.sellerTrapScore; reasons.push(`🪤 Trapped sellers = support ✅`); }
+  if (direction==='sell' && trapsSMC.buyerTrapScore  > 0) { score += trapsSMC.buyerTrapScore;  reasons.push(`🪤 Trapped buyers = resistance ✅`); }
+
   if (score < 6) return { signal:'HOLD', confidence:0, score, reasons };
   const conf = Math.min(95, 50 + score*5);
   return { signal:direction==='buy'?'BUY':'SELL', confidence:conf, score, reasons, rsi:r, atr:atr(bars5m,14) };
@@ -2366,6 +2473,11 @@ function signalICT(sym, bars5m, bars15m) {
   // FVG at entry
   const entryFVG = fvgs.find(f => f.type===(direction==='buy'?'bull':'bear') && Math.abs(price-f.mid)/price < 0.005);
   if (entryFVG) { score+=2; reasons.push(`FVG entry confluence ✅`); }
+
+  // BIG TRAP — liquidity sweeps + traps = strongest ICT entry
+  const trapsICT = findTraps(bars5m, 20);
+  if (direction==='buy'  && trapsICT.sellerTrapScore > 0) { score += trapsICT.sellerTrapScore + 1; reasons.push(`🪤 ICT + Trapped sellers = strong support ✅`); }
+  if (direction==='sell' && trapsICT.buyerTrapScore  > 0) { score += trapsICT.buyerTrapScore  + 1; reasons.push(`🪤 ICT + Trapped buyers = strong resistance ✅`); }
 
   if (adxVal.adx < 12) return { signal:'HOLD', confidence:0, reasons:[...reasons,'ADX too low'] };
   if (score < 7) return { signal:'HOLD', confidence:0, score, reasons };
@@ -2721,7 +2833,27 @@ function generateSignal(sym, bars5m, bars15m) {
     if (ll) { bonus++; reasons.push(`Lower lows structure ✅`); }
   }
 
-  // ── Quality score ──
+  // ── BIG TRAP ANALYSIS ──────────────────────────────────────────
+  // Trapped sellers below = strong support → confirms long entries
+  // Trapped buyers above = strong resistance → confirms short entries
+  // Strongest confluence signal — institutions are forced to cover
+  const traps = findTraps(bars5m, 20);
+
+  if (direction === 'buy' && traps.sellerTrapScore > 0) {
+    const best = traps.trappedSellers[0];
+    bonus += traps.sellerTrapScore;
+    reasons.push(`🪤 Trapped sellers below $${best?.price.toFixed(2)} (vol:${best?.vol.toFixed(0)}) — support ✅`);
+  }
+  if (direction === 'sell' && traps.buyerTrapScore > 0) {
+    const best = traps.trappedBuyers[0];
+    bonus += traps.buyerTrapScore;
+    reasons.push(`🪤 Trapped buyers above $${best?.price.toFixed(2)} (vol:${best?.vol.toFixed(0)}) — resistance ✅`);
+  }
+  // Nearest trap as price target info
+  if (traps.nearestTrap) {
+    const t = traps.nearestTrap;
+    reasons.push(`Nearest trap: ${t.type==='buyer'?'🔴 buyers above':'🟢 sellers below'} $${t.price.toFixed(2)} (${(t.dist*100).toFixed(2)}% away)`);
+  }
   // Gates passed (required) + bonus confluence (nice to have)
   // Need at least 5 gates AND at least 1 bonus for a trade
   const minGates = c15 ? 6 : 5; // stricter when 15min data available
@@ -3021,12 +3153,39 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
       catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
     }
     portfolio -= cost;
+
+    // Use trapped buyer clusters above as TP targets — they'll panic-sell when price hits them
+    // This gives us precise TP levels based on where the real supply/resistance is
+    const entryTraps = bars ? findTraps(bars, 20) : null;
+    let initTP1 = CONFIG.tp1Pct, initTP2 = CONFIG.tp2Pct, initTP3 = CONFIG.tp3Pct;
+    if (entryTraps && entryTraps.trappedBuyers.length > 0) {
+      // Sort trapped buyer clusters by proximity above entry price
+      const buyerTargets = entryTraps.trappedBuyers
+        .filter(t => t.price > price && (t.price - price)/price < 0.15)
+        .sort((a,b) => a.price - b.price);
+      if (buyerTargets.length >= 1) {
+        initTP1 = (buyerTargets[0].price - price) / price;
+        log('trap', `🪤 ${sym} TP1 set to trapped buyer cluster @ $${buyerTargets[0].price.toFixed(2)} (+${(initTP1*100).toFixed(2)}%)`);
+      }
+      if (buyerTargets.length >= 2) {
+        initTP2 = (buyerTargets[1].price - price) / price;
+        log('trap', `🪤 ${sym} TP2 set to trapped buyer cluster @ $${buyerTargets[1].price.toFixed(2)} (+${(initTP2*100).toFixed(2)}%)`);
+      }
+      if (buyerTargets.length >= 3) {
+        initTP3 = (buyerTargets[2].price - price) / price;
+      }
+    }
+
     positions[sym] = {
       entryPrice: price, qty, qtyRemaining: qty, cost,
       entryTime: new Date(), highWater: price, lowWater: price,
       atrAtEntry: atrVal14, stopPrice,
       breakEvenSet: false, tp1Hit: false, tp2Hit: false,
       srLevels, sigInfo, direction: 'long',
+      // Trap-aware initial TPs (overridden by dynamic TP as trade progresses)
+      dynamicTP1: +initTP1.toFixed(4),
+      dynamicTP2: +initTP2.toFixed(4),
+      dynamicTP3: +initTP3.toFixed(4),
       // Rich entry analytics for post-trade learning
       entryAnalytics: {
         stopDistPct:    +((price - stopPrice) / price * 100).toFixed(3),
@@ -3039,8 +3198,8 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
         volumeRatio:    bars?.length >= 10 ? +(bars[bars.length-1].v / (bars.slice(-10).reduce((a,b)=>a+b.v,0)/10)).toFixed(2) : 1,
         session:        getCurrentSession(),
         signalReasons:  sigInfo.reasons?.slice(0,5) || [],
-        mfe:            0, // max favorable excursion — updated as position moves
-        mae:            0, // max adverse excursion — updated as position moves
+        mfe:            0,
+        mae:            0,
       },
     };
     alpacaPositions.add(sym);
