@@ -2732,9 +2732,19 @@ function generateSignal(sym, bars5m, bars15m) {
   const lows  = bars5m.map(b => b.l);
   const price = c5[c5.length - 1];
 
+  // ── PRE-GATE: Minimum volatility ──────────────────────────────
+  // Reject stocks that don't move enough to reach TP1 before BE triggers
+  // NIO, DRCL, PYPL type stocks hit +0.3% then immediately reverse = constant BE exits
+  const atrNow = atr(bars5m, 14);
+  const atrPct = price > 0 ? atrNow / price : 0;
+  if (atrPct < 0.004) { // 0.4% ATR minimum
+    return { signal: 'HOLD', confidence: 0, score: 0,
+      reasons: [`ATR too low (${(atrPct*100).toFixed(2)}% < 0.4% min) — not enough movement`], rsi: 50 };
+  }
+
   const reasons = [];
-  let passedGates = 0; // how many hard gates passed
-  let direction   = null; // 'buy' or 'sell' — set by first strong signal, all others must agree
+  let passedGates = 0;
+  let direction   = null;
 
   // ── GATE 1: RSI must be in meaningful territory ──
   // Neutral RSI (40-60) = no edge. We only trade extremes.
@@ -3385,12 +3395,14 @@ async function manageShort(sym, price, bars) {
   const hwChg = (pos.entryPrice - pos.lowWater) / pos.entryPrice; // how far down we've been
 
   // ── IMMEDIATE PROFIT LOCK + TRAILING STOP (shorts — inverted) ──
-  // Tier 1 (0.3%+): lock break-even — stop moves to entry, can't lose
-  if (!pos.breakEvenSet && chg >= CONFIG.breakEvenAt) {
+  // Tier 1 — ATR-scaled break-even for shorts
+  const shortAtrPct = bars && bars.length >= 14 ? atr(bars, 14) / price : 0.008;
+  const shortScaledBE = Math.max(0.002, Math.min(0.010, shortAtrPct * 0.4));
+  if (!pos.breakEvenSet && chg >= shortScaledBE) {
     shortPositions[sym].stopPrice   = pos.entryPrice * 0.9999;
     shortPositions[sym].breakEvenSet = true;
-    log('risk', `🔒 ${sym} short break-even locked @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
-    await syncLog('sys', `🔒 Short break-even locked: ${sym} @ $${pos.entryPrice.toFixed(2)}`);
+    log('risk', `🔒 ${sym} short BE @ $${pos.entryPrice.toFixed(2)} (BE=${(shortScaledBE*100).toFixed(2)}%)`);
+    await syncLog('sys', `🔒 Short BE: ${sym} @ $${pos.entryPrice.toFixed(2)}`);
   }
 
   // Tier 2 — trail 0.8% above low water once down 1%
@@ -3862,14 +3874,18 @@ async function managePosition(sym, price, bars) {
   // After TP1 hit:  trail 1.5% below high water on remaining shares
   // After TP2 hit:  trail 1.0% below high water on final runner
 
-  const hwChg = (pos.highWater - pos.entryPrice) / pos.entryPrice; // how far up we've been
+  const hwChg = (pos.highWater - pos.entryPrice) / pos.entryPrice;
 
-  // Tier 1 — lock break-even immediately at +0.3%
-  if (!pos.breakEvenSet && chg >= 0.003) {
-    positions[sym].stopPrice   = pos.entryPrice * 1.0001; // tiny buffer above entry
+  // Tier 1 — ATR-scaled break-even
+  // Low-vol (ATR 0.4%): BE at 0.16%, high-vol (ATR 1.5%): BE at 0.6%
+  // Stops constant BE exits on slow-moving stocks like NIO/DRCL
+  const posAtrPct = bars && bars.length >= 14 ? atr(bars, 14) / price : 0.008;
+  const scaledBE  = Math.max(0.002, Math.min(0.010, posAtrPct * 0.4));
+  if (!pos.breakEvenSet && chg >= scaledBE) {
+    positions[sym].stopPrice   = pos.entryPrice * 1.0001;
     positions[sym].breakEvenSet = true;
-    log('risk', `🔒 ${sym} break-even locked @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
-    await syncLog('sys', `🔒 Break-even locked: ${sym} @ $${pos.entryPrice.toFixed(2)}`);
+    log('risk', `🔒 ${sym} BE locked @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}% | BE=${(scaledBE*100).toFixed(2)}%)`);
+    await syncLog('sys', `🔒 Break-even: ${sym} @ $${pos.entryPrice.toFixed(2)}`);
   }
 
   // Tier 2 — trail 0.8% below high water once up 1%
