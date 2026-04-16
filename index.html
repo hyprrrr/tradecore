@@ -780,20 +780,14 @@ async function poll(){
 }
 
 function updateAdaptiveStats(p){
-  // Read adapted settings from tc_settings if available
-  // For now read from the bot log or portfolio fields
-  // The bot writes adapted values back to tc_settings via Supabase
   const wins   = +p.total_wins  || 0;
   const losses = +p.total_losses|| 0;
   const total  = wins + losses;
   const wr     = total > 0 ? ((wins/total)*100).toFixed(0) : '—';
-
-  // Update last run label with win rate
   const el = document.getElementById('adaptLastRun');
-  if(el) el.textContent = total > 0 ? `${wr}% win rate · ${total} trades analyzed` : 'waiting for trades…';
-
-  // These values update when the bot writes back to Supabase after tuning
-  // For now show defaults — they'll update after first auto-tune
+  if(el) el.textContent = total > 0
+    ? `${wr}% win rate · ${total} trades · ${+wr >= 60 ? '✅ target met' : '⚠ below 60% target — adapting'}`
+    : 'waiting for trades…';
 }
 
 function updateScreener(p){
