@@ -818,18 +818,30 @@ async function poll(){
 
   const p=portfolio[0], posData=positions||[];
 
-  // Build equity history from live portfolio total_value on every poll
-  // This is simpler and more reliable than reading from tc_equity database
-  // Build equity history from poll data with strict spike filter
-  // 2% max change per poll (3s interval) eliminates all position-entry spikes
-  const rawEquity = +p.total_value;
-  const startCap  = getStartingCapital();
-  if(rawEquity > startCap * 0.7 && rawEquity < startCap * 1.5) {
-    const last = equityHistory[equityHistory.length-1];
-    if(!last || Math.abs((rawEquity - last) / last) < 0.02) {
-      equityHistory.push(+rawEquity.toFixed(2));
-      if(equityHistory.length > 500) equityHistory.shift();
-    }
+  // Build equity history from poll data
+  // Smart spike filter: a drop is only valid if there are no new positions
+  // (position entries temporarily reduce cash before total_value is corrected)
+  const rawEquity  = +p.total_value;
+  const startCap   = getStartingCapital();
+  const last        = equityHistory[equityHistory.length-1];
+  const change      = last ? (rawEquity - last) / last : 0;
+  const posCount    = posData.length;
+  const lastPosCount = equityHistory._lastPosCount || 0;
+  equityHistory._lastPosCount = posCount;
+
+  const isValidPoint = (
+    rawEquity > startCap * 0.5 &&
+    rawEquity < startCap * 2.0 &&
+    // Allow any upward move or tiny downward move
+    (change >= -0.001 ||
+    // Allow larger drops ONLY if no new positions opened since last poll
+    // (if positions increased, the drop is a cash→position transfer, not a real loss)
+     (change >= -0.02 && posCount <= lastPosCount))
+  );
+
+  if(!last || isValidPoint) {
+    equityHistory.push(+rawEquity.toFixed(2));
+    if(equityHistory.length > 500) equityHistory.shift();
   }
   if(!equityLoaded){ equityLoaded=true; }
 
