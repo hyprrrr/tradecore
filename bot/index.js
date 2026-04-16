@@ -3502,42 +3502,55 @@ function calcDynamicTP(pos, price, bars) {
   const atrVal   = atr(bars, 14);
   const atrPct   = atrVal / price;
   const chg      = (price - pos.entryPrice) / pos.entryPrice;
-  const mfe      = (pos.highWater - pos.entryPrice) / pos.entryPrice; // best we've seen
+  const mfe      = (pos.highWater - pos.entryPrice) / pos.entryPrice;
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
 
-  // Base TP on ATR — realistic target is 2-3× ATR from entry
-  // If ATR is small (low volatility stock), TP should be tighter
-  // If ATR is large (high volatility), TP can be wider
-  const atrTP1 = Math.min(atrPct * 2, 0.06);  // 2× ATR, max 6%
-  const atrTP2 = Math.min(atrPct * 3.5, 0.10); // 3.5× ATR, max 10%
-  const atrTP3 = Math.min(atrPct * 5, 0.15);   // 5× ATR, max 15%
+  // Measure live velocity — how fast is it moving right now?
+  const last3closes = bars.slice(-3).map(b => b.c);
+  const velocity = last3closes.length >= 3
+    ? (last3closes[last3closes.length-1] - last3closes[0]) / last3closes[0]
+    : 0;
 
-  // Momentum adjustment — if trade moved strongly in first 30 min,
-  // momentum is real and we can let it run further
-  const earlyStrength = holdMins <= 30 && mfe > atrPct * 1.5;
+  // Current RSI to detect overbought
+  const closes = bars.map(b => b.c);
+  const currentRSI = rsi(closes, 14);
+  const isOverbought = currentRSI > 70;
 
-  // Reduce TP if trade has been flat for a long time (momentum dead)
-  const flatTooLong = holdMins > 60 && Math.abs(chg) < atrPct * 0.5;
+  // Base TP on actual ATR — no caps, scales naturally to stock volatility
+  let tp1 = atrPct * 1.5;   // 1.5x ATR
+  let tp2 = atrPct * 3.0;   // 3x ATR
+  let tp3 = atrPct * 5.0;   // 5x ATR
 
-  let tp1 = atrTP1;
-  let tp2 = atrTP2;
-  let tp3 = atrTP3;
-
-  if (earlyStrength) {
-    // Strong momentum — let it run
-    tp1 *= 1.3; tp2 *= 1.3; tp3 *= 1.3;
-  }
-  if (flatTooLong) {
-    // Dead momentum — tighten TP to get out
-    tp1 *= 0.5; tp2 *= 0.7; tp3 *= 0.8;
+  // CHASE MODE: trade already ran past TP1 — push TPs forward to capture the move
+  if (mfe > tp1 * 1.5) {
+    tp1 = mfe * 0.8;          // just below current high water
+    tp2 = mfe + atrPct * 2;   // extension target
+    tp3 = mfe + atrPct * 4;   // full extension
   }
 
-  // Never set TP below current profit — that would cause immediate exit
-  tp1 = Math.max(tp1, chg + 0.003);
-  tp2 = Math.max(tp2, tp1 + 0.01);
-  tp3 = Math.max(tp3, tp2 + 0.02);
+  // MOMENTUM BOOST: strong velocity = expand TPs
+  if (velocity > atrPct * 0.5) {
+    tp1 *= 1.4; tp2 *= 1.4; tp3 *= 1.5;
+  }
 
-  return { tp1: +tp1.toFixed(4), tp2: +tp2.toFixed(4), tp3: +tp3.toFixed(4), atrPct: +atrPct.toFixed(4) };
+  // OVERBOUGHT: RSI > 70, reduce TP3 — not much more left in the move
+  if (isOverbought) {
+    tp3 = Math.min(tp3, mfe + atrPct);
+  }
+
+  // FLAT: barely moving after 45 min — lower TPs to get out
+  if (holdMins > 45 && mfe < atrPct * 0.5) {
+    tp1 = Math.max(chg + 0.001, atrPct * 0.5);
+    tp2 = tp1 + atrPct * 0.5;
+    tp3 = tp1 + atrPct;
+  }
+
+  // Always stay ahead of current price
+  tp1 = Math.max(tp1, chg + 0.002);
+  tp2 = Math.max(tp2, tp1 + atrPct * 0.5);
+  tp3 = Math.max(tp3, tp2 + atrPct);
+
+  return { tp1:+tp1.toFixed(4), tp2:+tp2.toFixed(4), tp3:+tp3.toFixed(4), atrPct:+atrPct.toFixed(4), velocity:+velocity.toFixed(4), rsi:+currentRSI.toFixed(1) };
 }
 
 // ── Market Close Time Check ───────────────────────────────────────
@@ -3582,14 +3595,24 @@ async function managePosition(sym, price, bars) {
   if (!pos.tp1Hit && bars && bars.length >= 14) {
     const dtp = calcDynamicTP(pos, price, bars);
     if (dtp) {
-      // Only move TPs — never tighten them if trade is already moving well
-      const newTP1 = pos.dynamicTP1 ? Math.min(dtp.tp1, pos.dynamicTP1) : dtp.tp1;
-      const newTP2 = pos.dynamicTP2 ? Math.min(dtp.tp2, pos.dynamicTP2) : dtp.tp2;
-      const newTP3 = pos.dynamicTP3 ? Math.min(dtp.tp3, pos.dynamicTP3) : dtp.tp3;
-      if (!pos.dynamicTP1 || Math.abs(newTP1 - pos.dynamicTP1) > 0.001) {
-        positions[sym].dynamicTP1 = newTP1;
-        positions[sym].dynamicTP2 = newTP2;
-        positions[sym].dynamicTP3 = newTP3;
+      // TPs can EXPAND when momentum is strong (chase the move)
+      // TPs only TIGHTEN when momentum dies (flat/overbought)
+      const prevTP1 = pos.dynamicTP1 || CONFIG.tp1Pct;
+      const prevTP2 = pos.dynamicTP2 || CONFIG.tp2Pct;
+      const prevTP3 = pos.dynamicTP3 || CONFIG.tp3Pct;
+
+      // In chase mode (dtp.tp1 < prevTP1) = TP moved closer, that's a tighten — allow
+      // In expand mode (dtp.tp1 > prevTP1) = TP moved further, allow if velocity is strong
+      const expanding = dtp.tp1 > prevTP1;
+      const velocityOk = (dtp.velocity || 0) > 0 || (dtp.rsi || 50) < 65;
+
+      if (!expanding || velocityOk) {
+        positions[sym].dynamicTP1 = dtp.tp1;
+        positions[sym].dynamicTP2 = dtp.tp2;
+        positions[sym].dynamicTP3 = dtp.tp3;
+        if (expanding) {
+          log('tp', `📈 ${sym} TP expanding: TP1=${(dtp.tp1*100).toFixed(2)}% TP2=${(dtp.tp2*100).toFixed(2)}% TP3=${(dtp.tp3*100).toFixed(2)}% (RSI=${dtp.rsi} vel=${(dtp.velocity*100).toFixed(2)}%)`);
+        }
       }
     }
   }
