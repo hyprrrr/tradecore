@@ -2180,33 +2180,64 @@ async function manageShort(sym, price, bars) {
   const pos = shortPositions[sym];
   if (!pos) return;
 
-  const chg      = (pos.entryPrice - price) / pos.entryPrice; // positive = profitable (price dropped)
+  const chg      = (pos.entryPrice - price) / pos.entryPrice; // positive = profitable
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
 
-  // Update low water mark (we want price to go DOWN)
+  // Update low water mark (lowest price = most profit for short)
   if (price < pos.lowWater) shortPositions[sym].lowWater = price;
+  const hwChg = (pos.entryPrice - pos.lowWater) / pos.entryPrice; // how far down we've been
 
-  // Ratchet stop loss DOWN as price falls (lock in profits)
-  if (bars && bars.length >= 14) {
-    const curAtr = atr(bars, 14);
-    const newStop = price + (curAtr * CONFIG.atrStopMult);
-    if (newStop < shortPositions[sym].stopPrice) {
-      shortPositions[sym].stopPrice = newStop;
-      log('risk', `${sym} short stop ratcheted → $${newStop.toFixed(2)}`);
+  // ── IMMEDIATE PROFIT LOCK + TRAILING STOP (shorts — inverted) ──
+  // Tier 1 (0.3%+): lock break-even — stop moves to entry, can't lose
+  if (!pos.breakEvenSet && chg >= 0.003) {
+    shortPositions[sym].stopPrice   = pos.entryPrice * 0.9999;
+    shortPositions[sym].breakEvenSet = true;
+    log('risk', `🔒 ${sym} short break-even locked @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
+    await syncLog('sys', `🔒 Short break-even locked: ${sym} @ $${pos.entryPrice.toFixed(2)}`);
+  }
+
+  // Tier 2 — trail 0.8% above low water once down 1%
+  if (pos.breakEvenSet && hwChg >= 0.010 && !pos.tp1Hit) {
+    const trail = pos.lowWater * (1 + 0.008);
+    if (trail < shortPositions[sym].stopPrice) {
+      shortPositions[sym].stopPrice = trail;
     }
   }
 
-  // Stop loss — price went UP (bad for short)
-  if (price >= pos.stopPrice) {
-    const stopType = pos.breakEvenSet ? 'BREAK_EVEN_STOP' : 'STOP_LOSS';
-    return coverShort(sym, price, stopType);
+  // Tier 3 — trail 1.5% above low water once down 2%
+  if (pos.breakEvenSet && hwChg >= 0.020 && !pos.tp1Hit) {
+    const trail = pos.lowWater * (1 + 0.015);
+    if (trail < shortPositions[sym].stopPrice) {
+      shortPositions[sym].stopPrice = trail;
+    }
   }
 
-  // Break-even: once down breakEvenAt%, move stop to entry
-  if (!pos.breakEvenSet && chg >= CONFIG.breakEvenAt) {
-    shortPositions[sym].stopPrice  = pos.entryPrice;
-    shortPositions[sym].breakEvenSet = true;
-    log('risk', `🔒 Short break-even: ${sym} SL → $${pos.entryPrice.toFixed(2)}`);
+  // Tier 4 — trail 2% above low water once down 4%+
+  if (pos.breakEvenSet && hwChg >= 0.040 && !pos.tp1Hit) {
+    const trail = pos.lowWater * (1 + 0.020);
+    if (trail < shortPositions[sym].stopPrice) {
+      shortPositions[sym].stopPrice = trail;
+    }
+  }
+
+  // After TP1 — 1.5% trail on remaining
+  if (pos.tp1Hit && !pos.tp2Hit) {
+    const trail = pos.lowWater * (1 + 0.015);
+    if (trail < shortPositions[sym].stopPrice) shortPositions[sym].stopPrice = trail;
+  }
+
+  // After TP2 — 1% trail on final runner
+  if (pos.tp1Hit && pos.tp2Hit) {
+    const trail = pos.lowWater * (1 + 0.010);
+    if (trail < shortPositions[sym].stopPrice) shortPositions[sym].stopPrice = trail;
+  }
+
+  // Check stop hit — price went UP against short
+  if (price >= shortPositions[sym].stopPrice) {
+    const pct = ((pos.entryPrice - price) / pos.entryPrice * 100).toFixed(2);
+    const reason = price >= pos.entryPrice * 0.999 ? 'BREAK_EVEN_STOP' : 'TRAILING_STOP';
+    log('risk', `${reason === 'BREAK_EVEN_STOP' ? '🔒' : '📉'} SHORT ${sym} ${reason} @ $${price.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct}%)`);
+    return coverShort(sym, price, reason);
   }
 
   // TP1 — cover 33% at tp1Pct drop
@@ -2233,7 +2264,7 @@ async function manageShort(sym, price, bars) {
     return coverShort(sym, price, 'TIME_STOP');
   }
 
-  log('pos', `SHORT ${sym} ${chg>=0?'+':''}${(chg*100).toFixed(2)}% | SL=$${pos.stopPrice.toFixed(2)} | BE:${pos.breakEvenSet?'✅':'❌'}`);
+  log('pos', `SHORT ${sym} ${chg>=0?'+':''}${(chg*100).toFixed(2)}% | SL=$${shortPositions[sym].stopPrice.toFixed(2)} | BE:${pos.breakEvenSet?'✅':'❌'}`);
 }
 
 async function coverPartialShort(sym, price, qty, reason) {
@@ -2354,75 +2385,82 @@ async function managePosition(sym, price, bars) {
     positions[sym].entryAnalytics.mae = +mae.toFixed(3);
   }
 
-  // ── 1. Ratchet ATR stop upward as price rises ──
-  if (bars && bars.length >= 14) {
-    const curAtr = atr(bars, 14);
-    const newStop = price - (curAtr * CONFIG.atrStopMult);
-    if (newStop > positions[sym].stopPrice) {
-      positions[sym].stopPrice = newStop;
-      log('risk', `${sym} ATR stop ratcheted → $${newStop.toFixed(2)}`);
-    }
+  // ── 1. Hard stop loss (initial stop before break-even locks in) ──
+  if (!pos.breakEvenSet && price <= pos.stopPrice) {
+    log('risk', `${sym} stop hit @ $${price.toFixed(2)} (stop=$${pos.stopPrice.toFixed(2)})`);
+    return exitPosition(sym, price, 'STOP_LOSS');
   }
 
-  // ── 2. Hard stop loss ──
-  if (price <= pos.stopPrice) {
-    const reason = pos.breakEvenSet ? 'BREAK_EVEN_STOP' : 'STOP_LOSS';
-    log('risk', `${sym} stop hit @ $${price.toFixed(2)} (stop=$${pos.stopPrice.toFixed(2)}) → ${reason}`);
-    return exitPosition(sym, price, reason);
-  }
+  // ── 3. IMMEDIATE PROFIT LOCK + TRAILING STOP ──────────────────────
+  // Philosophy: as soon as price moves in our favor at all, lock in profit.
+  // Worst case = scratch trade (exit at entry). Best case = full profit run.
+  //
+  // Tier 1 (0.3%+): move stop to entry price → can never lose on this trade
+  // Tier 2 (1.0%+): trail 0.8% below high water → lock small profit
+  // Tier 3 (2.0%+): trail 1.5% below high water → lock bigger profit
+  // Tier 4 (4.0%+): trail 2.0% below high water → let winner run with tight trail
+  // After TP1 hit:  trail 1.5% below high water on remaining shares
+  // After TP2 hit:  trail 1.0% below high water on final runner
 
-  // ── 3. Break-even: move SL to entry once up breakEvenAt% ──
-  if (!pos.breakEvenSet && chg >= CONFIG.breakEvenAt) {
-    positions[sym].stopPrice   = pos.entryPrice;
+  const hwChg = (pos.highWater - pos.entryPrice) / pos.entryPrice; // how far up we've been
+
+  // Tier 1 — lock break-even immediately at +0.3%
+  if (!pos.breakEvenSet && chg >= 0.003) {
+    positions[sym].stopPrice   = pos.entryPrice * 1.0001; // tiny buffer above entry
     positions[sym].breakEvenSet = true;
-    log('risk', `🔒 Break-even set: ${sym} SL → $${pos.entryPrice.toFixed(2)} (can't lose now)`);
-    await syncLog('sys', `🔒 Break-even locked for ${sym} @ $${pos.entryPrice.toFixed(2)}`);
-    await sendDiscordAlert('breakeven', sym, pos.qtyRemaining, price, undefined, 'BREAK_EVEN_SET');
+    log('risk', `🔒 ${sym} break-even locked @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
+    await syncLog('sys', `🔒 Break-even locked: ${sym} @ $${pos.entryPrice.toFixed(2)}`);
   }
 
-  // ── 4. TP1 — sell 33% at tp1Pct ──
-  if (!pos.tp1Hit && chg >= CONFIG.tp1Pct) {
-    const sell = Math.max(1, Math.floor((pos.qtyRemaining) * 0.33));
-    positions[sym].tp1Hit = true;
-    log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}%: selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
-    await partialExit(sym, price, sell, 'TP1');
-    if (!positions[sym]) return;
-    positions[sym].stopPrice = Math.max(pos.stopPrice, pos.entryPrice); // lock to BE after TP1
-    return;
-  }
-
-  // ── 5. TP2 — sell 50% of remainder (≈33% of original) at tp2Pct ──
-  if (pos.tp1Hit && !pos.tp2Hit && chg >= CONFIG.tp2Pct) {
-    const sell = Math.max(1, Math.floor(positions[sym].qtyRemaining * 0.5));
-    positions[sym].tp2Hit = true;
-    log('sell', `🎯🎯 TP2 +${(chg*100).toFixed(1)}%: selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
-    await partialExit(sym, price, sell, 'TP2');
-    if (!positions[sym]) return;
-    positions[sym].stopPrice = Math.max(positions[sym].stopPrice, price * 0.98); // tight 2% trail on runner
-    return;
-  }
-
-  // ── 6. TP3 — exit final runner at tp3Pct ──
-  if (pos.tp1Hit && pos.tp2Hit && chg >= CONFIG.tp3Pct) {
-    log('sell', `🎯🎯🎯 TP3 +${(chg*100).toFixed(1)}%: final exit ${sym} @ $${price.toFixed(2)}`);
-    return exitPosition(sym, price, 'TAKE_PROFIT');
-  }
-
-  // ── 7. Trailing stop on runner after partial exits ──
-  if (CONFIG.trailingStop && (pos.tp1Hit || pos.tp2Hit)) {
-    const trailPct = pos.tp2Hit ? 0.02 : CONFIG.trailingStopPct;
-    if ((pos.highWater - price) / pos.highWater >= trailPct) {
-      log('risk', `📉 Trail stop on runner: ${sym} hw=$${pos.highWater.toFixed(2)} → $${price.toFixed(2)}`);
-      return exitPosition(sym, price, 'TRAILING_STOP');
+  // Tier 2 — trail 0.8% below high water once up 1%
+  if (pos.breakEvenSet && hwChg >= 0.010 && !pos.tp1Hit) {
+    const trail = pos.highWater * (1 - 0.008);
+    if (trail > positions[sym].stopPrice) {
+      positions[sym].stopPrice = trail;
+      log('risk', `📈 ${sym} trail T2: stop → $${trail.toFixed(2)} (hw=$${pos.highWater.toFixed(2)})`);
     }
   }
 
-  // ── 8. Standard trailing stop (no TPs hit yet) ──
-  if (CONFIG.trailingStop && !pos.tp1Hit && pos.highWater > pos.entryPrice * (1 + CONFIG.breakEvenAt)) {
-    if ((pos.highWater - price) / pos.highWater >= CONFIG.trailingStopPct) {
-      log('risk', `📉 Trail stop: ${sym} hw=$${pos.highWater.toFixed(2)} → $${price.toFixed(2)}`);
-      return exitPosition(sym, price, 'TRAILING_STOP');
+  // Tier 3 — trail 1.5% below high water once up 2%
+  if (pos.breakEvenSet && hwChg >= 0.020 && !pos.tp1Hit) {
+    const trail = pos.highWater * (1 - 0.015);
+    if (trail > positions[sym].stopPrice) {
+      positions[sym].stopPrice = trail;
+      log('risk', `📈 ${sym} trail T3: stop → $${trail.toFixed(2)} (hw=$${pos.highWater.toFixed(2)})`);
     }
+  }
+
+  // Tier 4 — trail 2% below high water once up 4%+ (let runner breathe)
+  if (pos.breakEvenSet && hwChg >= 0.040 && !pos.tp1Hit) {
+    const trail = pos.highWater * (1 - 0.020);
+    if (trail > positions[sym].stopPrice) {
+      positions[sym].stopPrice = trail;
+      log('risk', `📈 ${sym} trail T4: stop → $${trail.toFixed(2)} (hw=$${pos.highWater.toFixed(2)})`);
+    }
+  }
+
+  // After TP1 — tighter trail on remaining shares (1.5%)
+  if (pos.tp1Hit && !pos.tp2Hit) {
+    const trail = pos.highWater * (1 - 0.015);
+    if (trail > positions[sym].stopPrice) {
+      positions[sym].stopPrice = trail;
+    }
+  }
+
+  // After TP2 — very tight trail on final runner (1%)
+  if (pos.tp1Hit && pos.tp2Hit) {
+    const trail = pos.highWater * (1 - 0.010);
+    if (trail > positions[sym].stopPrice) {
+      positions[sym].stopPrice = trail;
+    }
+  }
+
+  // Check if trailing stop was hit
+  if (pos.breakEvenSet && price <= positions[sym].stopPrice) {
+    const pct = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
+    const reason = price <= pos.entryPrice * 1.001 ? 'BREAK_EVEN_STOP' : 'TRAILING_STOP';
+    log('risk', `${reason === 'BREAK_EVEN_STOP' ? '🔒' : '📉'} ${sym} ${reason} @ $${price.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct}%)`);
+    return exitPosition(sym, price, reason);
   }
 
   // ── 9. Resistance exit — disabled in sim (SR levels unreliable with limited history) ──
