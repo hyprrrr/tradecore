@@ -839,14 +839,19 @@ async function poll(){
     .filter(pos => pos.side === 'SHORT')
     .reduce((sum, pos) => sum + (+pos.pnl || 0), 0);
 
-  // True equity = cash + all open position value
-  const trueEquity = cashVal > 0 ? +(cashVal + longVal + shortPnl).toFixed(2) : +p.total_value;
+  // True equity = cash + all open long position market value + short P&L
+  // Only use this if cash is a real non-zero value (not a stale/null DB read)
+  const trueEquity = cashVal > 100
+    ? +(cashVal + longVal + shortPnl).toFixed(2)
+    : +p.total_value;
 
-  const last    = equityHistory[equityHistory.length-1];
-  const change  = last ? (trueEquity - last) / last : 0;
-  const isSane  = trueEquity > startCap * 0.5 && trueEquity < startCap * 2.0;
-  // Only reject if value drops more than 5% in one poll — genuine crashes allowed
-  const isValid = !last || change > -0.05;
+  // Equity chart filter — reject values that spike or are clearly wrong
+  const last   = equityHistory[equityHistory.length-1];
+  const change = last ? (trueEquity - last) / last : 0;
+  const isSane = trueEquity > startCap * 0.5 && trueEquity < startCap * 1.5;
+  // Block spikes in EITHER direction beyond 2% per poll (3 second interval)
+  // Real P&L can't legitimately move 2% in 3 seconds on a diversified portfolio
+  const isValid = !last || (change > -0.02 && change < 0.02);
 
   if(isSane && isValid) {
     equityHistory.push(trueEquity);
@@ -854,8 +859,6 @@ async function poll(){
   }
   if(!equityLoaded){ equityLoaded=true; }
 
-  // Always update KPIs and positions (fast, important)
-  // Pass trueEquity so portfolio display uses same spike-free value as chart
   updateKPIs(p, posData, [], trueEquity);
   
   // Only re-render positions if they changed
@@ -922,18 +925,22 @@ function updateScreener(p){
 function getStartingCapital(){ try{ const s=JSON.parse(localStorage.getItem('tc_settings')||'{}'); if(s.startingCapital&&+s.startingCapital>0) return +s.startingCapital; }catch(e){} return 100000; }
 
 function updateKPIs(p, positions, trades, overrideEquity){
-  const equity   = overrideEquity || +p.total_value;
-  const cash     = +p.cash;
-  const dayPnl   = +p.day_pnl;
-  const wins     = +p.total_wins  || 0;
-  const losses   = +p.total_losses|| 0;
-  const total    = wins + losses;
-  const startCap = getStartingCapital();
+  const rawEquity = overrideEquity || +p.total_value;
+  const startCap  = getStartingCapital();
 
-  // Skip clearly broken values
+  // Use last known equity if current value looks like a spike
+  const lastKnown = equityHistory[equityHistory.length-1];
+  const equity = (lastKnown && lastKnown > 0 && Math.abs((rawEquity-lastKnown)/lastKnown) > 0.03)
+    ? lastKnown  // spike detected — show last stable value
+    : rawEquity; // looks normal — use current
+
   if (!equity || equity <= 0 || equity > 10000000) return;
 
-  // All-time P&L vs starting capital set in settings
+  const cash   = +p.cash;
+  const dayPnl = +p.day_pnl;
+  const wins   = +p.total_wins  || 0;
+  const losses = +p.total_losses|| 0;
+  const total  = wins + losses;
   const allTimePnl = equity - startCap;
   const allTimePct = startCap > 0 ? ((allTimePnl / startCap) * 100).toFixed(2) : '0.00';
 
