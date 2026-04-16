@@ -1355,9 +1355,7 @@ async function runSimScan() {
   if (!lastSnapshot) return;
   const barTime = lastBarTime;
 
-  // Sync positions with fresh bar prices — do this BEFORE portfolio sync
-  await syncPositions();
-  // (cash was reduced when buying, so add back full position value not just P&L)
+  // Calculate equity from fresh bar prices
   const positionMarketValue = Object.entries(positions).reduce((acc, [sym, pos]) => {
     const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
     return acc + cur * (pos.qtyRemaining || pos.qty);
@@ -1366,29 +1364,27 @@ async function runSimScan() {
     const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
     return acc + (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty);
   }, 0);
-  const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
-    return acc + (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
-  }, 0) + shortPnl;
-
   const equity = portfolio + positionMarketValue + shortPnl;
   const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
+  realEquity   = equity;
 
-  realEquity = equity;
-
-  await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
-    cash:            +portfolio.toFixed(2),
-    total_value:     +equity.toFixed(2),
-    day_pnl:         +dayPnl.toFixed(2),
-    total_wins:      totalWins,
-    total_losses:    totalLosses,
-    circuit_breaker: circuitBreakerOn,
-    last_scan:       new Date().toISOString(),
-    session:         `🎮 SIM [${barTime?.slice(11,16)||'?'}]`,
-    updated_at:      new Date().toISOString(),
-  });
-  // NOTE: sim does NOT write to tc_equity — would pollute real equity chart
-  await syncLog('sim', `🎮 SIM bar ${simState.cursor}/${simState.totalBars} | Equity=$${equity.toFixed(2)} P&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
+  // Write positions + portfolio in parallel — atomic so dashboard never sees mismatched state
+  await Promise.all([
+    syncPositions(),
+    sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+      cash:            +portfolio.toFixed(2),
+      total_value:     +equity.toFixed(2),
+      day_pnl:         +dayPnl.toFixed(2),
+      total_wins:      totalWins,
+      total_losses:    totalLosses,
+      circuit_breaker: circuitBreakerOn,
+      last_scan:       new Date().toISOString(),
+      session:         `🎮 SIM [${barTime?.slice(11,16)||'?'}]`,
+      updated_at:      new Date().toISOString(),
+    }),
+  ]);
+  // Log async — don't block the next bar
+  syncLog('sim', `🎮 SIM bar ${simState.cursor}/${simState.totalBars} | Equity=$${equity.toFixed(2)} P&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`).catch(()=>{});
 }
 
 async function getAccount() {
