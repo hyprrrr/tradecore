@@ -263,13 +263,41 @@ async function loadRemoteConfig() {
           await syncPositions();
 
         } else {
-          // Entering sim — snapshot current live state so we can restore it
-          log('sim', '🎮 Simulation mode ENABLED — loading bar data on next scan');
-          // Reset sim portfolio to starting capital for clean test
+          // Entering sim — full clean reset so every sim run starts fresh
+          log('sim', '🎮 Simulation mode ENABLED — resetting for fresh replay');
+
+          // Clear all in-memory positions and state
+          Object.keys(positions).forEach(k => delete positions[k]);
+          Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
+          Object.keys(scalpPositions).forEach(k => delete scalpPositions[k]);
+          pendingSignals.clear();
+          totalWins = 0; totalLosses = 0;
+          tradePerformanceLog = [];
+          circuitBreakerOn = false;
+          wsSubscribed.clear(); // don't stream live prices during sim
+
+          // Reset portfolio to starting capital
           portfolio            = CONFIG.startingCapital;
           realEquity           = CONFIG.startingCapital;
           realDailyStartEquity = CONFIG.startingCapital;
-          circuitBreakerOn     = false;
+
+          // Force bar reload on next sim scan
+          simState.loaded  = false;
+          simState.cursor  = 0;
+          simState.bars    = {};
+
+          // Wipe sim Supabase tables so dashboard shows clean state
+          await sbFetch('sim_tc_positions?symbol=neq.____NONE____', 'DELETE').catch(()=>{});
+          await sbFetch('sim_tc_trades?id=gt.0', 'DELETE').catch(()=>{});
+          await sbFetch('sim_tc_logs?id=gt.0', 'DELETE').catch(()=>{});
+          await sbFetch('sim_tc_portfolio?id=eq.1', 'PATCH', {
+            cash: CONFIG.startingCapital, total_value: CONFIG.startingCapital,
+            day_pnl: 0, total_wins: 0, total_losses: 0,
+            circuit_breaker: false, session: '🎮 SIM LOADING…',
+            updated_at: new Date().toISOString(),
+          }).catch(()=>{});
+
+          log('sim', `🎮 Sim reset complete — portfolio=$${CONFIG.startingCapital.toFixed(2)}`);
         }
       }
     }
@@ -1803,9 +1831,25 @@ function simAdvanceCursor() {
   if (!simState.loaded) return null;
 
   if (simState.cursor >= simState.totalBars - 20) {
-    // End of replay — loop back to start (or stop)
-    log('sim', '🎮 Bar replay reached end — looping back to start');
-    simState.cursor = 20; // start with enough history for indicators
+    // End of replay — fully reset so next run starts clean
+    log('sim', '🎮 Bar replay complete — resetting for next run');
+    simState.cursor = 20;
+
+    // Clear all open positions so they don't carry over
+    Object.keys(positions).forEach(k => delete positions[k]);
+    Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
+    pendingSignals.clear();
+    portfolio = CONFIG.startingCapital;
+    realDailyStartEquity = CONFIG.startingCapital;
+    totalWins = 0; totalLosses = 0;
+
+    // Clear sim positions from Supabase
+    sbFetch('sim_tc_positions?symbol=neq.____NONE____', 'DELETE').catch(()=>{});
+    sbFetch('sim_tc_portfolio?id=eq.1', 'PATCH', {
+      cash: CONFIG.startingCapital, total_value: CONFIG.startingCapital,
+      day_pnl: 0, total_wins: 0, total_losses: 0,
+      session: '🎮 SIM RESET', updated_at: new Date().toISOString(),
+    }).catch(()=>{});
   }
 
   simState.cursor++;
