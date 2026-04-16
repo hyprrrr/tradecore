@@ -830,8 +830,15 @@ function updateKPIs(p, positions, trades){
   const total    = wins + losses;
   const startCap = getStartingCapital();
 
-  // Only skip if values are clearly broken (negative or absurdly large)
+  // Skip clearly broken values
   if (!equity || equity <= 0 || equity > 10000000) return;
+
+  // Sanity check — reject values that jump >25% from last known good value
+  // This prevents brief wrong states from rendering during sim bar transitions
+  const lastKnown = equityHistory[equityHistory.length-1];
+  if (lastKnown && lastKnown > 0 && Math.abs((equity - lastKnown) / lastKnown) > 0.25) {
+    return; // skip this poll — wait for consistent value
+  }
 
   // All-time P&L vs starting capital set in settings
   const allTimePnl = equity - startCap;
