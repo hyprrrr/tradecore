@@ -741,18 +741,17 @@ async function poll(){
 
   // Build equity history from live portfolio total_value on every poll
   // This is simpler and more reliable than reading from tc_equity database
-  // Filter: only add if value is sane (within 10% of last known value or first point)
+  // Build equity history from poll data with strict spike filter
+  // 2% max change per poll (3s interval) eliminates all position-entry spikes
   const rawEquity = +p.total_value;
   const startCap  = getStartingCapital();
-  if(rawEquity > startCap * 0.5 && rawEquity < startCap * 2) {
+  if(rawEquity > startCap * 0.7 && rawEquity < startCap * 1.5) {
     const last = equityHistory[equityHistory.length-1];
-    // Only add if no previous value, or change is less than 10% (filters out spikes)
-    if(!last || Math.abs((rawEquity - last) / last) < 0.10) {
+    if(!last || Math.abs((rawEquity - last) / last) < 0.02) {
       equityHistory.push(+rawEquity.toFixed(2));
       if(equityHistory.length > 500) equityHistory.shift();
     }
   }
-  // Reset chart on sim toggle (equityHistory gets cleared in onModeChange)
   if(!equityLoaded){ equityLoaded=true; }
 
   // Always update KPIs and positions (fast, important)
