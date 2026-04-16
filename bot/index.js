@@ -69,7 +69,21 @@ const CONFIG = {
   maxDailyLossPct:  +(process.env.MAX_DAILY_LOSS    || 3)  / 100,
 
   // Advanced exit config
-  breakEvenAt:       +(process.env.BREAK_EVEN_AT     || 2)  / 100, // move SL to entry once up X%
+  breakEvenAt:       +(process.env.BREAK_EVEN_AT     || 0.3)  / 100,
+  trailT2At:         0.010,  // trail 0.8% once up 1%
+  trailT3At:         0.020,  // trail 1.5% once up 2%
+  trailT4At:         0.040,  // trail 2.0% once up 4%
+  minConfidence:     60,
+  adaptTargetWR:     0.60,
+  adaptEmergencyWR:  0.40,
+  confirmCount:      4,
+  peakMinProfit:     0.020,  // 2% min profit before peak detection runs
+  peakSignalsReq:    2,      // signals needed for peak exit
+  peakRsiExit:       80,     // RSI level for immediate exit
+  fadeMinProfit:     0.020,  // 2% min profit before fade exit
+  fadePullback:      0.020,  // 2% pullback from high triggers fade exit
+  hardMaxLoss:       0.030,  // 3% max loss per trade (hard ceiling)
+  initialStopPct:    0.020,  // 2% initial stop before break-even // move SL to entry once up X%
   tp1Pct:            +(process.env.TP1_PCT           || 4)  / 100, // sell 33% here
   tp2Pct:            +(process.env.TP2_PCT           || 8)  / 100, // sell 33% here
   tp3Pct:            +(process.env.TP3_PCT           || 14) / 100, // sell final 34% here
@@ -146,6 +160,21 @@ async function loadRemoteConfig() {
     if (s.tp2_pct)          CONFIG.tp2Pct           = +s.tp2_pct / 100;
     if (s.tp3_pct)          CONFIG.tp3Pct           = +s.tp3_pct / 100;
     if (s.break_even_at)    CONFIG.breakEvenAt      = +s.break_even_at / 100;
+    if (s.trail_t2_at)      CONFIG.trailT2At        = +s.trail_t2_at / 100;
+    if (s.trail_t3_at)      CONFIG.trailT3At        = +s.trail_t3_at / 100;
+    if (s.trail_t4_at)      CONFIG.trailT4At        = +s.trail_t4_at / 100;
+    if (s.min_confidence)   CONFIG.minConfidence     = +s.min_confidence;
+    if (s.adapt_target_wr)  CONFIG.adaptTargetWR     = +s.adapt_target_wr / 100;
+    if (s.adapt_emergency_wr) CONFIG.adaptEmergencyWR = +s.adapt_emergency_wr / 100;
+    if (s.confirm_count)    CONFIG.confirmCount      = +s.confirm_count;
+    if (s.peak_min_profit)  CONFIG.peakMinProfit     = +s.peak_min_profit / 100;
+    if (s.peak_signals_req) CONFIG.peakSignalsReq    = +s.peak_signals_req;
+    if (s.peak_rsi_exit)    CONFIG.peakRsiExit       = +s.peak_rsi_exit;
+    if (s.fade_min_profit)  CONFIG.fadeMinProfit     = +s.fade_min_profit / 100;
+    if (s.fade_pullback)    CONFIG.fadePullback      = +s.fade_pullback / 100;
+    if (s.hard_max_loss)    CONFIG.hardMaxLoss       = +s.hard_max_loss / 100;
+    if (s.initial_stop_pct) CONFIG.initialStopPct    = +s.initial_stop_pct / 100;
+    if (s.atr_stop_mult)    CONFIG.atrStopMult       = +s.atr_stop_mult;
     if (s.discord_webhook)  CONFIG.discordWebhook   = s.discord_webhook;
     if (s.trend_filter      !== undefined) CONFIG.trendFilter       = !!s.trend_filter;
     if (s.volume_filter     !== undefined) CONFIG.volumeFilter      = !!s.volume_filter;
@@ -287,8 +316,8 @@ const CORRELATION_GROUPS = [
 //   - Emergency mode triggers instantly if win rate drops below 40%
 // ═══════════════════════════════════════════════════════════════════
 
-const ADAPT_TARGET_WR   = 0.60; // target win rate
-const ADAPT_EMERGENCY   = 0.40; // emergency mode threshold
+const ADAPT_TARGET_WR   = CONFIG.adaptTargetWR || 0.60; // target win rate
+const ADAPT_EMERGENCY   = CONFIG.adaptEmergencyWR || 0.40; // emergency mode threshold
 const ADAPT_ALPHA       = 0.3;  // EMA weight for recent trades (higher = more reactive)
 
 const ADAPT_DEFAULTS = {
@@ -671,11 +700,25 @@ async function runAdaptiveTuning() {
   // Save to Supabase
   try {
     await sbFetch('tc_settings?id=eq.1', 'PATCH', {
-      rsi_oversold:     CONFIG.rsiOversold,
-      rsi_overbought:   CONFIG.rsiOverbought,
-      max_position_pct: +(CONFIG.maxPositionPct * 100).toFixed(1),
-      atr_stop_mult:    CONFIG.atrStopMult,
-      updated_at:       new Date().toISOString(),
+      rsi_oversold:       CONFIG.rsiOversold,
+      rsi_overbought:     CONFIG.rsiOverbought,
+      max_position_pct:   +(CONFIG.maxPositionPct * 100).toFixed(1),
+      atr_stop_mult:      CONFIG.atrStopMult,
+      min_confidence:     CONFIG.minConfidence,
+      tp1_pct:            +(CONFIG.tp1Pct * 100).toFixed(1),
+      tp2_pct:            +(CONFIG.tp2Pct * 100).toFixed(1),
+      tp3_pct:            +(CONFIG.tp3Pct * 100).toFixed(1),
+      break_even_at:      +(CONFIG.breakEvenAt * 100).toFixed(2),
+      trail_t2_at:        +(CONFIG.trailT2At * 100).toFixed(2),
+      trail_t3_at:        +(CONFIG.trailT3At * 100).toFixed(2),
+      trail_t4_at:        +(CONFIG.trailT4At * 100).toFixed(2),
+      peak_min_profit:    +(CONFIG.peakMinProfit * 100).toFixed(2),
+      peak_signals_req:   CONFIG.peakSignalsReq,
+      peak_rsi_exit:      CONFIG.peakRsiExit,
+      fade_min_profit:    +(CONFIG.fadeMinProfit * 100).toFixed(2),
+      fade_pullback:      +(CONFIG.fadePullback * 100).toFixed(2),
+      hard_max_loss:      +(CONFIG.hardMaxLoss * 100).toFixed(2),
+      updated_at:         new Date().toISOString(),
     });
     await syncLog('adapt', `🧠 Adapted | ${summary} | ${JSON.stringify(changes)}`);
   } catch(e) {}
@@ -2094,7 +2137,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     // Use 1× ATR as initial stop — tight enough to limit loss, wide enough to avoid noise
     const atrStop   = price - (atrVal14 * Math.min(CONFIG.atrStopMult, 1.5));
     // Hard cap: never risk more than 2% on initial stop
-    const capStop   = price * (1 - 0.02);
+    const capStop   = price * (1 - (CONFIG.initialStopPct || 0.02));
     // In sim: minimum 1.5% stop to avoid being shaken by bar spread
     const simFloor  = isSimMode() ? price * (1 - 0.015) : atrStop;
     const stopPrice = Math.max(atrStop, capStop, isSimMode() ? simFloor : capStop);
@@ -2155,7 +2198,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     // SHORT entry — tighter initial stop, break-even locks at +0.3% move
     const atrVal14s = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.02;
     const atrStopS  = price + (atrVal14s * Math.min(CONFIG.atrStopMult, 1.5));
-    const capStopS  = price * (1 + 0.02); // hard cap 2% max initial risk
+    const capStopS  = price * (1 + (CONFIG.initialStopPct || 0.02)); // hard cap 2% max initial risk
     const simCeilS  = isSimMode() ? price * (1 + 0.015) : atrStopS;
     const stopPrice = Math.min(atrStopS, capStopS, isSimMode() ? simCeilS : capStopS);
 
@@ -2242,7 +2285,7 @@ async function manageShort(sym, price, bars) {
 
   // ── IMMEDIATE PROFIT LOCK + TRAILING STOP (shorts — inverted) ──
   // Tier 1 (0.3%+): lock break-even — stop moves to entry, can't lose
-  if (!pos.breakEvenSet && chg >= 0.003) {
+  if (!pos.breakEvenSet && chg >= CONFIG.breakEvenAt) {
     shortPositions[sym].stopPrice   = pos.entryPrice * 0.9999;
     shortPositions[sym].breakEvenSet = true;
     log('risk', `🔒 ${sym} short break-even locked @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
@@ -2451,11 +2494,11 @@ function detectPeak(sym, bars, pos) {
     const priceHigh5ag = Math.max(...highs.slice(-10, -5));
     if (priceHigh > priceHigh5ag * 1.001 && rsiNow < rsi5ago - 3) {
       signals.push(`RSI divergence (price ↑ RSI ${rsiNow.toFixed(0)} < ${rsi5ago.toFixed(0)})`);
-      if (rsiNow > 70) urgency = 'immediate'; // overbought + divergence = strong sell signal
+      if (rsiNow > (CONFIG.peakRsiExit || 80) - 10) urgency = 'immediate';
     }
     // Overbought RSI alone is a warning
-    if (rsiNow > 75) signals.push(`RSI overbought ${rsiNow.toFixed(0)}`);
-    if (rsiNow > 80) urgency = 'immediate';
+    if (rsiNow > (CONFIG.peakRsiExit || 80) - 5) signals.push(`RSI overbought ${rsiNow.toFixed(0)}`);
+    if (rsiNow > (CONFIG.peakRsiExit || 80)) urgency = 'immediate';
   }
 
   // ── 2. VOLUME EXHAUSTION ───────────────────────────────────────
@@ -2577,7 +2620,7 @@ async function managePosition(sym, price, bars) {
   }
 
   // Hard max loss safety net — never lose more than 3% on any trade under any circumstance
-  if (chg <= -0.03) {
+  if (chg <= -CONFIG.hardMaxLoss) {
     log('risk', `🛑 ${sym} hard max loss -3% triggered @ $${price.toFixed(2)}`);
     return exitPosition(sym, price, 'STOP_LOSS');
   }
@@ -2604,7 +2647,7 @@ async function managePosition(sym, price, bars) {
   }
 
   // Tier 2 — trail 0.8% below high water once up 1%
-  if (pos.breakEvenSet && hwChg >= 0.010 && !pos.tp1Hit) {
+  if (pos.breakEvenSet && hwChg >= CONFIG.trailT2At && !pos.tp1Hit) {
     const trail = pos.highWater * (1 - 0.008);
     if (trail > positions[sym].stopPrice) {
       positions[sym].stopPrice = trail;
@@ -2613,7 +2656,7 @@ async function managePosition(sym, price, bars) {
   }
 
   // Tier 3 — trail 1.5% below high water once up 2%
-  if (pos.breakEvenSet && hwChg >= 0.020 && !pos.tp1Hit) {
+  if (pos.breakEvenSet && hwChg >= CONFIG.trailT3At && !pos.tp1Hit) {
     const trail = pos.highWater * (1 - 0.015);
     if (trail > positions[sym].stopPrice) {
       positions[sym].stopPrice = trail;
@@ -2622,7 +2665,7 @@ async function managePosition(sym, price, bars) {
   }
 
   // Tier 4 — trail 2% below high water once up 4%+ (let runner breathe)
-  if (pos.breakEvenSet && hwChg >= 0.040 && !pos.tp1Hit) {
+  if (pos.breakEvenSet && hwChg >= CONFIG.trailT4At && !pos.tp1Hit) {
     const trail = pos.highWater * (1 - 0.020);
     if (trail > positions[sym].stopPrice) {
       positions[sym].stopPrice = trail;
@@ -2655,37 +2698,26 @@ async function managePosition(sym, price, bars) {
   }
 
   // ── Momentum fade exit — catches peaks before full trail triggers ──
-  // Detects 3 consecutive red bars while already pulled back 1%+ from high water
-  if (pos.breakEvenSet && bars && bars.length >= 5 && chg > 0) {
+  // Requires: already up 2%+, pulled back 2%+ from high, 3 consecutive red bars
+  if (pos.breakEvenSet && bars && bars.length >= 5 && chg >= CONFIG.fadeMinProfit) {
     const last3 = bars.slice(-3).map(b => b.c);
     const fallingBars = last3[2] < last3[1] && last3[1] < last3[0];
     const fromHW = (pos.highWater - price) / pos.highWater;
-    if (fallingBars && fromHW >= 0.010) {
+    if (fallingBars && fromHW >= CONFIG.fadePullback) {
       log('sell', `📉 ${sym} momentum fade: ${(fromHW*100).toFixed(1)}% from peak, 3 red bars — exiting at profit`);
       return exitPosition(sym, price, 'TRAILING_STOP');
     }
   }
 
-  // ── PEAK DETECTION — exit immediately when multiple reversal signals fire ──
-  if (pos.breakEvenSet && chg > 0.005 && bars && bars.length >= 10) {
+  // ── PEAK DETECTION — exit when strong reversal signals fire at meaningful profit ──
+  // Only runs when trade is up 2%+ to avoid exiting early on small moves
+  if (pos.breakEvenSet && chg >= CONFIG.peakMinProfit && bars && bars.length >= 10) {
     const peak = detectPeak(sym, bars, pos);
-    if (peak.isPeak) {
-      if (peak.urgency === 'immediate') {
-        // Strong reversal signal — exit entire position at market immediately
-        log('sell', `🔔 PEAK EXIT ${sym} @ $${price.toFixed(2)} (+${(chg*100).toFixed(2)}%) — ${peak.signals.slice(0,2).join(', ')}`);
-        await syncLog('sell', `🔔 Peak exit: ${sym} @ $${price.toFixed(2)} | ${peak.signals.join(' | ')}`);
-        return exitPosition(sym, price, 'PEAK_EXIT');
-      } else if (peak.signals.length >= 2 && !pos.tp1Hit) {
-        // Warning level — sell partial (33%) to lock in some profit
-        const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.33));
-        log('sell', `⚠️ PEAK WARNING ${sym} — selling ${sell} shares to lock profit`);
-        positions[sym].tp1Hit = true; // treat as TP1 so we don't re-trigger
-        await partialExit(sym, price, sell, 'PEAK_PARTIAL');
-        if (!positions[sym]) return;
-        // Tighten trailing stop after partial peak exit
-        positions[sym].stopPrice = Math.max(positions[sym].stopPrice, price * 0.992);
-        return;
-      }
+    // Only act on immediate urgency with 2+ signals — avoids hair-trigger exits
+    if (peak.isPeak && peak.urgency === 'immediate' && peak.signals.length >= CONFIG.peakSignalsReq) {
+      log('sell', `🔔 PEAK EXIT ${sym} @ $${price.toFixed(2)} (+${(chg*100).toFixed(2)}%) — ${peak.signals.slice(0,2).join(', ')}`);
+      await syncLog('sell', `🔔 Peak exit: ${sym} @ $${price.toFixed(2)} | ${peak.signals.join(' | ')}`);
+      return exitPosition(sym, price, 'PEAK_EXIT');
     }
   }
 
@@ -3778,8 +3810,8 @@ function confirmSignal(sym, sig) {
     prev.sigInfo = sig;
     pendingSignals.set(sym, prev);
 
-    // Shorts need 5 consecutive confirmations (~75s), longs need 4 (~60s)
-    const required = sig.signal === 'SELL' ? 5 : 4;
+    // Shorts need 5 consecutive confirmations (~75s), longs need CONFIG.confirmCount
+    const required = sig.signal === 'SELL' ? 5 : (CONFIG.confirmCount || 4);
 
     if (prev.count >= required) {
       pendingSignals.delete(sym);
