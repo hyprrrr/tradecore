@@ -101,7 +101,7 @@ const CONFIG = {
   scanIntervalMin: +(process.env.SCAN_INTERVAL_MIN || 5),
 
   // ── Mode controls (overridden by dashboard via Supabase) ──
-  swingEnabled:        process.env.SWING_ENABLED !== 'false',
+  positionTradingEnabled: process.env.POSITION_TRADING === 'true',
   scalpMode:           process.env.SCALP_MODE === 'true',
   shortsEnabled:       process.env.ENABLE_SHORTS === 'true',
   minConfidence:       +(process.env.MIN_CONFIDENCE || 60), // adaptive — auto-adjusted by learning engine
@@ -182,9 +182,10 @@ async function loadRemoteConfig() {
     if (s.correlation_filter !== undefined) CONFIG.correlationFilter = !!s.correlation_filter;
 
     // Mode flags — controlled from dashboard
-    if (s.swing_enabled  !== undefined) CONFIG.swingEnabled  = !!s.swing_enabled;
-    if (s.scalp_mode     !== undefined) CONFIG.scalpMode     = !!s.scalp_mode;
-    if (s.shorts_enabled !== undefined) CONFIG.shortsEnabled = !!s.shorts_enabled;
+    if (s.swing_enabled  !== undefined) CONFIG.swingEnabled          = !!s.swing_enabled;
+    if (s.scalp_mode     !== undefined) CONFIG.scalpMode             = !!s.scalp_mode;
+    if (s.shorts_enabled !== undefined) CONFIG.shortsEnabled         = !!s.shorts_enabled;
+    if (s.position_trading !== undefined) CONFIG.positionTradingEnabled = !!s.position_trading;
     if (s.sim_mode !== undefined) {
       const newMode = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
       if (newMode !== CONFIG.mode) {
@@ -747,6 +748,209 @@ async function runAdaptiveTuning() {
 
 // ═══════════════════════════════════════════════════════════════════
 // END ADAPTIVE LEARNING ENGINE v2
+// ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+// POSITION TRADING ENGINE
+// ═══════════════════════════════════════════════════════════════════
+
+const SECTOR_ETFS = {
+  AAPL:'QQQ',MSFT:'QQQ',NVDA:'QQQ',TSLA:'QQQ',META:'QQQ',GOOGL:'QQQ',AMZN:'QQQ',
+  JPM:'XLF',BAC:'XLF',GS:'XLF',MS:'XLF',WFC:'XLF',
+  XOM:'XLE',CVX:'XLE',SLB:'XLE',OXY:'XLE',
+  JNJ:'XLV',PFE:'XLV',UNH:'XLV',ABBV:'XLV',
+  WMT:'XLP',COST:'XLP',PG:'XLP',
+  CAT:'XLI',BA:'XLI',GE:'XLI',
+  DEFAULT:'SPY',
+};
+function getSectorEtf(sym){ return SECTOR_ETFS[sym]||SECTOR_ETFS.DEFAULT; }
+
+let positionTrades = {};
+
+const PT_CONFIG = {
+  maxPositions:3, maxPosPct:0.10, initialStopPct:0.08, trailStopPct:0.08,
+  tp1Pct:0.15, tp2Pct:0.25, tp3Pct:0.40, reassessDays:30, flatThreshold:0.03,
+};
+
+async function fetchDailyBars(sym, days=250) {
+  try {
+    const end   = new Date().toISOString().split("T")[0];
+    const start = new Date(Date.now()-days*86400000).toISOString().split("T")[0];
+    const url   = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=1Day&start=${start}&end=${end}&limit=${days}&feed=iex`;
+    const data  = await alpacaFetch(url);
+    return (data?.bars||[]).map(b=>({t:b.t,o:b.o,h:b.h,l:b.l,c:b.c,v:b.v||0}));
+  } catch(e){ return []; }
+}
+
+async function generatePositionSignal(sym) {
+  const [daily, sector] = await Promise.all([fetchDailyBars(sym,250), fetchDailyBars(getSectorEtf(sym),250)]);
+  if (daily.length < 200) return { signal:'HOLD', reason:'Insufficient history' };
+
+  const closes  = daily.map(b=>b.c);
+  const volumes = daily.map(b=>b.v);
+  const price   = closes[closes.length-1];
+
+  const ma50   = closes.slice(-50).reduce((a,b)=>a+b,0)/50;
+  const ma200  = closes.slice(-200).reduce((a,b)=>a+b,0)/200;
+  const pma50  = closes.slice(-51,-1).reduce((a,b)=>a+b,0)/50;
+  const pma200 = closes.slice(-201,-1).reduce((a,b)=>a+b,0)/200;
+
+  const goldenCross = ma50 > ma200;
+  const freshGolden = pma50 <= pma200 && ma50 > ma200;
+  const aboveMa50   = price > ma50;
+  const aboveMa200  = price > ma200;
+
+  const wkCloses = closes.filter((_,i)=>i%5===0);
+  const weeklyRSI = rsi(wkCloses, 14);
+
+  const avgVol20  = volumes.slice(-20).reduce((a,b)=>a+b,0)/20;
+  const avgVol5   = volumes.slice(-5).reduce((a,b)=>a+b,0)/5;
+  const volExpand = avgVol5 > avgVol20*1.1;
+
+  const ma200_30ago = closes.slice(-230,-30).reduce((a,b)=>a+b,0)/200;
+  const maSlope     = (ma200-ma200_30ago)/ma200_30ago;
+
+  let sectorBull = false;
+  if (sector.length>=200) {
+    const sc=sector.map(b=>b.c);
+    sectorBull = sc.slice(-50).reduce((a,b)=>a+b,0)/50 > sc.slice(-200).reduce((a,b)=>a+b,0)/200
+              && sc[sc.length-1] > sc.slice(-50).reduce((a,b)=>a+b,0)/50;
+  }
+
+  let relStrength = false;
+  if (sector.length>=20) {
+    const sRet = (sector[sector.length-1].c-sector[sector.length-20].c)/sector[sector.length-20].c;
+    const pRet = (price-closes[closes.length-20])/closes[closes.length-20];
+    relStrength = pRet > sRet+0.02;
+  }
+
+  if (!aboveMa200)    return { signal:'HOLD', reason:`Below 200d MA ($${ma200.toFixed(0)})` };
+  if (ma50 < ma200)   return { signal:'HOLD', reason:`Death cross — 50d < 200d` };
+  if (weeklyRSI > 75) return { signal:'HOLD', reason:`Weekly RSI overbought (${weeklyRSI.toFixed(0)})` };
+  if (weeklyRSI < 35) return { signal:'HOLD', reason:`Weekly RSI oversold (${weeklyRSI.toFixed(0)})` };
+
+  const reasons = [];
+  let score = 0;
+  if (goldenCross)    { score+=3; reasons.push(`Golden cross: MA50=$${ma50.toFixed(0)} > MA200=$${ma200.toFixed(0)} ✅`); }
+  if (freshGolden)    { score+=2; reasons.push(`Fresh golden cross 🔥`); }
+  if (aboveMa50)      { score+=1; reasons.push(`Above 50d MA ✅`); }
+  if (maSlope>0.01)   { score+=1; reasons.push(`200d MA rising ✅`); }
+  if (volExpand)      { score+=1; reasons.push(`Volume expanding (${(avgVol5/avgVol20).toFixed(1)}x) ✅`); }
+  if (sectorBull)     { score+=2; reasons.push(`Sector (${getSectorEtf(sym)}) bullish ✅`); }
+  if (relStrength)    { score+=2; reasons.push(`Outperforming sector ✅`); }
+  if (weeklyRSI>=50&&weeklyRSI<=65) { score+=1; reasons.push(`Weekly RSI ${weeklyRSI.toFixed(0)} healthy ✅`); }
+
+  if (score < 7) return { signal:'HOLD', score, reason:`Score ${score} < 7 required`, reasons };
+
+  return {
+    signal:'BUY', score, price, ma50, ma200, weeklyRSI,
+    stopPrice: price*(1-PT_CONFIG.initialStopPct),
+    reasons,
+    summary:`Score ${score} | MA50=$${ma50.toFixed(0)} MA200=$${ma200.toFixed(0)} | Stop $${(price*0.92).toFixed(0)} | Target $${(price*1.40).toFixed(0)}`,
+  };
+}
+
+async function managePositionTrades() {
+  if (!CONFIG.positionTradingEnabled) return;
+  if (isSimMode() || !isWeekday()) return;
+
+  for (const [sym, pos] of Object.entries(positionTrades)) {
+    const bars = await fetchDailyBars(sym, 250);
+    if (!bars.length) continue;
+    const closes = bars.map(b=>b.c);
+    const price  = closes[closes.length-1];
+    const chg    = (price-pos.entryPrice)/pos.entryPrice;
+    const ma50   = closes.slice(-50).reduce((a,b)=>a+b,0)/50;
+    const ma200  = closes.slice(-200).reduce((a,b)=>a+b,0)/200;
+    const days   = Math.floor((Date.now()-new Date(pos.entryDate).getTime())/86400000);
+
+    if (price > pos.highWater) positionTrades[sym].highWater = price;
+    const trail = pos.highWater*(1-PT_CONFIG.trailStopPct);
+    if (trail > positionTrades[sym].stopPrice) positionTrades[sym].stopPrice = trail;
+
+    if (ma50 < ma200)         { await exitPositionTrade(sym,price,'DEATH_CROSS'); continue; }
+    if (price < ma200*0.99)   { await exitPositionTrade(sym,price,'TREND_BROKEN'); continue; }
+    if (price <= positionTrades[sym].stopPrice) { await exitPositionTrade(sym,price,chg>0?'TRAIL_STOP_PROFIT':'STOP_LOSS'); continue; }
+
+    if (!pos.tp1Hit && chg >= PT_CONFIG.tp1Pct) {
+      const qty = Math.max(1,Math.floor(pos.qty*0.33));
+      positionTrades[sym].tp1Hit = true;
+      positionTrades[sym].qty -= qty;
+      positionTrades[sym].stopPrice = Math.max(positionTrades[sym].stopPrice, pos.entryPrice);
+      await placeOrder(sym,qty,'sell');
+      const pnl = qty*(price-pos.entryPrice);
+      await syncTrade({sym,side:'PT_TP1',qty,price,pnl,reason:'PT_TP1'});
+      await syncLog('position',`🎯 PT TP1: ${sym} +${(chg*100).toFixed(1)}% P&L=+$${pnl.toFixed(2)}`);
+      log('position',`🎯 ${sym} PT-TP1 +${(chg*100).toFixed(1)}% selling ${qty}x`);
+    }
+    if (pos.tp1Hit && !pos.tp2Hit && chg >= PT_CONFIG.tp2Pct) {
+      const qty = Math.max(1,Math.floor(positionTrades[sym].qty*0.5));
+      positionTrades[sym].tp2Hit = true; positionTrades[sym].qty -= qty;
+      await placeOrder(sym,qty,'sell');
+      const pnl = qty*(price-pos.entryPrice);
+      await syncTrade({sym,side:'PT_TP2',qty,price,pnl,reason:'PT_TP2'});
+      log('position',`🎯🎯 ${sym} PT-TP2 +${(chg*100).toFixed(1)}% selling ${qty}x`);
+    }
+    if (pos.tp1Hit && pos.tp2Hit && chg >= PT_CONFIG.tp3Pct) {
+      await exitPositionTrade(sym,price,'PT_TAKE_PROFIT'); continue;
+    }
+    if (days >= PT_CONFIG.reassessDays && Math.abs(chg) < PT_CONFIG.flatThreshold) {
+      const sig = await generatePositionSignal(sym);
+      if (sig.signal !== 'BUY') { await exitPositionTrade(sym,price,'TIME_REASSESS'); }
+      else log('position',`✅ ${sym} reassessment passed — holding`);
+      continue;
+    }
+    log('position',`📊 PT ${sym} ${chg>=0?"+":""}${(chg*100).toFixed(1)}% day${days} stop=$${positionTrades[sym].stopPrice.toFixed(0)}`);
+  }
+
+  if (Object.keys(positionTrades).length >= PT_CONFIG.maxPositions) return;
+
+  const scanList = [...new Set([...CONFIG.symbols,'AAPL','MSFT','NVDA','AMZN','GOOGL','META','JPM','UNH','XOM','WMT'])];
+  for (const sym of scanList) {
+    if (positionTrades[sym]||positions[sym]||shortPositions[sym]) continue;
+    if (Object.keys(positionTrades).length >= PT_CONFIG.maxPositions) break;
+    const sig = await generatePositionSignal(sym);
+    if (sig.signal !== 'BUY') continue;
+
+    const qty = Math.max(1,Math.floor(portfolio*PT_CONFIG.maxPosPct/sig.price));
+    positionTrades[sym] = { entryPrice:sig.price, qty, entryDate:new Date().toISOString(), highWater:sig.price, stopPrice:sig.stopPrice, tp1Hit:false, tp2Hit:false, score:sig.score };
+    portfolio -= qty*sig.price;
+    await placeOrder(sym,qty,'buy');
+    await syncTrade({sym,side:'PT_BUY',qty,price:sig.price,pnl:null,reason:'POSITION_TRADE'});
+    await syncLog('position',`📈 Position Trade: ${sym} @ $${sig.price.toFixed(2)} | ${sig.reasons?.slice(0,3).join(' | ')}`);
+    log('position',`📈 POSITION TRADE: ${sym} @ $${sig.price.toFixed(2)} qty=${qty} | ${sig.summary}`);
+
+    if (CONFIG.discordWebhook) {
+      const fetch = await getFetch();
+      fetch(CONFIG.discordWebhook,{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({embeds:[{title:`📈 Position Trade Opened: ${sym}`,color:0x7fff6e,
+          fields:[
+            {name:'Entry',value:`$${sig.price.toFixed(2)}`,inline:true},
+            {name:'Qty',value:String(qty),inline:true},
+            {name:'Stop',value:`$${sig.stopPrice.toFixed(0)} (-8%)`,inline:true},
+            {name:'Targets',value:`+15% / +25% / +40%`,inline:false},
+            {name:'Why',value:sig.reasons?.slice(0,4).join("\n")||"—",inline:false},
+          ],footer:{text:`Score ${sig.score} | Hold weeks-months`},timestamp:new Date().toISOString(),
+        }]})}).catch(()=>{});
+    }
+  }
+}
+
+async function exitPositionTrade(sym, price, reason) {
+  const pos = positionTrades[sym];
+  if (!pos) return;
+  const pnl = (price-pos.entryPrice)*pos.qty;
+  await placeOrder(sym,pos.qty,'sell');
+  portfolio += pos.qty*price;
+  delete positionTrades[sym];
+  pnl > 0 ? totalWins++ : totalLosses++;
+  log('position',`${pnl>0?"✅":"🛑"} PT EXIT ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?"+":""}$${pnl.toFixed(2)} (${reason})`);
+  await syncTrade({sym,side:'PT_SELL',qty:pos.qty,price,pnl,reason});
+  await syncLog('position',`${pnl>0?"✅":"🛑"} Position Trade Closed: ${sym} P&L=${pnl>=0?"+":""}$${pnl.toFixed(2)} (${reason})`);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// END POSITION TRADING ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
 // ─────────────────────────────────────────────
@@ -1712,7 +1916,7 @@ async function runSimScan() {
       const price = bars5m[bars5m.length - 1].c;
       priceHistory5m[sym] = bars5m.map(b => b.c);
 
-      let sig = generateSignal(sym, bars5m, bars15m.length >= 10 ? bars15m : null);
+      let sig = generateSignalByStrategy(sym, bars5m, bars15m.length >= 10 ? bars15m : null) || generateSignal(sym, bars5m, bars15m.length >= 10 ? bars15m : null);
       sig = applyDayBias(sig);
 
       if (sig.signal !== 'HOLD') {
@@ -1871,6 +2075,497 @@ function adx(bars, period = 14) {
 //   6. ADX must show trending conditions — no ranging markets
 //   7. Reward:Risk must be at least 2:1 before entering
 // ─────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════
+// PROFESSIONAL STRATEGY LIBRARY
+// ═══════════════════════════════════════════════════════════════════
+//
+// Strategies used by institutional and professional traders.
+// Each is a complete signal generator returning { signal, score, confidence, reasons }.
+// All run live on every bar and are selected via CONFIG.strategy.
+//
+// Available strategies:
+//   rsi_macd        — Classic RSI + MACD (default, balanced)
+//   smc             — Smart Money Concepts (FVG, DOL, OB, BOS)
+//   ict             — ICT (kill zones, liquidity sweeps, OTE)
+//   vwap_reversion  — VWAP mean reversion (institutional entry)
+//   order_flow      — Volume delta + absorption (tape reading)
+//   wyckoff         — Accumulation/distribution phases
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Helper: Detect Fair Value Gaps (FVG) ─────────────────────────
+// FVG = when price gaps past a candle leaving an "imbalance"
+// Price tends to return to fill these gaps
+function findFVGs(bars, lookback = 20) {
+  const fvgs = [];
+  const slice = bars.slice(-lookback);
+  for (let i = 1; i < slice.length - 1; i++) {
+    const prev = slice[i-1], curr = slice[i], next = slice[i+1];
+    // Bullish FVG: previous high < next low (gap up — imbalance above)
+    if (prev.h < next.l) {
+      fvgs.push({ type:'bull', top: next.l, bottom: prev.h, mid:(prev.h+next.l)/2, bar:i });
+    }
+    // Bearish FVG: previous low > next high (gap down — imbalance below)
+    if (prev.l > next.h) {
+      fvgs.push({ type:'bear', top: prev.l, bottom: next.h, mid:(prev.l+next.h)/2, bar:i });
+    }
+  }
+  return fvgs;
+}
+
+// ── Helper: Detect Order Blocks (OB) ─────────────────────────────
+// OB = last opposing candle before a strong directional move
+// Strong support/resistance — price often returns to test them
+function findOrderBlocks(bars, lookback = 30) {
+  const obs = [];
+  const slice = bars.slice(-lookback);
+  for (let i = 1; i < slice.length - 3; i++) {
+    const b = slice[i];
+    // Look for a down candle (supply OB) followed by 3+ strong up candles
+    const isBearCandle = b.c < b.o;
+    const isBullCandle = b.c > b.o;
+    const nextThree = slice.slice(i+1, i+4);
+    const strongUp   = nextThree.every(x => x.c > x.o) && nextThree.reduce((a,x)=>a+(x.c-x.o),0) > (b.h-b.l)*1.5;
+    const strongDown = nextThree.every(x => x.c < x.o) && nextThree.reduce((a,x)=>a+(x.o-x.c),0) > (b.h-b.l)*1.5;
+    if (isBearCandle && strongUp)  obs.push({ type:'bull', high:b.h, low:b.l, mid:(b.h+b.l)/2 });
+    if (isBullCandle && strongDown) obs.push({ type:'bear', high:b.h, low:b.l, mid:(b.h+b.l)/2 });
+  }
+  return obs.slice(-5); // last 5 order blocks
+}
+
+// ── Helper: Break of Structure (BOS) / Change of Character (ChoCH) ──
+// BOS = price breaks a prior swing high/low (trend continuation)
+// ChoCH = first break in the opposite direction (potential reversal)
+function detectBOS(bars, lookback = 20) {
+  const slice = bars.slice(-lookback);
+  const highs = slice.map(b => b.h);
+  const lows  = slice.map(b => b.l);
+  const price = slice[slice.length-1].c;
+
+  // Find most recent swing high and low
+  let swingHigh = Math.max(...highs.slice(0, -3));
+  let swingLow  = Math.min(...lows.slice(0, -3));
+
+  const bullBOS = price > swingHigh; // broke above prior high
+  const bearBOS = price < swingLow;  // broke below prior low
+
+  // Higher highs = uptrend structure intact
+  const hh = highs[highs.length-1] > highs[highs.length-5] &&
+              highs[highs.length-5] > highs[highs.length-10];
+  const ll = lows[lows.length-1] < lows[lows.length-5] &&
+             lows[lows.length-5]  < lows[lows.length-10];
+
+  return { bullBOS, bearBOS, swingHigh, swingLow, hh, ll };
+}
+
+// ── Helper: Liquidity Levels (DOL — Draw on Liquidity) ───────────
+// Markets are drawn toward liquidity pools — clusters of stops
+// Equal highs/lows = stop-hunt targets
+function findLiquidityLevels(bars, lookback = 30) {
+  const slice = bars.slice(-lookback);
+  const highs = slice.map(b => b.h);
+  const lows  = slice.map(b => b.l);
+  const price = slice[slice.length-1].c;
+
+  // Equal highs (sell-side liquidity above) — stops sitting just above
+  const highClusters = [];
+  for (let i = 0; i < highs.length - 3; i++) {
+    const similar = highs.filter(h => Math.abs(h - highs[i]) / highs[i] < 0.002);
+    if (similar.length >= 2) highClusters.push(highs[i]);
+  }
+
+  // Equal lows (buy-side liquidity below) — stops sitting just below
+  const lowClusters = [];
+  for (let i = 0; i < lows.length - 3; i++) {
+    const similar = lows.filter(l => Math.abs(l - lows[i]) / lows[i] < 0.002);
+    if (similar.length >= 2) lowClusters.push(lows[i]);
+  }
+
+  // Nearest liquidity above and below
+  const above = highClusters.filter(h => h > price).sort((a,b)=>a-b)[0];
+  const below  = lowClusters.filter(l => l < price).sort((a,b)=>b-a)[0];
+
+  // Which liquidity pool is price being drawn to?
+  const dolUp   = above && (above - price) / price < 0.02;  // within 2%
+  const dolDown = below && (price - below) / price < 0.02;
+
+  return { above, below, dolUp, dolDown };
+}
+
+// ── Helper: ICT Kill Zones ────────────────────────────────────────
+// High-probability entry windows when institutional orders are placed
+// London Open: 2-5 AM ET | NY Open: 8-11 AM ET | London Close: 10 AM-12 PM ET
+function inKillZone() {
+  const et = new Date(new Date().toLocaleString('en-US',{timeZone:'America/New_York'}));
+  const h = et.getHours(), m = et.getMinutes();
+  const mins = h * 60 + m;
+  const london = mins >= 120 && mins <= 300;   // 2-5 AM ET
+  const nyOpen = mins >= 480 && mins <= 660;   // 8-11 AM ET
+  const lClose = mins >= 600 && mins <= 720;   // 10 AM-12 PM ET
+  const nyPM   = mins >= 780 && mins <= 900;   // 1-3 PM ET
+  return { inZone: london||nyOpen||lClose||nyPM, london, nyOpen, lClose, nyPM };
+}
+
+// ── Helper: Wyckoff Phase Detection ──────────────────────────────
+// Accumulation: declining volume on down bars, rising on up bars
+// Distribution: rising volume on down bars, declining on up bars
+function detectWyckoffPhase(bars, lookback = 20) {
+  const slice = bars.slice(-lookback);
+  let upVolume = 0, downVolume = 0, upCount = 0, downCount = 0;
+  for (const b of slice) {
+    if (b.c > b.o) { upVolume += b.v; upCount++; }
+    else            { downVolume += b.v; downCount++; }
+  }
+  const avgUpVol   = upCount   > 0 ? upVolume/upCount     : 0;
+  const avgDownVol = downCount > 0 ? downVolume/downCount : 0;
+
+  // Price range compression (spring/upthrust zone)
+  const ranges = slice.map(b => b.h - b.l);
+  const avgRange = ranges.reduce((a,b)=>a+b,0)/ranges.length;
+  const recentRange = ranges.slice(-5).reduce((a,b)=>a+b,0)/5;
+  const compressed = recentRange < avgRange * 0.6; // range shrinking
+
+  const accumulating  = avgUpVol > avgDownVol * 1.3 && compressed; // smart money buying
+  const distributing  = avgDownVol > avgUpVol * 1.3 && compressed; // smart money selling
+
+  return { accumulating, distributing, avgUpVol, avgDownVol, compressed };
+}
+
+// ── Helper: VWAP Band Analysis ────────────────────────────────────
+function vwapBands(bars) {
+  if (!bars || bars.length < 10) return null;
+  const vw = vwap(bars);
+  const prices = bars.map(b => (b.h+b.l+b.c)/3);
+  const std = Math.sqrt(prices.reduce((a,p)=>a+(p-vw)**2,0)/prices.length);
+  return { vwap:vw, upper1:vw+std, upper2:vw+std*2, lower1:vw-std, lower2:vw-std*2 };
+}
+
+// ── Helper: Order Flow / Delta ────────────────────────────────────
+// Estimates buying vs selling pressure from bar structure
+function estimateDelta(bars, lookback = 10) {
+  const slice = bars.slice(-lookback);
+  let buyPressure = 0, sellPressure = 0;
+  for (const b of slice) {
+    const range = b.h - b.l || 0.0001;
+    const close_loc = (b.c - b.l) / range; // 1 = closed at high, 0 = at low
+    buyPressure  += b.v * close_loc;
+    sellPressure += b.v * (1 - close_loc);
+  }
+  const delta = (buyPressure - sellPressure) / (buyPressure + sellPressure);
+  return { delta, buyPressure, sellPressure }; // delta: +1 = all buying, -1 = all selling
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STRATEGY IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Strategy: SMC (Smart Money Concepts) ─────────────────────────
+// Used by: Prop traders, hedge funds, retail ICT traders
+// Edge: Identifies where institutions are buying/selling by reading
+//       market structure, not just indicators
+function signalSMC(sym, bars5m, bars15m) {
+  if (bars5m.length < 50) return { signal:'HOLD', confidence:0, reasons:['Need 50+ bars'] };
+  const closes = bars5m.map(b=>b.c);
+  const price  = closes[closes.length-1];
+  const reasons = [];
+  let score = 0, direction = null;
+
+  const bos    = detectBOS(bars5m, 20);
+  const fvgs   = findFVGs(bars5m, 30);
+  const obs    = findOrderBlocks(bars5m, 40);
+  const liq    = findLiquidityLevels(bars5m, 30);
+  const kz     = inKillZone();
+  const adxVal = adx(bars5m);
+  const r      = rsi(closes, 14);
+  const vol    = bars5m.map(b=>b.v);
+  const avgVol = vol.slice(-20).reduce((a,b)=>a+b,0)/20;
+  const curVol = vol[vol.length-1];
+
+  // BOS signals direction
+  if (bos.bullBOS && bos.hh) { direction='buy';  score+=3; reasons.push('Bull BOS + HH structure ✅'); }
+  if (bos.bearBOS && bos.ll) { direction='sell'; score+=3; reasons.push('Bear BOS + LL structure ✅'); }
+  if (!direction) return { signal:'HOLD', confidence:0, reasons:['No BOS — no clear direction'] };
+
+  // FVG — price inside a bullish FVG = likely to bounce up
+  const bullFVG = fvgs.find(f => f.type==='bull' && price >= f.bottom && price <= f.top);
+  const bearFVG = fvgs.find(f => f.type==='bear' && price >= f.bottom && price <= f.top);
+  if (direction==='buy'  && bullFVG) { score+=3; reasons.push(`Inside bull FVG ($${bullFVG.bottom.toFixed(2)}-$${bullFVG.top.toFixed(2)}) ✅`); }
+  if (direction==='sell' && bearFVG) { score+=3; reasons.push(`Inside bear FVG ($${bearFVG.bottom.toFixed(2)}-$${bearFVG.top.toFixed(2)}) ✅`); }
+
+  // Order block confluence
+  const nearBullOB = obs.find(o => o.type==='bull' && price >= o.low*0.999 && price <= o.high*1.005);
+  const nearBearOB = obs.find(o => o.type==='bear' && price <= o.high*1.001 && price >= o.low*0.995);
+  if (direction==='buy'  && nearBullOB) { score+=2; reasons.push(`At bull order block $${nearBullOB.mid.toFixed(2)} ✅`); }
+  if (direction==='sell' && nearBearOB) { score+=2; reasons.push(`At bear order block $${nearBearOB.mid.toFixed(2)} ✅`); }
+
+  // DOL — price being drawn toward liquidity
+  if (direction==='buy'  && liq.dolUp)   { score+=2; reasons.push(`DOL: liquidity sweep above $${liq.above?.toFixed(2)} ✅`); }
+  if (direction==='sell' && liq.dolDown) { score+=2; reasons.push(`DOL: liquidity below $${liq.below?.toFixed(2)} ✅`); }
+
+  // Kill zone bonus
+  if (kz.inZone) { score+=1; reasons.push(`ICT kill zone active ✅`); }
+
+  // Volume and trend filters
+  if (curVol > avgVol * 1.2) { score+=1; reasons.push(`Volume surge (${(curVol/avgVol).toFixed(1)}x) ✅`); }
+  if (adxVal.adx < 15) return { signal:'HOLD', confidence:0, reasons:[...reasons,'ADX too low — ranging'] };
+
+  if (score < 6) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(95, 50 + score*5);
+  return { signal:direction==='buy'?'BUY':'SELL', confidence:conf, score, reasons, rsi:r, atr:atr(bars5m,14) };
+}
+
+// ── Strategy: ICT (Inner Circle Trader) ──────────────────────────
+// Used by: ICT students, prop firm traders
+// Edge: Kill zones + OTE (Optimal Trade Entry) retracements
+//       + liquidity sweeps before reversals
+function signalICT(sym, bars5m, bars15m) {
+  if (bars5m.length < 50) return { signal:'HOLD', confidence:0, reasons:['Need 50+ bars'] };
+  const closes = bars5m.map(b=>b.c);
+  const highs  = bars5m.map(b=>b.h);
+  const lows   = bars5m.map(b=>b.l);
+  const price  = closes[closes.length-1];
+  const reasons = [];
+  let score = 0, direction = null;
+
+  const kz  = inKillZone();
+  const bos = detectBOS(bars5m, 30);
+  const liq = findLiquidityLevels(bars5m, 40);
+  const fvgs = findFVGs(bars5m, 20);
+  const r   = rsi(closes, 14);
+  const adxVal = adx(bars5m);
+
+  // ICT requires kill zone
+  if (!kz.inZone) return { signal:'HOLD', confidence:0, reasons:['Not in ICT kill zone (NY/London open required)'] };
+  score += 2; reasons.push(`Kill zone active (${kz.nyOpen?'NY Open':kz.london?'London':kz.lClose?'London Close':'PM'}) ✅`);
+
+  // Market structure
+  if (bos.hh && !bos.bearBOS) { direction='buy';  score+=2; reasons.push('Higher highs structure ✅'); }
+  if (bos.ll && !bos.bullBOS) { direction='sell'; score+=2; reasons.push('Lower lows structure ✅'); }
+  if (!direction) return { signal:'HOLD', confidence:0, reasons:[...reasons,'No clear market structure'] };
+
+  // OTE (Optimal Trade Entry) — 62-79% Fibonacci retracement of last swing
+  const lookback = 20;
+  const swingHigh = Math.max(...highs.slice(-lookback));
+  const swingLow  = Math.min(...lows.slice(-lookback));
+  const swing = swingHigh - swingLow;
+  const fib62  = direction==='buy' ? swingLow  + swing*0.62 : swingHigh - swing*0.62;
+  const fib79  = direction==='buy' ? swingLow  + swing*0.79 : swingHigh - swing*0.79;
+  const inOTE  = direction==='buy'
+    ? price >= Math.min(fib62,fib79) && price <= Math.max(fib62,fib79)
+    : price <= Math.max(fib62,fib79) && price >= Math.min(fib62,fib79);
+  if (inOTE) { score+=3; reasons.push(`In OTE zone (62-79% fib) ✅`); }
+
+  // Liquidity sweep before entry (price sweeps stops then reverses)
+  if (direction==='buy'  && liq.below && (price-liq.below)/price < 0.005) {
+    score+=3; reasons.push(`Liquidity sweep below $${liq.below?.toFixed(2)} — reversal likely ✅`);
+  }
+  if (direction==='sell' && liq.above && (liq.above-price)/price < 0.005) {
+    score+=3; reasons.push(`Liquidity sweep above $${liq.above?.toFixed(2)} — reversal likely ✅`);
+  }
+
+  // FVG at entry
+  const entryFVG = fvgs.find(f => f.type===(direction==='buy'?'bull':'bear') && Math.abs(price-f.mid)/price < 0.005);
+  if (entryFVG) { score+=2; reasons.push(`FVG entry confluence ✅`); }
+
+  if (adxVal.adx < 12) return { signal:'HOLD', confidence:0, reasons:[...reasons,'ADX too low'] };
+  if (score < 7) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(95, 45 + score*5);
+  return { signal:direction==='buy'?'BUY':'SELL', confidence:conf, score, reasons, rsi:r, atr:atr(bars5m,14) };
+}
+
+// ── Strategy: VWAP Reversion ──────────────────────────────────────
+// Used by: Day traders, market makers, quant desks
+// Edge: Price always reverts to VWAP — trade from 2σ bands back to mean
+function signalVWAPReversion(sym, bars5m, bars15m) {
+  if (bars5m.length < 20) return { signal:'HOLD', confidence:0, reasons:['Need 20+ bars'] };
+  const closes = bars5m.map(b=>b.c);
+  const price  = closes[closes.length-1];
+  const reasons = [];
+  let score = 0, direction = null;
+
+  const vb  = vwapBands(bars5m);
+  if (!vb) return { signal:'HOLD', confidence:0, reasons:['No VWAP data'] };
+
+  const r      = rsi(closes, 14);
+  const adxVal = adx(bars5m);
+  const stoch  = stochRSI(closes);
+  const vol    = bars5m.map(b=>b.v);
+  const avgVol = vol.slice(-10).reduce((a,b)=>a+b,0)/10;
+  const curVol = vol[vol.length-1];
+
+  // Only trade in ranging or lightly trending markets
+  if (adxVal.adx > 35) return { signal:'HOLD', confidence:0, reasons:['ADX too high — trending, not reverting'] };
+
+  // Price at 2σ band = high probability reversion
+  if (price <= vb.lower2) {
+    direction='buy';
+    score+=4; reasons.push(`At VWAP -2σ ($${vb.lower2.toFixed(2)}) — extreme low ✅`);
+  } else if (price <= vb.lower1) {
+    direction='buy';
+    score+=2; reasons.push(`At VWAP -1σ ($${vb.lower1.toFixed(2)}) ✅`);
+  } else if (price >= vb.upper2) {
+    direction='sell';
+    score+=4; reasons.push(`At VWAP +2σ ($${vb.upper2.toFixed(2)}) — extreme high ✅`);
+  } else if (price >= vb.upper1) {
+    direction='sell';
+    score+=2; reasons.push(`At VWAP +1σ ($${vb.upper1.toFixed(2)}) ✅`);
+  } else {
+    return { signal:'HOLD', confidence:0, reasons:['Price near VWAP — no edge'] };
+  }
+
+  // RSI confirmation
+  if (direction==='buy'  && r < 40) { score+=2; reasons.push(`RSI oversold (${r.toFixed(0)}) ✅`); }
+  if (direction==='sell' && r > 60) { score+=2; reasons.push(`RSI overbought (${r.toFixed(0)}) ✅`); }
+
+  // StochRSI
+  if (direction==='buy'  && stoch.k < 20) { score+=1; reasons.push(`StochRSI oversold ✅`); }
+  if (direction==='sell' && stoch.k > 80) { score+=1; reasons.push(`StochRSI overbought ✅`); }
+
+  // Volume spike = institutional order at extreme
+  if (curVol > avgVol * 1.5) { score+=2; reasons.push(`Volume spike (${(curVol/avgVol).toFixed(1)}x) at extreme ✅`); }
+
+  // Price starting to reject (last bar closing toward VWAP)
+  const lastBar = bars5m[bars5m.length-1];
+  const rejecting = direction==='buy'
+    ? lastBar.c > lastBar.o && lastBar.l <= vb.lower1 // green bar at low
+    : lastBar.c < lastBar.o && lastBar.h >= vb.upper1; // red bar at high
+  if (rejecting) { score+=2; reasons.push(`Rejection candle at extreme ✅`); }
+
+  if (score < 5) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(95, 40 + score*6);
+  return { signal:direction==='buy'?'BUY':'SELL', confidence:conf, score, reasons, rsi:r, atr:atr(bars5m,14) };
+}
+
+// ── Strategy: Order Flow ──────────────────────────────────────────
+// Used by: Futures traders, HFT desks, tape readers
+// Edge: Delta analysis shows who's in control — buyers or sellers
+//       Absorption = price stops moving despite heavy buying/selling
+function signalOrderFlow(sym, bars5m, bars15m) {
+  if (bars5m.length < 20) return { signal:'HOLD', confidence:0, reasons:['Need 20+ bars'] };
+  const closes = bars5m.map(b=>b.c);
+  const price  = closes[closes.length-1];
+  const reasons = [];
+  let score = 0, direction = null;
+
+  const delta  = estimateDelta(bars5m, 5);   // last 5 bars
+  const delta20 = estimateDelta(bars5m, 20); // trend delta
+  const r      = rsi(closes, 14);
+  const adxVal = adx(bars5m);
+  const vb     = vwapBands(bars5m);
+  const vol    = bars5m.map(b=>b.v);
+
+  // Strong positive delta = buyers dominating
+  if (delta.delta > 0.3) {
+    direction='buy';
+    score+=3; reasons.push(`Positive delta (${(delta.delta*100).toFixed(0)}% buy pressure) ✅`);
+  } else if (delta.delta < -0.3) {
+    direction='sell';
+    score+=3; reasons.push(`Negative delta (${(Math.abs(delta.delta)*100).toFixed(0)}% sell pressure) ✅`);
+  } else {
+    return { signal:'HOLD', confidence:0, reasons:['Delta neutral — no clear order flow'] };
+  }
+
+  // Delta divergence = potential reversal (price up but delta down = absorption)
+  const priceUp    = price > closes[closes.length-5];
+  const deltaUp    = delta.delta > delta20.delta;
+  const absorption = (priceUp && !deltaUp) || (!priceUp && deltaUp);
+  if (!absorption) { score+=2; reasons.push('Delta confirms price direction ✅'); }
+  else { reasons.push('⚠ Absorption detected — possible reversal'); }
+
+  // Volume confirmation
+  const avgVol = vol.slice(-20).reduce((a,b)=>a+b,0)/20;
+  const recentVol = vol.slice(-3).reduce((a,b)=>a+b,0)/3;
+  if (recentVol > avgVol * 1.3) { score+=2; reasons.push(`Volume confirming (${(recentVol/avgVol).toFixed(1)}x) ✅`); }
+
+  // VWAP alignment
+  if (vb) {
+    if (direction==='buy'  && price > vb.vwap) { score+=1; reasons.push('Above VWAP ✅'); }
+    if (direction==='sell' && price < vb.vwap) { score+=1; reasons.push('Below VWAP ✅'); }
+  }
+
+  // ADX for trend strength
+  if (adxVal.adx > 20) { score+=1; reasons.push(`ADX ${adxVal.adx.toFixed(0)} trending ✅`); }
+
+  if (score < 5) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(95, 40 + score*6);
+  return { signal:direction==='buy'?'BUY':'SELL', confidence:conf, score, reasons, rsi:r, atr:atr(bars5m,14) };
+}
+
+// ── Strategy: Wyckoff ────────────────────────────────────────────
+// Used by: Institutional traders, value investors with timing
+// Edge: Reads accumulation/distribution phases — gets in before
+//       the markup/markdown phase when the big move happens
+function signalWyckoff(sym, bars5m, bars15m) {
+  if (bars5m.length < 50) return { signal:'HOLD', confidence:0, reasons:['Need 50+ bars'] };
+  const closes = bars5m.map(b=>b.c);
+  const price  = closes[closes.length-1];
+  const reasons = [];
+  let score = 0, direction = null;
+
+  const wy    = detectWyckoffPhase(bars5m, 30);
+  const bos   = detectBOS(bars5m, 20);
+  const r     = rsi(closes, 14);
+  const adxVal = adx(bars5m);
+  const vol   = bars5m.map(b=>b.v);
+  const avgVol = vol.slice(-20).reduce((a,b)=>a+b,0)/20;
+  const lastVol = vol[vol.length-1];
+
+  // Phase detection
+  if (wy.accumulating) {
+    direction='buy';
+    score+=4; reasons.push(`Wyckoff accumulation (up vol ${(wy.avgUpVol/wy.avgDownVol).toFixed(1)}× down vol) ✅`);
+  } else if (wy.distributing) {
+    direction='sell';
+    score+=4; reasons.push(`Wyckoff distribution (down vol ${(wy.avgDownVol/wy.avgUpVol).toFixed(1)}× up vol) ✅`);
+  } else {
+    return { signal:'HOLD', confidence:0, reasons:['No clear Wyckoff phase'] };
+  }
+
+  // Spring (acc) or Upthrust (dist) — fake break before reversal
+  if (direction==='buy' && bos.bearBOS && wy.compressed) {
+    score+=3; reasons.push('Wyckoff spring — fake low before markup ✅');
+  }
+  if (direction==='sell' && bos.bullBOS && wy.compressed) {
+    score+=3; reasons.push('Wyckoff upthrust — fake high before markdown ✅');
+  }
+
+  // Range compression = price coiling before breakout
+  if (wy.compressed) { score+=2; reasons.push('Price range compressed — coiling ✅'); }
+
+  // RSI — not overbought/oversold, just leaving extreme
+  if (direction==='buy'  && r > 35 && r < 55) { score+=1; reasons.push(`RSI recovering (${r.toFixed(0)}) ✅`); }
+  if (direction==='sell' && r < 65 && r > 45) { score+=1; reasons.push(`RSI rolling over (${r.toFixed(0)}) ✅`); }
+
+  // Volume test — last bar high volume = sign of strength/weakness
+  if (lastVol > avgVol * 1.5) { score+=1; reasons.push(`High volume ${(lastVol/avgVol).toFixed(1)}x ✅`); }
+
+  if (score < 6) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(95, 40 + score*5);
+  return { signal:direction==='buy'?'BUY':'SELL', confidence:conf, score, reasons, rsi:r, atr:atr(bars5m,14) };
+}
+
+// ── Strategy Router ───────────────────────────────────────────────
+// Calls the right strategy based on CONFIG.strategy
+// Also runs a secondary strategy for confluence (optional)
+function generateSignalByStrategy(sym, bars5m, bars15m) {
+  const strategy = CONFIG.strategy || 'rsi_macd';
+
+  switch(strategy) {
+    case 'smc':            return signalSMC(sym, bars5m, bars15m);
+    case 'ict':            return signalICT(sym, bars5m, bars15m);
+    case 'vwap_reversion': return signalVWAPReversion(sym, bars5m, bars15m);
+    case 'order_flow':     return signalOrderFlow(sym, bars5m, bars15m);
+    case 'wyckoff':        return signalWyckoff(sym, bars5m, bars15m);
+    case 'rsi_macd':
+    default:               return null; // falls through to existing generateSignal
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// END PROFESSIONAL STRATEGY LIBRARY
+// ═══════════════════════════════════════════════════════════════════
+
+
 function generateSignal(sym, bars5m, bars15m) {
   if (!bars5m || bars5m.length < 30) return { signal: 'HOLD', confidence: 0, reasons: ['Need 30+ bars'] };
 
@@ -2473,6 +3168,15 @@ async function manageShort(sym, price, bars) {
   const chg      = (pos.entryPrice - price) / pos.entryPrice;
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
 
+  // Intraday only — close shorts before market close too
+  if (!isSimMode() && isMarketOpen()) {
+    const mins = minsToClose();
+    if (mins <= 0 && mins > -60) {
+      log('risk', `⏰ SHORT ${sym} INTRADAY CLOSE — market closing`);
+      return coverShort(sym, price, 'INTRADAY_CLOSE');
+    }
+  }
+
   // Update low water mark (lowest price = most profit for short)
   if (price < pos.lowWater) shortPositions[sym].lowWater = price;
   const hwChg = (pos.entryPrice - pos.lowWater) / pos.entryPrice; // how far down we've been
@@ -2624,7 +3328,7 @@ async function exitPosition(sym, price, reason) {
   alpacaPositions.delete(sym);
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
-  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱', PEAK_EXIT:'🔔' }[reason] || '📤';
+  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱', PEAK_EXIT:'🔔', INTRADAY_CLOSE:'🔔' }[reason] || '📤';
   log('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
   await sendDiscordAlert('sell', sym, qtyToSell, price, pnl, reason);
   await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
@@ -2786,6 +3490,66 @@ function detectPeak(sym, bars, pos) {
 // ─────────────────────────────────────────────
 // ADVANCED POSITION MANAGEMENT
 // ─────────────────────────────────────────────
+
+// ── Dynamic Take Profit Calculator ───────────────────────────────
+// Analyzes actual price movement since entry and sets realistic TP
+// levels based on ATR, recent momentum, and how far the trade has moved.
+// Prevents TP from being too high (trade reverses before hitting it)
+// or too low (exits early, leaves money on the table).
+function calcDynamicTP(pos, price, bars) {
+  if (!bars || bars.length < 14) return null;
+
+  const atrVal   = atr(bars, 14);
+  const atrPct   = atrVal / price;
+  const chg      = (price - pos.entryPrice) / pos.entryPrice;
+  const mfe      = (pos.highWater - pos.entryPrice) / pos.entryPrice; // best we've seen
+  const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
+
+  // Base TP on ATR — realistic target is 2-3× ATR from entry
+  // If ATR is small (low volatility stock), TP should be tighter
+  // If ATR is large (high volatility), TP can be wider
+  const atrTP1 = Math.min(atrPct * 2, 0.06);  // 2× ATR, max 6%
+  const atrTP2 = Math.min(atrPct * 3.5, 0.10); // 3.5× ATR, max 10%
+  const atrTP3 = Math.min(atrPct * 5, 0.15);   // 5× ATR, max 15%
+
+  // Momentum adjustment — if trade moved strongly in first 30 min,
+  // momentum is real and we can let it run further
+  const earlyStrength = holdMins <= 30 && mfe > atrPct * 1.5;
+
+  // Reduce TP if trade has been flat for a long time (momentum dead)
+  const flatTooLong = holdMins > 60 && Math.abs(chg) < atrPct * 0.5;
+
+  let tp1 = atrTP1;
+  let tp2 = atrTP2;
+  let tp3 = atrTP3;
+
+  if (earlyStrength) {
+    // Strong momentum — let it run
+    tp1 *= 1.3; tp2 *= 1.3; tp3 *= 1.3;
+  }
+  if (flatTooLong) {
+    // Dead momentum — tighten TP to get out
+    tp1 *= 0.5; tp2 *= 0.7; tp3 *= 0.8;
+  }
+
+  // Never set TP below current profit — that would cause immediate exit
+  tp1 = Math.max(tp1, chg + 0.003);
+  tp2 = Math.max(tp2, tp1 + 0.01);
+  tp3 = Math.max(tp3, tp2 + 0.02);
+
+  return { tp1: +tp1.toFixed(4), tp2: +tp2.toFixed(4), tp3: +tp3.toFixed(4), atrPct: +atrPct.toFixed(4) };
+}
+
+// ── Market Close Time Check ───────────────────────────────────────
+// Returns minutes until market close (negative = already closed)
+function minsToClose() {
+  const now = new Date();
+  const et  = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const closeHour = 15, closeMin = 45; // 3:45 PM ET — 15 min before actual close
+  const minsLeft = (closeHour * 60 + closeMin) - (et.getHours() * 60 + et.getMinutes());
+  return minsLeft;
+}
+
 async function managePosition(sym, price, bars) {
   const pos = positions[sym];
   if (!pos) return;
@@ -2800,6 +3564,40 @@ async function managePosition(sym, price, bars) {
 
   const chg      = (price - pos.entryPrice) / pos.entryPrice;
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
+
+  // ── INTRADAY ONLY — close 15 min before market close ─────────────
+  // Never hold overnight — gaps are unpredictable and can blow through stops
+  if (!isSimMode() && isMarketOpen()) {
+    const mins = minsToClose();
+    if (mins <= 0 && mins > -60) {
+      // Within the closing window — exit at whatever price we have
+      const exitPct = (chg * 100).toFixed(2);
+      log('risk', `⏰ ${sym} INTRADAY CLOSE — market closing, exiting at ${exitPct >= 0 ? '+' : ''}${exitPct}%`);
+      return exitPosition(sym, price, 'INTRADAY_CLOSE');
+    }
+  }
+
+  // ── DYNAMIC TP — update per-position TP levels every bar ─────────
+  // Only adjust if trade hasn't hit TP1 yet (still in initial phase)
+  if (!pos.tp1Hit && bars && bars.length >= 14) {
+    const dtp = calcDynamicTP(pos, price, bars);
+    if (dtp) {
+      // Only move TPs — never tighten them if trade is already moving well
+      const newTP1 = pos.dynamicTP1 ? Math.min(dtp.tp1, pos.dynamicTP1) : dtp.tp1;
+      const newTP2 = pos.dynamicTP2 ? Math.min(dtp.tp2, pos.dynamicTP2) : dtp.tp2;
+      const newTP3 = pos.dynamicTP3 ? Math.min(dtp.tp3, pos.dynamicTP3) : dtp.tp3;
+      if (!pos.dynamicTP1 || Math.abs(newTP1 - pos.dynamicTP1) > 0.001) {
+        positions[sym].dynamicTP1 = newTP1;
+        positions[sym].dynamicTP2 = newTP2;
+        positions[sym].dynamicTP3 = newTP3;
+      }
+    }
+  }
+
+  // Use dynamic TP if available, otherwise fall back to CONFIG values
+  const effectiveTP1 = pos.dynamicTP1 || CONFIG.tp1Pct;
+  const effectiveTP2 = pos.dynamicTP2 || CONFIG.tp2Pct;
+  const effectiveTP3 = pos.dynamicTP3 || CONFIG.tp3Pct;
 
   // Update high water mark
   if (price > pos.highWater) positions[sym].highWater = price;
@@ -2924,24 +3722,24 @@ async function managePosition(sym, price, bars) {
   }
 
   // ── Take profit tiers ──
-  if (!pos.tp1Hit && chg >= CONFIG.tp1Pct) {
+  if (!pos.tp1Hit && chg >= effectiveTP1) {
     const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.33));
     positions[sym].tp1Hit = true;
-    log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}%: selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
+    log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}% (dyn ${(effectiveTP1*100).toFixed(1)}%): selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
     await partialExit(sym, price, sell, 'TP1');
     if (!positions[sym]) return;
     return;
   }
-  if (pos.tp1Hit && !pos.tp2Hit && chg >= CONFIG.tp2Pct) {
+  if (pos.tp1Hit && !pos.tp2Hit && chg >= effectiveTP2) {
     const sell = Math.max(1, Math.floor(positions[sym].qtyRemaining * 0.5));
     positions[sym].tp2Hit = true;
-    log('sell', `🎯🎯 TP2 +${(chg*100).toFixed(1)}%: selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
+    log('sell', `🎯🎯 TP2 +${(chg*100).toFixed(1)}% (dyn ${(effectiveTP2*100).toFixed(1)}%): selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
     await partialExit(sym, price, sell, 'TP2');
     if (!positions[sym]) return;
     return;
   }
-  if (pos.tp1Hit && pos.tp2Hit && chg >= CONFIG.tp3Pct) {
-    log('sell', `🎯🎯🎯 TP3 +${(chg*100).toFixed(1)}%: final exit ${sym} @ $${price.toFixed(2)}`);
+  if (pos.tp1Hit && pos.tp2Hit && chg >= effectiveTP3) {
+    log('sell', `🎯🎯🎯 TP3 +${(chg*100).toFixed(1)}% (dyn ${(effectiveTP3*100).toFixed(1)}%): final exit ${sym} @ $${price.toFixed(2)}`);
     return exitPosition(sym, price, 'TAKE_PROFIT');
   }
 
@@ -3079,7 +3877,7 @@ async function runScan() {
       }
 
       // Generate signal
-      let sig = generateSignal(sym, bars5m, bars15m);
+      let sig = generateSignalByStrategy(sym, bars5m, bars15m) || generateSignal(sym, bars5m, bars15m);
       const adjustedConfidence = Math.round(sig.confidence * sessionMult);
       sig = { ...sig, confidence: adjustedConfidence };
 
@@ -4216,7 +5014,36 @@ async function tick() {
     // ── Simulation mode — handled by dedicated 3s sim tick ──
     if (isSimMode()) return;
 
-    // ── Live / Paper mode ──
+    // ── INTRADAY SAFETY NET — force close all positions at 3:50 PM ET ──
+  // Belt-and-suspenders: even if managePosition missed the 3:45 signal
+  if (!isSimMode() && isWeekday()) {
+    const minsLeft = minsToClose();
+    if (minsLeft <= -5 && minsLeft > -30) { // 3:50 PM window
+      const allOpen = [...Object.keys(positions), ...Object.keys(shortPositions), ...Object.keys(scalpPositions)];
+      if (allOpen.length > 0) {
+        log('risk', `⏰ INTRADAY CLOSE-ALL: ${allOpen.length} positions still open at market close`);
+        for (const sym of Object.keys(positions)) {
+          const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || positions[sym].entryPrice;
+          await exitPosition(sym, cur, 'INTRADAY_CLOSE');
+        }
+        for (const sym of Object.keys(shortPositions)) {
+          const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || shortPositions[sym].entryPrice;
+          await coverShort(sym, cur, 'INTRADAY_CLOSE');
+        }
+      }
+    }
+  }
+
+  // ── Live / Paper mode ──
+  if (CONFIG.positionTradingEnabled && !isSimMode() && isMarketOpen()) {
+    const hoursSinceLastPT = (now2 - (tick._lastPTRun||0)) / 3600000;
+    if (hoursSinceLastPT >= 23) { // once per day
+      tick._lastPTRun = now2;
+      managePositionTrades().catch(e => log('error', `PT scan: ${e.message}`));
+    }
+  }
+
+  // ── Live / Paper mode ──
 
     // Screener every 3 minutes
     if (isMarketOpen() && (now - lastScreenerRun >= SCREENER_INTERVAL_MS)) {
