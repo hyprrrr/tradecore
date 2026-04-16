@@ -1892,19 +1892,41 @@ function generateSignal(sym, bars5m, bars15m) {
     reasons.push(`Only ${passedGates}/${minGates} gates passed — need more confluence`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
-  if (bonus < 1) {
-    reasons.push(`No bonus confirmations — waiting for better setup`);
+  // Require 2+ bonus confirmations (was 1) — eliminates borderline setups
+  if (bonus < 2) {
+    reasons.push(`Only ${bonus} bonus signal (need 2+) — waiting for stronger setup`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
 
   // ── Reward:Risk check ──
   // Only take trades where the expected move justifies the risk
   const atrVal  = atr(bars5m, 14);
-  const stopDist = atrVal * CONFIG.atrStopMult;
-  const tpDist   = atrVal * CONFIG.atrStopMult * 2; // require minimum 2:1 R:R
-  if (stopDist > 0 && tpDist / stopDist < 1.8) {
-    reasons.push(`R:R too low (${(tpDist/stopDist).toFixed(1)}:1) — need 1.8:1 minimum`);
+  const stopDist = atrVal * Math.min(CONFIG.atrStopMult, 1.5); // use tighter stop in R:R calc
+  const tpDist   = atrVal * CONFIG.atrStopMult * 2.5; // require minimum 2.5:1 R:R
+  if (stopDist > 0 && tpDist / stopDist < 2.0) {
+    reasons.push(`R:R too low (${(tpDist/stopDist).toFixed(1)}:1) — need 2.0:1 minimum`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
+  }
+
+  // ── Pre-entry candle health check ──
+  // Don't enter if the last 2 bars show strong rejection of our direction
+  const last2 = bars5m.slice(-2);
+  if (last2.length >= 2) {
+    if (direction === 'buy') {
+      // Don't buy if last 2 bars both closed below their open (sellers in control)
+      const bearLast2 = last2.every(b => b.c < b.o);
+      if (bearLast2) return { signal: 'HOLD', confidence, score, reasons: [...reasons, 'Last 2 bars bearish — waiting for buyers'], rsi: r };
+      // Don't buy if current bar has long upper wick (rejection at highs)
+      const cur = last2[1];
+      const upperWick = cur.h - Math.max(cur.c, cur.o);
+      const body = Math.abs(cur.c - cur.o) || 0.001;
+      if (upperWick > body * 2) return { signal: 'HOLD', confidence, score, reasons: [...reasons, 'Upper wick rejection — no buy'], rsi: r };
+    }
+    if (direction === 'sell') {
+      // Don't short if last 2 bars closed above their open (buyers in control)
+      const bullLast2 = last2.every(b => b.c > b.o);
+      if (bullLast2) return { signal: 'HOLD', confidence, score, reasons: [...reasons, 'Last 2 bars bullish — waiting for sellers'], rsi: r };
+    }
   }
 
   // ── Shorting requires much more conviction than going long ──
@@ -2009,18 +2031,28 @@ function checkCircuitBreaker() {
 // ─────────────────────────────────────────────
 // POSITION SIZING (ATR-based, risk 1% per trade)
 // ─────────────────────────────────────────────
-function calcQty(symbol, price, bars) {
-  const maxCost  = portfolio * CONFIG.maxPositionPct;
-  const maxShares = Math.floor(maxCost / price);
+function calcQty(symbol, price, bars, confidence = 70) {
+  // Scale position size by signal confidence
+  // 60% confidence → 50% of max size
+  // 75% confidence → 75% of max size
+  // 90%+ confidence → full size
+  const confScale  = Math.max(0.4, Math.min(1.0, (confidence - CONFIG.minConfidence) / 30 + 0.5));
+  const scaledPct  = CONFIG.maxPositionPct * confScale;
+  const maxCost    = portfolio * scaledPct;
+  const maxShares  = Math.floor(maxCost / price);
   if (bars && bars.length >= 14) {
     const atrVal = atr(bars, 14);
     if (atrVal > 0) {
+      // Risk 1% of portfolio per trade, capped by position size limit
       const riskShares = Math.floor((portfolio * 0.01) / atrVal);
       const qty = Math.min(riskShares, maxShares);
-      if (qty >= 1) { log('size', `${symbol} ATR=${atrVal.toFixed(2)} → qty=${qty} (max=${maxShares})`); return qty; }
+      if (qty >= 1) {
+        log('size', `${symbol} conf=${confidence}% scale=${(confScale*100).toFixed(0)}% ATR=${atrVal.toFixed(2)} → qty=${qty}`);
+        return qty;
+      }
     }
   }
-  return maxShares;
+  return Math.max(1, maxShares);
 }
 
 // ─────────────────────────────────────────────
@@ -2045,7 +2077,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   if (direction === 'short' && (shortPositions[sym]  || alpacaShorts.has(sym)))         { log('warn', `${sym} already short`); return; }
   if (direction === 'long'  && isCorrelated(sym)) return;
 
-  const qty  = calcQty(sym, price, bars);
+  const qty  = calcQty(sym, price, bars, sigInfo?.confidence || 70);
   const cost = qty * price;
   if (qty < 1) { log('warn', `Cannot enter ${sym}: qty too small`); return; }
 
@@ -3746,8 +3778,8 @@ function confirmSignal(sym, sig) {
     prev.sigInfo = sig;
     pendingSignals.set(sym, prev);
 
-    // Shorts need 5 consecutive confirmations (~2.5 min), longs need 3 (~90s)
-    const required = sig.signal === 'SELL' ? 5 : 3;
+    // Shorts need 5 consecutive confirmations (~75s), longs need 4 (~60s)
+    const required = sig.signal === 'SELL' ? 5 : 4;
 
     if (prev.count >= required) {
       pendingSignals.delete(sym);
@@ -3757,7 +3789,7 @@ function confirmSignal(sym, sig) {
     log('signal', `⏳ ${sym} ${sig.signal} pending (${prev.count}/${required})`);
     return false;
   }
-  const required = sig.signal === 'SELL' ? 5 : 3;
+  const required = sig.signal === 'SELL' ? 5 : 4;
   pendingSignals.set(sym, { signal: sig.signal, count: 1, sigInfo: sig });
   log('signal', `⏳ ${sym} new signal (${sig.signal} conf:${sig.confidence}%) — need ${required - 1} more confirmations`);
   return false;
