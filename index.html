@@ -737,17 +737,23 @@ async function poll(){
 
   if(!portfolio||portfolio.length===0){ setOffline(); return; }
 
-  if(!equityLoaded || pollCount % 40 === 0){ // reload every ~2 min
-    try{
-      // Always read from live tc_equity — sim never writes here so chart stays clean
-      const eq=await sbGet('tc_equity','?order=created_at.asc&limit=500');
-      if(eq&&eq.length>0) equityHistory=eq.map(e=>+e.value).filter(v=>!isNaN(v)&&v>0);
-      else equityHistory=[];
-    }catch(e){}
-    equityLoaded=true;
-  }
-
   const p=portfolio[0], posData=positions||[];
+
+  // Build equity history from live portfolio total_value on every poll
+  // This is simpler and more reliable than reading from tc_equity database
+  // Filter: only add if value is sane (within 10% of last known value or first point)
+  const rawEquity = +p.total_value;
+  const startCap  = getStartingCapital();
+  if(rawEquity > startCap * 0.5 && rawEquity < startCap * 2) {
+    const last = equityHistory[equityHistory.length-1];
+    // Only add if no previous value, or change is less than 10% (filters out spikes)
+    if(!last || Math.abs((rawEquity - last) / last) < 0.10) {
+      equityHistory.push(+rawEquity.toFixed(2));
+      if(equityHistory.length > 500) equityHistory.shift();
+    }
+  }
+  // Reset chart on sim toggle (equityHistory gets cleared in onModeChange)
+  if(!equityLoaded){ equityLoaded=true; }
 
   // Always update KPIs and positions (fast, important)
   updateKPIs(p, posData, []);
@@ -832,13 +838,6 @@ function updateKPIs(p, positions, trades){
 
   // Skip clearly broken values
   if (!equity || equity <= 0 || equity > 10000000) return;
-
-  // Sanity check — reject values that jump >25% from last known good value
-  // This prevents brief wrong states from rendering during sim bar transitions
-  const lastKnown = equityHistory[equityHistory.length-1];
-  if (lastKnown && lastKnown > 0 && Math.abs((equity - lastKnown) / lastKnown) > 0.25) {
-    return; // skip this poll — wait for consistent value
-  }
 
   // All-time P&L vs starting capital set in settings
   const allTimePnl = equity - startCap;
