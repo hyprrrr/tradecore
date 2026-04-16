@@ -2054,11 +2054,18 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
 
   if (direction === 'long') {
     if (cost > portfolio) { log('warn', `Not enough cash for ${sym}`); return; }
-    const atrStop  = price - (atrVal * CONFIG.atrStopMult);
-    const pctStop  = price * (1 - CONFIG.stopLossPct);
-    // In sim use minimum 3% stop so normal bar noise doesn't immediately trigger exit
-    const minStop  = isSimMode() ? price * (1 - Math.max(CONFIG.stopLossPct, 0.03)) : pctStop;
-    const stopPrice = Math.max(atrStop, minStop);
+
+    // With immediate trailing stops, we use a tighter initial stop
+    // The trade only needs to go +0.3% before break-even locks in
+    // So initial stop should be just wide enough to avoid normal noise
+    const atrVal14  = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.02;
+    // Use 1× ATR as initial stop — tight enough to limit loss, wide enough to avoid noise
+    const atrStop   = price - (atrVal14 * Math.min(CONFIG.atrStopMult, 1.5));
+    // Hard cap: never risk more than 2% on initial stop
+    const capStop   = price * (1 - 0.02);
+    // In sim: minimum 1.5% stop to avoid being shaken by bar spread
+    const simFloor  = isSimMode() ? price * (1 - 0.015) : atrStop;
+    const stopPrice = Math.max(atrStop, capStop, isSimMode() ? simFloor : capStop);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       try { await placeSmartOrder(sym, qty, 'buy', false); }
@@ -2068,14 +2075,14 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     positions[sym] = {
       entryPrice: price, qty, qtyRemaining: qty, cost,
       entryTime: new Date(), highWater: price, lowWater: price,
-      atrAtEntry: atrVal, stopPrice,
+      atrAtEntry: atrVal14, stopPrice,
       breakEvenSet: false, tp1Hit: false, tp2Hit: false,
       srLevels, sigInfo, direction: 'long',
       // Rich entry analytics for post-trade learning
       entryAnalytics: {
         stopDistPct:    +((price - stopPrice) / price * 100).toFixed(3),
-        stopDistAtr:    atrVal > 0 ? +((price - stopPrice) / atrVal).toFixed(2) : 0,
-        atrPct:         +((atrVal / price) * 100).toFixed(3),
+        stopDistAtr:    atrVal14 > 0 ? +((price - stopPrice) / atrVal14).toFixed(2) : 0,
+        atrPct:         +((atrVal14 / price) * 100).toFixed(3),
         confidence:     sigInfo.confidence,
         score:          sigInfo.score || 0,
         rsi:            sigInfo.rsi || 50,
@@ -2095,16 +2102,18 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     trades.push({ time: new Date(), sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
     const stopPct = ((price - stopPrice) / price * 100).toFixed(2);
     log('buy', `✅ LONG ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (-${stopPct}%) | conf=${sigInfo.confidence}%`);
-    await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal });
+    await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal: atrVal14 });
     await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
 
   } else {
     // SHORT — borrow shares to sell, profit if price falls
     // Stop loss ABOVE entry for shorts
-    const atrStop   = price + (atrVal * CONFIG.atrStopMult);
-    const pctStop   = price * (1 + CONFIG.stopLossPct);
-    const maxStop   = isSimMode() ? price * (1 + Math.max(CONFIG.stopLossPct, 0.03)) : pctStop;
-    const stopPrice = Math.min(atrStop, maxStop);
+    // SHORT entry — tighter initial stop, break-even locks at +0.3% move
+    const atrVal14s = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.02;
+    const atrStopS  = price + (atrVal14s * Math.min(CONFIG.atrStopMult, 1.5));
+    const capStopS  = price * (1 + 0.02); // hard cap 2% max initial risk
+    const simCeilS  = isSimMode() ? price * (1 + 0.015) : atrStopS;
+    const stopPrice = Math.min(atrStopS, capStopS, isSimMode() ? simCeilS : capStopS);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       try { await placeSmartOrder(sym, qty, 'sell', false); } // sell to open short
