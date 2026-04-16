@@ -1158,7 +1158,9 @@ function isMarketOpen() {
   const et = getETTime();
   const day = et.getDay();
   const mins = et.getHours() * 60 + et.getMinutes();
-  return day >= 1 && day <= 5 && mins >= 571 && mins <= 955; // 9:31 - 3:55
+  // Open 9:45 AM ET (not 9:31) — skip first 15min whipsaw window
+  // Close 3:45 PM ET (not 3:55) — avoid end-of-day volatility
+  return day >= 1 && day <= 5 && mins >= 585 && mins <= 945; // 9:45 - 3:45
 }
 
 function isWeekday() {
@@ -2009,19 +2011,46 @@ function generateSignal(sym, bars5m, bars15m) {
 async function getMarketRegime() {
   if (!CONFIG.regimeFilter) return true;
   try {
-    const bars = await fetchBars('SPY', '1Day', 30);
-    if (!bars || bars.length < 10) return true;
-    const closes = bars.map(b => b.c);
-    const e10 = ema(closes, 10), e30 = ema(closes, Math.min(30, closes.length));
-    const latest = closes[closes.length - 1];
-    // Loosened: only block if BOTH price below EMA10 AND EMA10 below EMA30 by >1%
-    const hardBearish = latest < e10 && (e10 - e30) / e30 > 0.01;
-    if (hardBearish) {
-      log('regime', `⚠ Market BEARISH — BUYs paused (SPY=$${latest.toFixed(2)} EMA10=$${e10.toFixed(2)} EMA30=$${e30.toFixed(2)})`);
-    } else {
-      log('regime', `✅ Market OK — trading enabled (SPY=$${latest.toFixed(2)})`);
+    const [dayBars, intraBars] = await Promise.all([
+      fetchBars('SPY', '1Day', 30),
+      fetchBars('SPY', '5Min', 20),
+    ]);
+
+    // ── Daily trend check ──
+    if (dayBars && dayBars.length >= 10) {
+      const closes = dayBars.map(b => b.c);
+      const e10 = ema(closes, 10), e30 = ema(closes, Math.min(30, closes.length));
+      const latest = closes[closes.length - 1];
+      const hardBearish = latest < e10 && (e10 - e30) / e30 > 0.01;
+      if (hardBearish) {
+        log('regime', `⚠ Market BEARISH — BUYs paused (SPY=$${latest.toFixed(2)})`);
+        return false;
+      }
     }
-    return !hardBearish;
+
+    // ── Intraday volatility check — don't trade choppy / high-volatility opens ──
+    if (intraBars && intraBars.length >= 10) {
+      const spyAtr = atr(intraBars, 10);
+      const spyPrice = intraBars[intraBars.length-1].c;
+      const spyAtrPct = (spyAtr / spyPrice) * 100;
+
+      // If SPY is moving more than 0.4% per 5-min bar — too volatile
+      if (spyAtrPct > 0.4) {
+        log('regime', `⚠ SPY too volatile (ATR=${spyAtrPct.toFixed(2)}%/bar) — waiting for calmer market`);
+        return false;
+      }
+
+      // Check if SPY is in a sustained intraday downtrend (3+ consecutive down bars)
+      const last4 = intraBars.slice(-4).map(b => b.c);
+      const spyDowntrend = last4[3] < last4[2] && last4[2] < last4[1] && last4[1] < last4[0];
+      if (spyDowntrend) {
+        log('regime', `⚠ SPY 3-bar downtrend — pausing longs`);
+        return false;
+      }
+    }
+
+    log('regime', `✅ Market OK — regime clear, volatility normal`);
+    return true;
   } catch (e) { return true; }
 }
 
@@ -2042,7 +2071,8 @@ function isCorrelated(symbol) {
 function hasLargeGap(symbol, price) {
   if (!CONFIG.gapFilter || !prevDayClose[symbol]) return false;
   const gap = Math.abs((price - prevDayClose[symbol]) / prevDayClose[symbol]);
-  if (gap > 0.03) { log('filter', `Gap filter: ${symbol} gapped ${(gap*100).toFixed(1)}% — skip`); return true; }
+  // Block if gapped more than 2% — these stocks are unpredictable post-gap
+  if (gap > 0.02) { log('filter', `Gap filter: ${symbol} gapped ${(gap*100).toFixed(1)}% — skip`); return true; }
   return false;
 }
 
@@ -2053,26 +2083,41 @@ let realDailyStartEquity = 0;
 function checkCircuitBreaker() {
   if (circuitBreakerOn) return true;
 
-  // Never trip circuit breaker in sim mode — sim losses are not real
+  // Never trip circuit breaker in sim mode
   if (isSimMode()) return false;
 
-  // Use real Alpaca equity if available, otherwise skip the check
-  // (avoids false triggers after restarts when in-memory state is wrong)
   const equityToCheck  = realEquity          > 0 ? realEquity          : null;
   const startToCheck   = realDailyStartEquity > 0 ? realDailyStartEquity : null;
 
   if (!equityToCheck || !startToCheck) {
     log('risk', 'Circuit breaker: waiting for real equity data from Alpaca…');
-    return false; // don't trip until we have real data
+    return false;
   }
 
   const loss = (startToCheck - equityToCheck) / startToCheck;
-  if (loss >= CONFIG.maxDailyLossPct) {
+
+  // Trip at maxDailyLossPct (default 3%, but also enforced at 1.5% minimum)
+  const effectiveLimit = Math.min(CONFIG.maxDailyLossPct, 0.03);
+  if (loss >= effectiveLimit) {
     circuitBreakerOn = true;
-    log('risk', `🔴 CIRCUIT BREAKER: Down ${(loss*100).toFixed(1)}% today (equity $${equityToCheck.toFixed(2)} vs start $${startToCheck.toFixed(2)}) — halting all trades`);
+    log('risk', `🔴 CIRCUIT BREAKER: Down ${(loss*100).toFixed(1)}% today — halting all trades for the day`);
     sendDiscordAlert('circuit_breaker', 'ALL', 0, 0, -(startToCheck - equityToCheck));
+    return true;
   }
-  return circuitBreakerOn;
+
+  // Consecutive loss streak check — pause for 30 min after 3 straight losses
+  const recentTrades = tradePerformanceLog.slice(-3);
+  if (recentTrades.length >= 3 && recentTrades.every(t => !t.won)) {
+    const lastLoss = recentTrades[recentTrades.length-1].timestamp;
+    const pauseUntil = lastLoss + 30 * 60 * 1000;
+    if (Date.now() < pauseUntil) {
+      const minsLeft = Math.ceil((pauseUntil - Date.now()) / 60000);
+      log('risk', `⏸ 3 consecutive losses — cooling off for ${minsLeft} more minutes`);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // ─────────────────────────────────────────────
