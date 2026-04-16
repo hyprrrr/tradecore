@@ -1539,37 +1539,36 @@ const simState = {
 
 // Load historical 5-minute bars for all symbols to replay
 async function loadSimBars(symbols) {
-  log('sim', `🎮 Loading bar replay data for ${symbols.length} symbols in parallel…`);
+  log('sim', `🎮 Loading bar replay data for ${symbols.length} symbols from Alpaca…`);
   simState.bars    = {};
   simState.cursor  = 0;
   simState.loaded  = false;
 
-  const fetch = await getFetch();
+  // Use Alpaca historical bars — reliable from Railway, no rate limiting issues
+  // Get last 5 days of 5-min bars
+  const end   = new Date();
+  const start = new Date(end.getTime() - 5 * 24 * 60 * 60 * 1000);
+  const startStr = start.toISOString().split('.')[0] + 'Z';
+  const endStr   = end.toISOString().split('.')[0] + 'Z';
 
-  // Fetch all symbols in parallel — was sequential before (~10s), now ~1-2s
   const results = await Promise.allSettled(symbols.map(async sym => {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=5d`;
-    const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    const data = await res.json();
-    const result = data?.chart?.result?.[0];
-    if (!result) return { sym, bars: null };
-
-    const timestamps = result.timestamp || [];
-    const q = result.indicators?.quote?.[0] || {};
-    const bars = timestamps.map((t, i) => ({
-      t: new Date(t * 1000).toISOString(),
-      o: q.open?.[i]   || null,
-      h: q.high?.[i]   || null,
-      l: q.low?.[i]    || null,
-      c: q.close?.[i]  || null,
-      v: q.volume?.[i] || 0,
-    })).filter(b => b.c != null && b.h != null && b.l != null);
-
-    return { sym, bars: bars.length >= 20 ? bars : null };
+    try {
+      const url = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=5Min&start=${startStr}&end=${endStr}&limit=1000&adjustment=raw&feed=iex`;
+      const data = await alpacaFetch(url);
+      const bars  = (data?.bars || []).map(b => ({
+        t: b.t,
+        o: b.o, h: b.h, l: b.l, c: b.c,
+        v: b.v || 0,
+      })).filter(b => b.c && b.h && b.l && b.o);
+      return { sym, bars: bars.length >= 20 ? bars : null };
+    } catch(e) {
+      log('warn', `Sim: failed to load ${sym}: ${e.message}`);
+      return { sym, bars: null };
+    }
   }));
 
   for (const r of results) {
-    if (r.status === 'fulfilled' && r.value.bars) {
+    if (r.status === 'fulfilled' && r.value?.bars) {
       simState.bars[r.value.sym] = r.value.bars;
     }
   }
@@ -1579,12 +1578,12 @@ async function loadSimBars(symbols) {
 
   const lengths = Object.values(simState.bars).map(b => b.length);
   if (lengths.length === 0) {
-    log('error', 'Sim: no bar data loaded — cannot start replay');
+    log('error', 'Sim: no bar data loaded — check Alpaca API keys');
     return false;
   }
 
   simState.totalBars   = Math.min(...lengths);
-  simState.cursor      = 0; // start from the beginning of the replay window
+  simState.cursor      = 20; // start with enough history for indicators
   simState.loaded      = true;
   simState.startTime   = simState.bars[Object.keys(simState.bars)[0]][0].t;
   simState.currentTime = simState.startTime;
