@@ -2233,19 +2233,16 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal: atrVal14 });
     await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
 
-    // Immediately write correct total_value = cash + full position market value
-    // This prevents any poll from seeing a "cash-only" value that looks like a loss spike
-    const allPosVal = Object.entries(positions).reduce((a, [s, pos]) => {
-      const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
-      return a + cur * (pos.qtyRemaining || pos.qty);
-    }, 0);
-    const correctEquity = portfolio + allPosVal;
+    // Write correct total_value immediately after entry
+    // Use realEquity if available (Alpaca's ground truth), otherwise estimate
+    // NEVER use cash + position value — that double-counts when cash hasn't settled
+    const correctEquity = realEquity > 0 ? realEquity : (portfolio + price * qty);
     await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
       cash:        +portfolio.toFixed(2),
       total_value: +correctEquity.toFixed(2),
       updated_at:  new Date().toISOString(),
     });
-    if (!isSimMode()) syncPortfolio().catch(()=>{}); // background sync with Alpaca
+    if (!isSimMode()) syncPortfolio().catch(()=>{}); // background refresh from Alpaca
 
   } else {
     // SHORT — borrow shares to sell, profit if price falls
