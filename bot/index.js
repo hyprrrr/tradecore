@@ -525,7 +525,142 @@ async function runAdaptiveTuning() {
     if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.003) { CONFIG.maxPositionPct = +newPct.toFixed(3); changes.maxPositionPct = (CONFIG.maxPositionPct*100).toFixed(1)+'%'; reasons.push('Strong edge — increasing position size'); }
   }
 
-  if (Object.keys(changes).length === 0) return;
+  // ── DEEP STOP LOSS ANALYSIS ──────────────────────────────────────
+  // Analyze WHY trades hit stop loss using MFE/MAE data
+  const slTrades  = recent20.filter(t => t.exitReason === 'STOP_LOSS' && t.mae !== undefined);
+  const tpTrades  = recent20.filter(t => t.won && t.mfe !== undefined);
+
+  if (slTrades.length >= 3) {
+    const avgMAE = slTrades.reduce((a,t) => a + (t.mae||0), 0) / slTrades.length;
+    const avgMFE_beforeSL = slTrades.reduce((a,t) => a + (t.mfe||0), 0) / slTrades.length;
+    const avgStopDist = slTrades.reduce((a,t) => a + (t.stopDistPct||CONFIG.stopLossPct*100), 0) / slTrades.length;
+
+    // If stop was hit but trade first went positive — stop is too tight relative to noise
+    if (avgMFE_beforeSL > 0.5 && avgMAE > avgStopDist * 0.8) {
+      const newMult = Math.min(ADAPT_BOUNDS.atrStopMult.max, CONFIG.atrStopMult + 0.15);
+      if (newMult !== CONFIG.atrStopMult) {
+        CONFIG.atrStopMult = +newMult.toFixed(2);
+        changes.atrStopMult = CONFIG.atrStopMult;
+        reasons.push(`SL analysis: avg MAE ${avgMAE.toFixed(2)}% vs stop ${avgStopDist.toFixed(2)}% — stop too tight for noise`);
+      }
+    }
+
+    // If trade went negative immediately (no MFE before SL) — signal quality issue
+    if (avgMFE_beforeSL < 0.2 && slTrades.length >= 4) {
+      const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, CONFIG.minConfidence + _step(effectiveWR, ADAPT_TARGET_WR, 1.5));
+      if (Math.abs(newConf - CONFIG.minConfidence) > 0.5) {
+        CONFIG.minConfidence = Math.round(newConf);
+        changes.minConfidence = CONFIG.minConfidence;
+        reasons.push(`SL analysis: trades went negative immediately (avg MFE ${avgMFE_beforeSL.toFixed(2)}%) — poor entry timing`);
+      }
+    }
+
+    // Analyze stop distance vs ATR — if stop is less than 1× ATR it's likely noise
+    const avgStopAtr = slTrades.reduce((a,t) => a + (t.stopDistAtr||CONFIG.atrStopMult), 0) / slTrades.length;
+    if (avgStopAtr < 1.5 && effectiveWR < ADAPT_TARGET_WR) {
+      const newMult = Math.min(ADAPT_BOUNDS.atrStopMult.max, CONFIG.atrStopMult + 0.2);
+      if (newMult !== CONFIG.atrStopMult) {
+        CONFIG.atrStopMult = +newMult.toFixed(2);
+        changes.atrStopMult = CONFIG.atrStopMult;
+        reasons.push(`SL analysis: stop only ${avgStopAtr.toFixed(1)}× ATR — needs at least 1.5× to absorb noise`);
+      }
+    }
+  }
+
+  // ── DEEP TAKE PROFIT ANALYSIS ─────────────────────────────────────
+  if (tpTrades.length >= 3) {
+    const avgMFE = tpTrades.reduce((a,t) => a + (t.mfe||0), 0) / tpTrades.length;
+    const avgHold = tpTrades.reduce((a,t) => a + (t.holdMins||0), 0) / tpTrades.length;
+
+    // If winners regularly exceed TP3 — TP levels too conservative, missing upside
+    const exceededTP3 = tpTrades.filter(t => (t.mfe||0) > CONFIG.tp3Pct * 100 * 1.5).length;
+    if (exceededTP3 > tpTrades.length * 0.4) {
+      const newTP3 = Math.min(ADAPT_BOUNDS.tp3Pct.max, CONFIG.tp3Pct * 1.1);
+      if (Math.abs(newTP3 - CONFIG.tp3Pct) > 0.005) {
+        CONFIG.tp3Pct = +newTP3.toFixed(3);
+        changes.tp3Pct = (CONFIG.tp3Pct*100).toFixed(1)+'%';
+        reasons.push(`TP analysis: ${exceededTP3}/${tpTrades.length} winners exceeded TP3 — raising target`);
+      }
+    }
+
+    // If winners are being exited too early (MFE much higher than exit pnl)
+    const earlyExits = tpTrades.filter(t => (t.mfe||0) > (t.pnlPct||0) * 100 * 1.5).length;
+    if (earlyExits > tpTrades.length * 0.5) {
+      // Winners have more room — loosen trailing stop slightly
+      const newTrail = Math.min(0.05, CONFIG.trailingStopPct * 1.15);
+      if (Math.abs(newTrail - CONFIG.trailingStopPct) > 0.002) {
+        CONFIG.trailingStopPct = +newTrail.toFixed(3);
+        changes.trailingStopPct = (CONFIG.trailingStopPct*100).toFixed(1)+'%';
+        reasons.push(`TP analysis: winners have more room (avg MFE ${avgMFE.toFixed(1)}%) — loosening trail`);
+      }
+    }
+  }
+
+  // ── ENTRY TIMING ANALYSIS ─────────────────────────────────────────
+  // Analyze volume, momentum, and ATR at entry across wins vs losses
+  const winEntries  = recent20.filter(t => t.won && t.volumeRatio !== undefined);
+  const lossEntries = recent20.filter(t => !t.won && t.volumeRatio !== undefined);
+
+  if (winEntries.length >= 3 && lossEntries.length >= 3) {
+    const avgWinVol  = winEntries.reduce((a,t) => a + (t.volumeRatio||1), 0) / winEntries.length;
+    const avgLossVol = lossEntries.reduce((a,t) => a + (t.volumeRatio||1), 0) / lossEntries.length;
+    const avgWinAtr  = winEntries.reduce((a,t) => a + (t.atrPct||0), 0) / winEntries.length;
+    const avgLossAtr = lossEntries.reduce((a,t) => a + (t.atrPct||0), 0) / lossEntries.length;
+
+    // Wins happen on higher volume — volume filter is working, maybe need higher threshold
+    if (avgWinVol > avgLossVol * 1.3) {
+      reasons.push(`Entry analysis: wins avg ${avgWinVol.toFixed(1)}x vol vs losses ${avgLossVol.toFixed(1)}x — volume signal strong`);
+    }
+
+    // Losses happen on high ATR (volatile) markets — consider tightening in volatile conditions
+    if (avgLossAtr > avgWinAtr * 1.4 && effectiveWR < ADAPT_TARGET_WR) {
+      const newMult = Math.min(ADAPT_BOUNDS.atrStopMult.max, CONFIG.atrStopMult + 0.1);
+      if (newMult !== CONFIG.atrStopMult) {
+        CONFIG.atrStopMult = +newMult.toFixed(2);
+        changes.atrStopMult = CONFIG.atrStopMult;
+        reasons.push(`Entry analysis: losses in high ATR (${avgLossAtr.toFixed(2)}% vs wins ${avgWinAtr.toFixed(2)}%) — widening stop for volatility`);
+      }
+    }
+  }
+
+  // ── SESSION ANALYSIS ──────────────────────────────────────────────
+  // Find which sessions are profitable vs losing
+  const sessionStats = {};
+  recent20.forEach(t => {
+    const s = t.session || 'unknown';
+    if (!sessionStats[s]) sessionStats[s] = { wins: 0, total: 0 };
+    sessionStats[s].total++;
+    if (t.won) sessionStats[s].wins++;
+  });
+  const badSessions = Object.entries(sessionStats)
+    .filter(([s, d]) => d.total >= 3 && d.wins/d.total < 0.35)
+    .map(([s]) => s);
+  if (badSessions.length > 0) {
+    reasons.push(`Session analysis: poor WR in ${badSessions.join(', ')} — consider avoiding these sessions`);
+  }
+
+  // ── HOLD TIME ANALYSIS ────────────────────────────────────────────
+  const longHoldsWon  = recent20.filter(t => t.won && (t.holdMins||0) > 120);
+  const shortHoldsWon = recent20.filter(t => t.won && (t.holdMins||0) <= 60);
+  const longHoldsLost = recent20.filter(t => !t.won && (t.holdMins||0) > 120);
+
+  if (longHoldsLost.length > longHoldsWon.length && longHoldsLost.length >= 3) {
+    // Long holds are losing — time stop might need tightening
+    const newTimeStop = Math.max(2, CONFIG.timeStopHours - 1);
+    if (newTimeStop !== CONFIG.timeStopHours) {
+      CONFIG.timeStopHours = newTimeStop;
+      changes.timeStopHours = newTimeStop + 'h';
+      reasons.push(`Hold analysis: long holds losing (${longHoldsLost.length} vs ${longHoldsWon.length} wins) — tightening time stop to ${newTimeStop}h`);
+    }
+  } else if (shortHoldsWon.length > longHoldsLost.length && effectiveWR > ADAPT_TARGET_WR + 0.1) {
+    // Short holds winning — could extend time stop to let winners run
+    const newTimeStop = Math.min(12, CONFIG.timeStopHours + 1);
+    if (newTimeStop !== CONFIG.timeStopHours) {
+      CONFIG.timeStopHours = newTimeStop;
+      changes.timeStopHours = newTimeStop + 'h';
+      reasons.push(`Hold analysis: short holds winning — letting winners run longer (${newTimeStop}h)`);
+    }
+  }
 
   // Log and persist
   const summary = `EWMA WR: ${(ewmaWinRate*100).toFixed(1)}% | Last5: ${(wr5*100).toFixed(0)}% | Last10: ${(wr10*100).toFixed(0)}% | Last20: ${(wr20*100).toFixed(0)}%`;
@@ -1932,10 +2067,25 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     portfolio -= cost;
     positions[sym] = {
       entryPrice: price, qty, qtyRemaining: qty, cost,
-      entryTime: new Date(), highWater: price,
+      entryTime: new Date(), highWater: price, lowWater: price,
       atrAtEntry: atrVal, stopPrice,
       breakEvenSet: false, tp1Hit: false, tp2Hit: false,
       srLevels, sigInfo, direction: 'long',
+      // Rich entry analytics for post-trade learning
+      entryAnalytics: {
+        stopDistPct:    +((price - stopPrice) / price * 100).toFixed(3),
+        stopDistAtr:    atrVal > 0 ? +((price - stopPrice) / atrVal).toFixed(2) : 0,
+        atrPct:         +((atrVal / price) * 100).toFixed(3),
+        confidence:     sigInfo.confidence,
+        score:          sigInfo.score || 0,
+        rsi:            sigInfo.rsi || 50,
+        entryMomentum:  bars?.length >= 5 ? +((price - bars[bars.length-5]?.c||price) / (bars[bars.length-5]?.c||price) * 100).toFixed(3) : 0,
+        volumeRatio:    bars?.length >= 10 ? +(bars[bars.length-1].v / (bars.slice(-10).reduce((a,b)=>a+b.v,0)/10)).toFixed(2) : 1,
+        session:        getCurrentSession(),
+        signalReasons:  sigInfo.reasons?.slice(0,5) || [],
+        mfe:            0, // max favorable excursion — updated as position moves
+        mae:            0, // max adverse excursion — updated as position moves
+      },
     };
     alpacaPositions.add(sym);
     // Seed price history immediately so P&L shows right away
@@ -2012,7 +2162,7 @@ async function coverShort(sym, price, reason) {
   const pnl = (pos.entryPrice - price) * qty;
   portfolio += pnl; // add profit (or subtract loss)
   pnl > 0 ? totalWins++ : totalLosses++;
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0 });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete shortPositions[sym];
   alpacaShorts.delete(sym);
 
@@ -2148,7 +2298,7 @@ async function exitPosition(sym, price, reason) {
   const pnl = qtyToSell * price - qtyToSell * avgCost;
   portfolio += qtyToSell * price;
   pnl > 0 ? totalWins++ : totalLosses++;
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0 });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete positions[sym];
   alpacaPositions.delete(sym);
 
@@ -2194,6 +2344,15 @@ async function managePosition(sym, price, bars) {
 
   // Update high water mark
   if (price > pos.highWater) positions[sym].highWater = price;
+  if (price < pos.lowWater)  positions[sym].lowWater  = price;
+
+  // Track MFE (max favorable) and MAE (max adverse) for post-trade analysis
+  if (pos.entryAnalytics) {
+    const mfe = (pos.highWater - pos.entryPrice) / pos.entryPrice * 100;
+    const mae = (pos.entryPrice - pos.lowWater)  / pos.entryPrice * 100;
+    positions[sym].entryAnalytics.mfe = +mfe.toFixed(3);
+    positions[sym].entryAnalytics.mae = +mae.toFixed(3);
+  }
 
   // ── 1. Ratchet ATR stop upward as price rises ──
   if (bars && bars.length >= 14) {
