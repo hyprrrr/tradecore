@@ -888,7 +888,14 @@ async function syncPositions() {
 
   // Swing longs
   for (const [sym, pos] of Object.entries(positions)) {
-    const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    // Use real-time price if available, otherwise use entry price
+    // Never use a price that's more than 5% away from entry on first write — protects against stale data
+    const rawCur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const ageSecs = (Date.now() - new Date(pos.entryTime).getTime()) / 1000;
+    // In first 30s, only use price if it's within 5% of entry (no stale bar prices)
+    const cur = (ageSecs < 30 && Math.abs(rawCur - pos.entryPrice) / pos.entryPrice > 0.05)
+      ? pos.entryPrice
+      : rawCur;
     const qty    = pos.qtyRemaining || pos.qty;
     const pnl    = (cur - pos.entryPrice) * qty;
     const pnlPct = pos.entryPrice > 0 ? ((cur - pos.entryPrice) / pos.entryPrice) * 100 : 0;
@@ -992,6 +999,96 @@ async function syncAll() {
 
 // Sync live prices every 60s using Alpaca's own position data
 // Alpaca gives us current_price, unrealized_pl directly — most accurate source
+// ─────────────────────────────────────────────
+// REAL-TIME PRICE STREAM — Alpaca WebSocket
+// ─────────────────────────────────────────────
+let wsStream       = null;
+let wsConnected    = false;
+let wsSubscribed   = new Set();
+let wsReconnectMs  = 2000;
+
+function getStreamUrl() {
+  const paper = process.env.ALPACA_PAPER !== 'false';
+  return paper
+    ? 'wss://stream.data.alpaca.markets/v2/iex'
+    : 'wss://stream.data.alpaca.markets/v2/sip';
+}
+
+async function connectPriceStream() {
+  if (isSimMode()) return;
+  if (!CONFIG.alpacaKey || !CONFIG.alpacaSecret) return;
+  try {
+    const { WebSocket } = await import('ws');
+    if (wsStream) { try { wsStream.terminate(); } catch(e){} }
+    wsStream = new WebSocket(getStreamUrl());
+    wsConnected = false;
+
+    wsStream.on('open', () => {
+      wsStream.send(JSON.stringify({ action:'auth', key:CONFIG.alpacaKey, secret:CONFIG.alpacaSecret }));
+    });
+
+    wsStream.on('message', (raw) => {
+      try {
+        const msgs = JSON.parse(raw);
+        for (const msg of (Array.isArray(msgs) ? msgs : [msgs])) {
+          if (msg.T === 'success' && msg.msg === 'authenticated') {
+            wsConnected = true; wsReconnectMs = 2000;
+            log('stream', '\u2705 Price stream live');
+            subscribeOpenPositions();
+          }
+          if (msg.T === 't') { // trade print
+            const sym = msg.S, price = +msg.p;
+            if (!sym || !price) continue;
+            if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
+            priceHistory5m[sym].push(price);
+            if (priceHistory5m[sym].length > 200) priceHistory5m[sym].shift();
+            if (positions[sym]) {
+              if (price > positions[sym].highWater) positions[sym].highWater = price;
+              if (price < (positions[sym].lowWater||price)) positions[sym].lowWater = price;
+            }
+            if (shortPositions[sym] && price < (shortPositions[sym].lowWater||price)) {
+              shortPositions[sym].lowWater = price;
+            }
+          }
+          if (msg.T === 'error') log('warn', `Stream: ${msg.msg}`);
+        }
+      } catch(e) {}
+    });
+
+    wsStream.on('close', (code) => {
+      wsConnected = false; wsSubscribed.clear();
+      log('stream', `Stream closed (${code}) — reconnecting in ${wsReconnectMs/1000}s`);
+      setTimeout(() => { wsReconnectMs = Math.min(wsReconnectMs*2,30000); connectPriceStream(); }, wsReconnectMs);
+    });
+
+    wsStream.on('error', (err) => { log('warn', `Stream err: ${err.message}`); });
+  } catch(e) {
+    log('warn', `WS unavailable (${e.message}) — using REST polling`);
+  }
+}
+
+function subscribeOpenPositions() {
+  if (!wsStream || !wsConnected) return;
+  const syms = [...new Set([...Object.keys(positions),...Object.keys(shortPositions),...Object.keys(scalpPositions)])].filter(s=>!wsSubscribed.has(s));
+  if (!syms.length) return;
+  wsStream.send(JSON.stringify({ action:'subscribe', trades:syms, quotes:syms }));
+  syms.forEach(s=>wsSubscribed.add(s));
+  log('stream', `📡 Subscribed: ${syms.join(', ')}`);
+}
+
+function unsubscribeClosedPositions() {
+  if (!wsStream || !wsConnected) return;
+  const open = new Set([...Object.keys(positions),...Object.keys(shortPositions),...Object.keys(scalpPositions)]);
+  const toUnsub = [...wsSubscribed].filter(s=>!open.has(s));
+  if (!toUnsub.length) return;
+  wsStream.send(JSON.stringify({ action:'unsubscribe', trades:toUnsub, quotes:toUnsub }));
+  toUnsub.forEach(s=>wsSubscribed.delete(s));
+}
+
+// ─────────────────────────────────────────────
+// END REAL-TIME PRICE STREAM
+// ─────────────────────────────────────────────
+
 async function syncPricesOnly() {
   if (isSimMode()) {
     for (const [sym, pos] of Object.entries(positions)) {
@@ -2168,10 +2265,28 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   if (checkCircuitBreaker()) return;
   if (hasLargeGap(sym, price)) return;
 
+  // ── HARD POSITION LIMITS — checked inside enterPosition so they can never be bypassed ──
+  const totalNow = Object.keys(positions).length + Object.keys(shortPositions).length + Object.keys(scalpPositions).length;
+  if (totalNow >= CONFIG.maxOpenPositions) {
+    log('risk', `🚫 Max positions (${CONFIG.maxOpenPositions}) reached — blocked ${sym}`);
+    return;
+  }
+
   // Don't enter if already in position in same direction
-  if (direction === 'long'  && (positions[sym]      || alpacaPositions.has(sym)))      { log('warn', `${sym} already long`); return; }
-  if (direction === 'short' && (shortPositions[sym]  || alpacaShorts.has(sym)))         { log('warn', `${sym} already short`); return; }
+  if (direction === 'long'  && (positions[sym]     || alpacaPositions.has(sym))) { log('warn', `${sym} already long`); return; }
+  if (direction === 'short' && (shortPositions[sym] || alpacaShorts.has(sym)))   { log('warn', `${sym} already short`); return; }
   if (direction === 'long'  && isCorrelated(sym)) return;
+
+  // ── DOLLAR EXPOSURE LIMIT — never deploy more than 90% of starting capital ──
+  const deployedNow = Object.entries(positions).reduce((a,[s,pos]) => {
+    const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
+    return a + cur * (pos.qtyRemaining || pos.qty);
+  }, 0);
+  const maxDeploy = CONFIG.startingCapital * 0.90;
+  if (!isSimMode() && deployedNow >= maxDeploy) {
+    log('risk', `🚫 90% capital deployed ($${deployedNow.toFixed(0)}) — blocked ${sym}`);
+    return;
+  }
 
   const qty  = calcQty(sym, price, bars, sigInfo?.confidence || 70);
   const cost = qty * price;
@@ -2196,6 +2311,18 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     const stopPrice = Math.max(atrStop, capStop, isSimMode() ? simFloor : capStop);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
+      // For live mode — verify Alpaca doesn't already have this position
+      // This catches restarts, sync delays, and duplicate signals
+      if (!isSimMode()) {
+        try {
+          const existingPos = await alpacaFetch(`${ALPACA_BASE()}/v2/positions/${sym}`);
+          if (existingPos && existingPos.qty) {
+            log('warn', `🚫 Alpaca already has ${sym} position (${existingPos.qty} shares) — blocked duplicate`);
+            alpacaPositions.add(sym); // update in-memory to prevent future attempts
+            return;
+          }
+        } catch(e) { /* 404 = no position, that's fine */ }
+      }
       try { await placeSmartOrder(sym, qty, 'buy', false); }
       catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
     }
@@ -2227,6 +2354,8 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     if (!priceHistory5m[sym] || priceHistory5m[sym].length === 0) {
       priceHistory5m[sym] = [price];
     }
+    // Subscribe to real-time price stream for this symbol
+    subscribeOpenPositions();
     trades.push({ time: new Date(), sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
     const stopPct = ((price - stopPrice) / price * 100).toFixed(2);
     log('buy', `✅ LONG ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (-${stopPct}%) | conf=${sigInfo.confidence}%`);
@@ -2338,7 +2467,11 @@ async function manageShort(sym, price, bars) {
   const pos = shortPositions[sym];
   if (!pos) return;
 
-  const chg      = (pos.entryPrice - price) / pos.entryPrice; // positive = profitable
+  // Don't manage until 30 seconds old — prevents false triggers from stale prices
+  const ageSecs = (Date.now() - new Date(pos.entryTime).getTime()) / 1000;
+  if (ageSecs < 30) return;
+
+  const chg      = (pos.entryPrice - price) / pos.entryPrice;
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
 
   // Update low water mark (lowest price = most profit for short)
@@ -2658,6 +2791,14 @@ async function managePosition(sym, price, bars) {
   const pos = positions[sym];
   if (!pos) return;
 
+  // Don't manage a position until it's at least 30 seconds old
+  // This prevents false stop-loss triggers from stale bar prices immediately after entry
+  const ageSecs = (Date.now() - new Date(pos.entryTime).getTime()) / 1000;
+  if (ageSecs < 30) {
+    log('pos', `${sym} entry ${ageSecs.toFixed(0)}s ago — waiting for first real price tick`);
+    return;
+  }
+
   const chg      = (price - pos.entryPrice) / pos.entryPrice;
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
 
@@ -2862,6 +3003,10 @@ async function runScan() {
   log('scan', `═══ ${session} — Scanning ${symbolsToScan.length} symbols ═══`);
   await syncLog('sys', `Scan started — ${session} — ${symbolsToScan.length} symbols (${CONFIG.symbols.length} favs + screener)`);
 
+  // Always sync real-time prices BEFORE managing positions
+  // This prevents stale bar-close prices from triggering false stop losses
+  if (!isSimMode()) await syncPricesOnly();
+
   // Always sync live Alpaca positions first
   await syncAlpacaPositions();
   log('scan', `Prefetching bars for ${symbolsToScan.length} symbols in parallel…`);
@@ -2909,21 +3054,27 @@ async function runScan() {
       priceHistory15m[sym] = bars15m?.map(b => b.c) || [];
 
       // Manage open long position
+      // Use real-time price from syncPricesOnly (Alpaca live price), NOT bar close
+      // Bar close can be minutes old — causes false stop losses immediately after entry
       if (positions[sym]) {
-        await managePosition(sym, price, bars5m);
+        const rtPrice = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+        const managedPrice = rtPrice && rtPrice > 0 ? rtPrice : price;
+        await managePosition(sym, managedPrice, bars5m);
         if (positions[sym]) {
-          const pct = ((price - positions[sym].entryPrice) / positions[sym].entryPrice * 100).toFixed(2);
-          log('pos', `LONG ${positions[sym].qtyRemaining||positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${pct}%) ${sessionLabel}`);
+          const pct = ((managedPrice - positions[sym].entryPrice) / positions[sym].entryPrice * 100).toFixed(2);
+          log('pos', `LONG ${positions[sym].qtyRemaining||positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${managedPrice.toFixed(2)} (${pct}%) ${sessionLabel}`);
         }
         continue;
       }
 
-      // Manage open short position
+      // Manage open short position — use real-time price
       if (shortPositions[sym]) {
-        await manageShort(sym, price, bars5m);
+        const rtPriceS = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+        const managedPriceS = rtPriceS && rtPriceS > 0 ? rtPriceS : price;
+        await manageShort(sym, managedPriceS, bars5m);
         if (shortPositions[sym]) {
-          const chg = ((shortPositions[sym].entryPrice - price) / shortPositions[sym].entryPrice * 100).toFixed(2);
-          log('pos', `SHORT ${shortPositions[sym].qtyRemaining}x ${sym} @ $${shortPositions[sym].entryPrice.toFixed(2)} → $${price.toFixed(2)} (${chg}%)`);
+          const chg = ((shortPositions[sym].entryPrice - managedPriceS) / shortPositions[sym].entryPrice * 100).toFixed(2);
+          log('pos', `SHORT ${shortPositions[sym].qtyRemaining}x ${sym} @ $${shortPositions[sym].entryPrice.toFixed(2)} → $${managedPriceS.toFixed(2)} (${chg}%)`);
         }
         continue;
       }
@@ -4146,7 +4297,6 @@ cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' 
 // Startup — prewarm data then scan immediately
 loadRemoteConfig().then(async () => {
   await updateDayBias();
-  // Run screener first so first scan has candidates ready
   if (isMarketOpen()) {
     screenerCandidates = await runMarketScreener();
     lastScreenerRun    = Date.now();
@@ -4154,8 +4304,18 @@ loadRemoteConfig().then(async () => {
   await prewarmData();
   await runScan();
   lastFullScan = Date.now();
+
+  // Start real-time price stream after initial scan
+  connectPriceStream();
 });
 setTimeout(syncPricesOnly, 5000);
+
+// Re-subscribe to any new positions every 30 seconds
+// (catches positions opened after initial subscription)
+setInterval(() => {
+  if (!isSimMode()) subscribeOpenPositions();
+  unsubscribeClosedPositions();
+}, 30000);
 
 // ─────────────────────────────────────────────
 // HTTP SERVER + DISCORD SLASH COMMANDS
