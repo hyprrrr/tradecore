@@ -2104,6 +2104,18 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     log('buy', `✅ LONG ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (-${stopPct}%) | conf=${sigInfo.confidence}%`);
     await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal: atrVal14 });
     await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
+    // Immediately write correct total_value (cash + position market value)
+    // Prevents dashboard from showing a brief spike of cash-only value
+    if (isSimMode()) {
+      const correctEquity = portfolio + price * qty;
+      await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+        cash: +portfolio.toFixed(2),
+        total_value: +correctEquity.toFixed(2),
+        updated_at: new Date().toISOString(),
+      });
+    } else {
+      await syncPortfolio();
+    }
 
   } else {
     // SHORT — borrow shares to sell, profit if price falls
@@ -2343,7 +2355,7 @@ async function exitPosition(sym, price, reason) {
   alpacaPositions.delete(sym);
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
-  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱' }[reason] || '📤';
+  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱', PEAK_EXIT:'🔔' }[reason] || '📤';
   log('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
   await sendDiscordAlert('sell', sym, qtyToSell, price, pnl, reason);
   await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
@@ -2370,6 +2382,136 @@ function calcSRLevels(bars) {
 function nearResistance(price, srLevels) {
   if (!srLevels || !srLevels.length) return false;
   return srLevels.some(l => l.type === 'resistance' && l.price > price && Math.abs((l.price - price) / price) < 0.003);
+}
+
+// ─────────────────────────────────────────────
+// PEAK DETECTION — signals when a trade has hit its max
+// Returns { isPeak: bool, reason: string, urgency: 'immediate'|'warning' }
+//
+// Uses multiple confluence signals:
+//   1. RSI divergence — price makes new high but RSI doesn't
+//   2. Volume exhaustion — volume shrinking as price extends
+//   3. Bearish candle patterns — shooting star, bearish engulfing, doji at high
+//   4. VWAP rejection — price pushed above VWAP but rejected back
+//   5. Bollinger Band upper touch — price at upper band, mean-reversion likely
+//   6. Momentum reversal — price acceleration slowing (lower highs on each bar)
+// ─────────────────────────────────────────────
+function detectPeak(sym, bars, pos) {
+  if (!bars || bars.length < 10 || !pos) return { isPeak: false };
+
+  const prices  = bars.map(b => b.c);
+  const highs   = bars.map(b => b.h);
+  const volumes = bars.map(b => b.v);
+  const price   = prices[prices.length - 1];
+  const signals = [];
+  let urgency   = 'warning';
+
+  // Only run peak detection if we're in profit
+  const chg = (price - pos.entryPrice) / pos.entryPrice;
+  if (chg <= 0) return { isPeak: false };
+
+  // ── 1. RSI DIVERGENCE ──────────────────────────────────────────
+  // Price making higher highs but RSI making lower highs = bearish divergence
+  if (bars.length >= 20) {
+    const rsiNow  = rsi(prices, 14);
+    const rsi5ago = rsi(prices.slice(0, -5), 14);
+    const priceHigh    = Math.max(...highs.slice(-5));
+    const priceHigh5ag = Math.max(...highs.slice(-10, -5));
+    if (priceHigh > priceHigh5ag * 1.001 && rsiNow < rsi5ago - 3) {
+      signals.push(`RSI divergence (price ↑ RSI ${rsiNow.toFixed(0)} < ${rsi5ago.toFixed(0)})`);
+      if (rsiNow > 70) urgency = 'immediate'; // overbought + divergence = strong sell signal
+    }
+    // Overbought RSI alone is a warning
+    if (rsiNow > 75) signals.push(`RSI overbought ${rsiNow.toFixed(0)}`);
+    if (rsiNow > 80) urgency = 'immediate';
+  }
+
+  // ── 2. VOLUME EXHAUSTION ───────────────────────────────────────
+  // Volume shrinking as price extends = buyers running out of steam
+  if (volumes.length >= 6) {
+    const avgVol   = volumes.slice(-10, -3).reduce((a,b) => a+b, 0) / 7;
+    const recentVol = volumes.slice(-3).reduce((a,b) => a+b, 0) / 3;
+    if (recentVol < avgVol * 0.5 && chg > 0.01) {
+      signals.push(`Volume exhaustion (${(recentVol/avgVol*100).toFixed(0)}% of avg)`);
+    }
+  }
+
+  // ── 3. BEARISH CANDLE PATTERNS ─────────────────────────────────
+  const last = bars[bars.length - 1];
+  const prev = bars[bars.length - 2];
+  if (last && prev) {
+    const body     = Math.abs(last.c - last.o);
+    const range    = last.h - last.l || 0.0001;
+    const upperWick = last.h - Math.max(last.c, last.o);
+    const lowerWick = Math.min(last.c, last.o) - last.l;
+
+    // Shooting star: small body, long upper wick, little lower wick
+    if (upperWick > body * 2 && upperWick > range * 0.6 && lowerWick < body * 0.5 && last.c < last.o) {
+      signals.push('Shooting star candle');
+      urgency = 'immediate';
+    }
+
+    // Bearish engulfing: current bearish bar completely covers previous bullish bar
+    if (last.c < last.o && prev.c > prev.o &&
+        last.o >= prev.c && last.c <= prev.o) {
+      signals.push('Bearish engulfing');
+      urgency = 'immediate';
+    }
+
+    // Doji at high: open ≈ close, price near high water
+    if (body < range * 0.1 && last.h >= pos.highWater * 0.999) {
+      signals.push('Doji at peak');
+    }
+
+    // Dark cloud cover: gap up then closes below midpoint of previous bar
+    if (last.o > prev.h && last.c < (prev.o + prev.c) / 2 && last.c < last.o) {
+      signals.push('Dark cloud cover');
+      urgency = 'immediate';
+    }
+  }
+
+  // ── 4. VWAP REJECTION ─────────────────────────────────────────
+  if (bars.length >= 20) {
+    const vw = vwap(bars.slice(-20));
+    const vwapDist = (price - vw) / vw;
+    // Far above VWAP and starting to pull back
+    if (vwapDist > 0.015 && price < pos.highWater * 0.999) {
+      signals.push(`VWAP extended +${(vwapDist*100).toFixed(1)}% — rejection likely`);
+    }
+  }
+
+  // ── 5. BOLLINGER BAND UPPER TOUCH ─────────────────────────────
+  const bb = bollingerBands(prices, 20, 2);
+  if (bb && price >= bb.upper * 0.998) {
+    signals.push(`At BB upper ($${bb.upper.toFixed(2)})`);
+    // If RSI also overbought at BB upper — strong peak signal
+    if (rsi(prices, 14) > 68) urgency = 'immediate';
+  }
+
+  // ── 6. MOMENTUM DECELERATION ──────────────────────────────────
+  // Bar-over-bar gains getting smaller (momentum running out)
+  if (bars.length >= 6) {
+    const moves = [];
+    for (let i = bars.length - 5; i < bars.length; i++) {
+      moves.push(bars[i].c - bars[i-1].c);
+    }
+    const positiveDecelerating = moves.every(m => m !== undefined) &&
+      moves[0] > 0 && moves[1] > 0 && moves[2] > 0 &&
+      moves[moves.length-1] < moves[moves.length-3] * 0.3; // last move < 30% of earlier move
+    if (positiveDecelerating && chg > 0.008) {
+      signals.push('Momentum decelerating (3 smaller gains)');
+    }
+  }
+
+  // ── CONFLUENCE THRESHOLD ───────────────────────────────────────
+  // Need 2+ signals for a warning, 1 immediate signal to act
+  const isPeak = urgency === 'immediate' || signals.length >= 2;
+
+  if (isPeak && signals.length > 0) {
+    log('risk', `🔔 PEAK DETECTED ${sym} @ $${price.toFixed(2)} (+${(chg*100).toFixed(2)}%) | ${signals.join(' | ')}`);
+  }
+
+  return { isPeak, urgency, signals };
 }
 
 // ─────────────────────────────────────────────
@@ -2489,6 +2631,29 @@ async function managePosition(sym, price, bars) {
     if (fallingBars && fromHW >= 0.010) {
       log('sell', `📉 ${sym} momentum fade: ${(fromHW*100).toFixed(1)}% from peak, 3 red bars — exiting at profit`);
       return exitPosition(sym, price, 'TRAILING_STOP');
+    }
+  }
+
+  // ── PEAK DETECTION — exit immediately when multiple reversal signals fire ──
+  if (pos.breakEvenSet && chg > 0.005 && bars && bars.length >= 10) {
+    const peak = detectPeak(sym, bars, pos);
+    if (peak.isPeak) {
+      if (peak.urgency === 'immediate') {
+        // Strong reversal signal — exit entire position at market immediately
+        log('sell', `🔔 PEAK EXIT ${sym} @ $${price.toFixed(2)} (+${(chg*100).toFixed(2)}%) — ${peak.signals.slice(0,2).join(', ')}`);
+        await syncLog('sell', `🔔 Peak exit: ${sym} @ $${price.toFixed(2)} | ${peak.signals.join(' | ')}`);
+        return exitPosition(sym, price, 'PEAK_EXIT');
+      } else if (peak.signals.length >= 2 && !pos.tp1Hit) {
+        // Warning level — sell partial (33%) to lock in some profit
+        const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.33));
+        log('sell', `⚠️ PEAK WARNING ${sym} — selling ${sell} shares to lock profit`);
+        positions[sym].tp1Hit = true; // treat as TP1 so we don't re-trigger
+        await partialExit(sym, price, sell, 'PEAK_PARTIAL');
+        if (!positions[sym]) return;
+        // Tighten trailing stop after partial peak exit
+        positions[sym].stopPrice = Math.max(positions[sym].stopPrice, price * 0.992);
+        return;
+      }
     }
   }
 
