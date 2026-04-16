@@ -517,7 +517,11 @@ async function syncPortfolio() {
       const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       return a + cur * (pos.qtyRemaining || pos.qty);
     }, 0);
-    const equity = portfolio + openVal;
+    const shortPnl = Object.entries(shortPositions).reduce((a, [sym, pos]) => {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      return a + (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty);
+    }, 0);
+    const equity = portfolio + openVal + shortPnl;
     const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
     if (equity > 0) { realEquity = equity; if (!realDailyStartEquity) realDailyStartEquity = CONFIG.startingCapital; }
     await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
@@ -525,11 +529,7 @@ async function syncPortfolio() {
       total_wins: totalWins, total_losses: totalLosses, circuit_breaker: circuitBreakerOn,
       last_scan: new Date().toISOString(), session: getCurrentSession(), updated_at: new Date().toISOString(),
     });
-    const now = Date.now();
-    if (equity > 0 && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
-      lastEquitySnapshot = now;
-      await sbFetch(tbl('tc_equity'), 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
-    }
+    // Sim never writes to tc_equity — equity chart only shows real account history
     return;
   }
 
@@ -704,7 +704,9 @@ async function syncLog(type, msg) {
 }
 
 async function syncAll() {
-  // Run both in parallel — was sequential before (2× slower)
+  // In sim mode, positions and portfolio are synced by runSimScan
+  // after prices are updated — don't sync here or we get stale prices
+  if (isSimMode()) return;
   await Promise.all([syncPortfolio(), syncPositions()]);
 }
 
@@ -1353,7 +1355,8 @@ async function runSimScan() {
   if (!lastSnapshot) return;
   const barTime = lastBarTime;
 
-  // equity = cash + full market value of open positions
+  // Sync positions with fresh bar prices — do this BEFORE portfolio sync
+  await syncPositions();
   // (cash was reduced when buying, so add back full position value not just P&L)
   const positionMarketValue = Object.entries(positions).reduce((acc, [sym, pos]) => {
     const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
