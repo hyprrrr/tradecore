@@ -739,7 +739,8 @@ async function poll(){
 
   if(!equityLoaded || pollCount % 40 === 0){ // reload every ~2 min
     try{
-      const eq=await sbGet(dtbl('tc_equity'),'?order=created_at.asc&limit=500');
+      // Always read from live tc_equity — sim never writes here so chart stays clean
+      const eq=await sbGet('tc_equity','?order=created_at.asc&limit=500');
       if(eq&&eq.length>0) equityHistory=eq.map(e=>+e.value).filter(v=>!isNaN(v)&&v>0);
       else equityHistory=[];
     }catch(e){}
