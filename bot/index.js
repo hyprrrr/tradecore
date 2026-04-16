@@ -1353,12 +1353,22 @@ async function runSimScan() {
   if (!lastSnapshot) return;
   const barTime = lastBarTime;
 
-  // Sync simulated portfolio to Supabase so dashboard updates live
+  // equity = cash + full market value of open positions
+  // (cash was reduced when buying, so add back full position value not just P&L)
+  const positionMarketValue = Object.entries(positions).reduce((acc, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    return acc + cur * (pos.qtyRemaining || pos.qty);
+  }, 0);
+  const shortPnl = Object.entries(shortPositions).reduce((acc, [sym, pos]) => {
+    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    return acc + (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty);
+  }, 0);
   const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
     const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
     return acc + (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
-  }, 0);
-  const equity = portfolio + openPnl;
+  }, 0) + shortPnl;
+
+  const equity = portfolio + positionMarketValue + shortPnl;
   const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
 
   realEquity = equity;
