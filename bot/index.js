@@ -1283,9 +1283,9 @@ async function runSimScan() {
     log('sim', `🎮 Sim portfolio reset to $${portfolio.toFixed(2)}`);
   }
 
-  // Advance multiple bars per scan — speeds up replay significantly
-  // At 5 bars/scan × every 15s = covers 75 min of market data per real minute
-  const SIM_BARS_PER_SCAN = 5;
+  // 1 bar per scan — keeps positions visible and lets you watch them play out
+  // Scan runs every 3s in sim mode (controlled by tick interval override below)
+  const SIM_BARS_PER_SCAN = 1;
   let lastSnapshot = null;
   let lastBarTime = null;
 
@@ -3398,14 +3398,8 @@ async function tick() {
   try {
     const now = Date.now();
 
-    // ── Simulation mode — use bar replay instead of live market ──
-    if (isSimMode()) {
-      if (now - lastFullScan >= FULL_SCAN_INTERVAL_MS) {
-        lastFullScan = now;
-        await runSimScan();
-      }
-      return; // skip all live market logic in sim mode
-    }
+    // ── Simulation mode — handled by dedicated 3s sim tick ──
+    if (isSimMode()) return;
 
     // ── Live / Paper mode ──
 
@@ -3435,8 +3429,24 @@ async function tick() {
   }
 }
 
-// Main tick every 15 seconds
+// Main tick every 8 seconds (live/paper mode)
 setInterval(tick, PRICE_SYNC_INTERVAL_MS);
+
+// Sim gets its own fast tick — 3 seconds per bar = realistic pace
+// 1 bar = 5 min of market time, so 3s real = ~5min sim
+// A 2-hour trade plays out in ~24 real seconds — fast enough to test, slow enough to watch
+setInterval(async () => {
+  if (!isSimMode()) return;
+  if (scanInProgress) return;
+  scanInProgress = true;
+  try {
+    await runSimScan();
+  } catch(e) {
+    log('error', `Sim tick error: ${e.message}`);
+  } finally {
+    scanInProgress = false;
+  }
+}, 3000);
 
 // Fast config poll — checks for mode changes every 5 seconds
 // This means sim on/off takes effect within 5s instead of up to 30s
