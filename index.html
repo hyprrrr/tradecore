@@ -737,8 +737,12 @@ async function poll(){
 
   if(!portfolio||portfolio.length===0){ setOffline(); return; }
 
-  if(!equityLoaded){
-    try{ const eq=await sbGet(dtbl('tc_equity'),'?order=created_at.asc&limit=500'); if(eq&&eq.length>0) equityHistory=eq.map(e=>+e.value).filter(v=>!isNaN(v)&&v>0); }catch(e){}
+  if(!equityLoaded || pollCount % 40 === 0){ // reload every ~2 min
+    try{
+      const eq=await sbGet(dtbl('tc_equity'),'?order=created_at.asc&limit=500');
+      if(eq&&eq.length>0) equityHistory=eq.map(e=>+e.value).filter(v=>!isNaN(v)&&v>0);
+      else equityHistory=[];
+    }catch(e){}
     equityLoaded=true;
   }
 
@@ -887,13 +891,8 @@ function updateKPIs(p, positions, trades){
     }
   }
 
-  const lastVal=equityHistory[equityHistory.length-1];
-  if(!lastVal||Math.abs(equity-lastVal)>0.01){
-    if(!lastVal||Math.abs((equity-lastVal)/lastVal)<0.05){
-      equityHistory.push(+equity.toFixed(2));
-      if(equityHistory.length>1000) equityHistory.shift();
-    }
-  }
+  // Only draw chart with database values — never push poll values directly
+  // This prevents sim data from creating spikes on the live chart
   drawChart();
 }
 
