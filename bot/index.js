@@ -1624,6 +1624,10 @@ async function runSimScan() {
       const confirmed = sig.signal !== 'HOLD' && sig.score > 0;
       if (!confirmed) continue;
 
+      // Recalculate totalOpen after every entry — prevents same-scan over-entry
+      const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
+      if (totalOpen >= CONFIG.maxOpenPositions) continue;
+
       if (sig.signal === 'BUY' && totalOpen < CONFIG.maxOpenPositions) {
         await enterPosition(sym, price, sig, bars5m, 'long');
       } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled && totalOpen < CONFIG.maxOpenPositions) {
@@ -2075,27 +2079,31 @@ function checkCircuitBreaker() {
 // POSITION SIZING (ATR-based, risk 1% per trade)
 // ─────────────────────────────────────────────
 function calcQty(symbol, price, bars, confidence = 70) {
-  // Scale position size by signal confidence
-  // 60% confidence → 50% of max size
-  // 75% confidence → 75% of max size
-  // 90%+ confidence → full size
+  if (!price || price <= 0) return 0;
+
+  // Hard dollar cap — never put more than maxPositionPct of STARTING capital in one trade
+  // Use startingCapital not current portfolio — prevents oversizing on winning streaks
+  const baseCap    = Math.max(portfolio, CONFIG.startingCapital);
   const confScale  = Math.max(0.4, Math.min(1.0, (confidence - CONFIG.minConfidence) / 30 + 0.5));
   const scaledPct  = CONFIG.maxPositionPct * confScale;
-  const maxCost    = portfolio * scaledPct;
+  const maxCost    = baseCap * scaledPct;              // hard dollar cap
   const maxShares  = Math.floor(maxCost / price);
+
+  if (maxShares < 1) return 0;
+
   if (bars && bars.length >= 14) {
     const atrVal = atr(bars, 14);
     if (atrVal > 0) {
-      // Risk 1% of portfolio per trade, capped by position size limit
-      const riskShares = Math.floor((portfolio * 0.01) / atrVal);
+      // Risk at most 1% of starting capital per trade
+      const riskShares = Math.floor((baseCap * 0.01) / atrVal);
       const qty = Math.min(riskShares, maxShares);
       if (qty >= 1) {
-        log('size', `${symbol} conf=${confidence}% scale=${(confScale*100).toFixed(0)}% ATR=${atrVal.toFixed(2)} → qty=${qty}`);
+        log('size', `${symbol} conf=${confidence}% scale=${(confScale*100).toFixed(0)}% max=$${maxCost.toFixed(0)} ATR=${atrVal.toFixed(2)} → qty=${qty}`);
         return qty;
       }
     }
   }
-  return Math.max(1, maxShares);
+  return maxShares;
 }
 
 // ─────────────────────────────────────────────
@@ -2903,9 +2911,21 @@ async function runScan() {
         await syncLog('info', `${sym} @ $${price.toFixed(2)} → ${sig.signal} conf:${sig.confidence}% score:${sig.score||0} ${sessionLabel}`);
       }
 
-      const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
+      // Recalculate AFTER each entry — prevents multiple entries in same scan
+      const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length + Object.keys(scalpPositions).length;
+      if (totalOpen >= CONFIG.maxOpenPositions) continue; // hard stop
 
-      // Signal confirmation gate — must appear on 2 consecutive scans
+      // Portfolio risk check — never deploy more than 90% of portfolio
+      const deployedCapital = Object.entries(positions).reduce((a,[s,pos])=>{
+        const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
+        return a + cur * (pos.qtyRemaining||pos.qty);
+      }, 0);
+      if (deployedCapital > portfolio * 0.90) {
+        log('risk', `Portfolio 90% deployed ($${deployedCapital.toFixed(0)}) — no new entries`);
+        continue;
+      }
+
+      // Signal confirmation gate — must appear on consecutive scans
       const confirmed = confirmSignal(sym, sig);
       if (!confirmed) continue; // waiting for confirmation
 
