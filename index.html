@@ -818,35 +818,45 @@ async function poll(){
 
   const p=portfolio[0], posData=positions||[];
 
-  // Build equity history from poll data
-  // Smart spike filter: a drop is only valid if there are no new positions
-  // (position entries temporarily reduce cash before total_value is corrected)
-  const rawEquity  = +p.total_value;
-  const startCap   = getStartingCapital();
-  const last        = equityHistory[equityHistory.length-1];
-  const change      = last ? (rawEquity - last) / last : 0;
-  const posCount    = posData.length;
-  const lastPosCount = equityHistory._lastPosCount || 0;
-  equityHistory._lastPosCount = posCount;
+  // Build equity history from cash + position market value
+  // NEVER use total_value from DB — it has lag on position entry/exit
+  // Instead compute it ourselves from the same poll data we already have
+  const startCap = getStartingCapital();
+  const cashVal  = +p.cash || 0;
 
-  const isValidPoint = (
-    rawEquity > startCap * 0.5 &&
-    rawEquity < startCap * 2.0 &&
-    // Allow any upward move or tiny downward move
-    (change >= -0.001 ||
-    // Allow larger drops ONLY if no new positions opened since last poll
-    // (if positions increased, the drop is a cash→position transfer, not a real loss)
-     (change >= -0.02 && posCount <= lastPosCount))
-  );
+  // Sum long position market values using current_price (updated every bar)
+  // Fall back to entry_price only if current_price missing (brand new position)
+  const longVal = posData
+    .filter(pos => pos.side !== 'SHORT')
+    .reduce((sum, pos) => {
+      const cur = +pos.current_price || +pos.entry_price || 0;
+      const qty = +pos.qty || 0;
+      return sum + cur * qty;
+    }, 0);
 
-  if(!last || isValidPoint) {
-    equityHistory.push(+rawEquity.toFixed(2));
+  // Short P&L (profit from price falling)
+  const shortPnl = posData
+    .filter(pos => pos.side === 'SHORT')
+    .reduce((sum, pos) => sum + (+pos.pnl || 0), 0);
+
+  // True equity = cash + all open position value
+  const trueEquity = cashVal > 0 ? +(cashVal + longVal + shortPnl).toFixed(2) : +p.total_value;
+
+  const last    = equityHistory[equityHistory.length-1];
+  const change  = last ? (trueEquity - last) / last : 0;
+  const isSane  = trueEquity > startCap * 0.5 && trueEquity < startCap * 2.0;
+  // Only reject if value drops more than 5% in one poll — genuine crashes allowed
+  const isValid = !last || change > -0.05;
+
+  if(isSane && isValid) {
+    equityHistory.push(trueEquity);
     if(equityHistory.length > 500) equityHistory.shift();
   }
   if(!equityLoaded){ equityLoaded=true; }
 
   // Always update KPIs and positions (fast, important)
-  updateKPIs(p, posData, []);
+  // Pass trueEquity so portfolio display uses same spike-free value as chart
+  updateKPIs(p, posData, [], trueEquity);
   
   // Only re-render positions if they changed
   const posHash = JSON.stringify(posData.map(p=>p.symbol+p.pnl+p.current_price));
@@ -911,8 +921,8 @@ function updateScreener(p){
 
 function getStartingCapital(){ try{ const s=JSON.parse(localStorage.getItem('tc_settings')||'{}'); if(s.startingCapital&&+s.startingCapital>0) return +s.startingCapital; }catch(e){} return 100000; }
 
-function updateKPIs(p, positions, trades){
-  const equity   = +p.total_value;
+function updateKPIs(p, positions, trades, overrideEquity){
+  const equity   = overrideEquity || +p.total_value;
   const cash     = +p.cash;
   const dayPnl   = +p.day_pnl;
   const wins     = +p.total_wins  || 0;
