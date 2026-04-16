@@ -270,168 +270,270 @@ const CORRELATION_GROUPS = [
 ];
 
 // ═══════════════════════════════════════════════════════════════════
-// ADAPTIVE LEARNING ENGINE
+// ADAPTIVE LEARNING ENGINE v2 — Statistical Fine-Tuning
 // ═══════════════════════════════════════════════════════════════════
 //
-// Tracks win/loss patterns and automatically adjusts entry thresholds
-// based on what conditions are actually producing profitable trades.
+// Triggers: after EVERY trade, checks if adjustment needed
+// Target:   maintain ≥60% win rate at all times
 //
-// What it adjusts:
-//   - Minimum confidence threshold (tighten/loosen based on win rate)
-//   - RSI oversold/overbought levels (shift based on where wins cluster)
-//   - ADX minimum (raise if ranging trades keep losing)
-//   - Confirmation gate count (raise if too many false signals)
-//   - Position sizing (reduce after losing streaks, increase on hot streaks)
-//
-// Rules:
-//   - Never adjusts more than ±20% from the original defaults
-//   - Requires minimum 10 trades before any adjustment
-//   - Re-evaluates every 20 closed trades
-//   - All changes are logged and written to Supabase for transparency
+// Approach: Bayesian-style parameter scoring
+//   - Each parameter has a "score" based on win rate at that value
+//   - Adjustments are proportional to how far below target we are
+//   - Uses exponential moving average so recent trades matter more
+//   - Finds optimal "sweet spots" by tracking win rate per RSI bucket,
+//     confidence bucket, session, etc.
+//   - Applies diminishing returns — large adjustments when far off target,
+//     tiny micro-adjustments when close to sweet spot
+//   - Emergency mode triggers instantly if win rate drops below 40%
 // ═══════════════════════════════════════════════════════════════════
+
+const ADAPT_TARGET_WR   = 0.60; // target win rate
+const ADAPT_EMERGENCY   = 0.40; // emergency mode threshold
+const ADAPT_ALPHA       = 0.3;  // EMA weight for recent trades (higher = more reactive)
 
 const ADAPT_DEFAULTS = {
   rsiOversold:    35,
   rsiOverbought:  65,
-  minConfidence:  60, // minimum confidence to enter a trade
+  minConfidence:  60,
   atrStopMult:    2.0,
   maxPositionPct: 0.15,
+  tp1Pct:         0.04,
+  tp2Pct:         0.08,
+  tp3Pct:         0.14,
+  breakEvenAt:    0.02,
 };
 
-// Bounds — never go outside these ranges
 const ADAPT_BOUNDS = {
-  rsiOversold:    { min: 20, max: 42 },
-  rsiOverbought:  { min: 58, max: 80 },
-  minConfidence:  { min: 50, max: 85 },
-  atrStopMult:    { min: 1.5, max: 3.0 },
-  maxPositionPct: { min: 0.05, max: 0.25 },
+  rsiOversold:    { min: 18, max: 45 },
+  rsiOverbought:  { min: 55, max: 82 },
+  minConfidence:  { min: 45, max: 90 },
+  atrStopMult:    { min: 1.2, max: 3.5 },
+  maxPositionPct: { min: 0.03, max: 0.25 },
+  tp1Pct:         { min: 0.02, max: 0.08 },
+  tp2Pct:         { min: 0.05, max: 0.15 },
+  tp3Pct:         { min: 0.08, max: 0.25 },
+  breakEvenAt:    { min: 0.01, max: 0.05 },
 };
 
-// In-memory trade performance log
-// Each entry: { pnl, confidence, rsi, session, won, timestamp }
+// Extended trade log — stores rich context for each trade
 let tradePerformanceLog = [];
-let lastAdaptAt = 0;
-const ADAPT_EVERY_N_TRADES = 20;
 
-// Called when a trade closes — record conditions for learning
-function recordTradeOutcome(pnl, entryConditions = {}) {
+// Exponential moving average of win rate (updates after every trade)
+let ewmaWinRate = 0.5; // start neutral
+
+// Parameter sweet spot tracking — maps parameter buckets to win rates
+const paramBuckets = {
+  rsi:        {}, // { '25-30': {wins:3, total:5}, ... }
+  confidence: {}, // { '70-75': {wins:4, total:6}, ... }
+  session:    {}, // { 'US Session': {wins:8, total:12}, ... }
+  adx:        {}, // { '20-25': {wins:2, total:4}, ... }
+};
+
+// Record a trade with full context for learning
+function recordTradeOutcome(pnl, ctx = {}) {
   const won = pnl > 0;
-  tradePerformanceLog.push({
-    pnl,
-    won,
-    confidence: entryConditions.confidence || 0,
-    rsi:        entryConditions.rsi        || 50,
-    session:    entryConditions.session    || 'unknown',
-    side:       entryConditions.side       || 'long',
+
+  // Update exponential moving average win rate (after every single trade)
+  ewmaWinRate = ADAPT_ALPHA * (won ? 1 : 0) + (1 - ADAPT_ALPHA) * ewmaWinRate;
+
+  const entry = {
+    pnl, won,
+    pnlPct:     ctx.pnlPct     || 0,
+    confidence: ctx.confidence || 0,
+    rsi:        ctx.rsi        || 50,
+    adx:        ctx.adx        || 0,
+    session:    ctx.session    || getCurrentSession(),
+    side:       ctx.side       || 'long',
+    holdMins:   ctx.holdMins   || 0,
+    exitReason: ctx.exitReason || 'unknown',
     timestamp:  Date.now(),
-  });
+  };
+  tradePerformanceLog.push(entry);
+  if (tradePerformanceLog.length > 200) tradePerformanceLog.shift();
 
-  // Keep last 100 trades only
-  if (tradePerformanceLog.length > 100) tradePerformanceLog.shift();
+  // Update parameter buckets for sweet spot detection
+  _updateBucket('rsi',        Math.floor(entry.rsi / 5) * 5,        won);
+  _updateBucket('confidence', Math.floor(entry.confidence / 5) * 5, won);
+  _updateBucket('session',    entry.session,                          won);
+  _updateBucket('adx',        Math.floor(entry.adx / 5) * 5,        won);
 
-  // Adapt every N closed trades
-  const closedCount = tradePerformanceLog.length;
-  if (closedCount >= 10 && closedCount % ADAPT_EVERY_N_TRADES === 0) {
-    runAdaptiveTuning();
-  }
+  // Run adaptation after EVERY trade (micro-adjustments)
+  runAdaptiveTuning().catch(() => {});
 }
 
-// Core adaptive tuning — analyzes recent trades and adjusts CONFIG
+function _updateBucket(param, key, won) {
+  if (!paramBuckets[param][key]) paramBuckets[param][key] = { wins: 0, total: 0 };
+  paramBuckets[param][key].total++;
+  if (won) paramBuckets[param][key].wins++;
+}
+
+function _bucketWR(param, key) {
+  const b = paramBuckets[param][key];
+  return b && b.total >= 3 ? b.wins / b.total : null;
+}
+
+// Find the RSI bucket with best win rate (min 3 samples)
+function _bestRSIBucket(side) {
+  const buckets = paramBuckets.rsi;
+  let best = null, bestWR = 0;
+  for (const [key, data] of Object.entries(buckets)) {
+    if (data.total < 3) continue;
+    const wr = data.wins / data.total;
+    const rsiVal = +key;
+    // Only consider relevant range for direction
+    if (side === 'long'  && rsiVal > 45) continue;
+    if (side === 'short' && rsiVal < 55) continue;
+    if (wr > bestWR) { best = rsiVal; bestWR = wr; }
+  }
+  return { rsi: best, wr: bestWR };
+}
+
+// Proportional step size — larger adjustment when further from target
+function _step(current, target, sensitivity = 1.0) {
+  const gap = Math.abs(ewmaWinRate - target);
+  // Bigger gap = bigger step, smaller gap = micro-adjustment
+  // gap 0.20 → step ~3x larger than gap 0.05
+  return Math.max(0.5, Math.min(5, gap * 20 * sensitivity));
+}
+
+// Core tuning — runs after every trade
 async function runAdaptiveTuning() {
-  const trades = tradePerformanceLog.slice(-50); // last 50 trades
-  if (trades.length < 10) return;
+  const log_prefix = 'adapt';
+  const n = tradePerformanceLog.length;
+  if (n < 5) return; // need minimum samples
 
-  const wins   = trades.filter(t => t.won);
-  const losses = trades.filter(t => !t.won);
-  const winRate = wins.length / trades.length;
+  const recent20  = tradePerformanceLog.slice(-20);
+  const recent10  = tradePerformanceLog.slice(-10);
+  const recent5   = tradePerformanceLog.slice(-5);
+  const wr20      = recent20.filter(t=>t.won).length / recent20.length;
+  const wr10      = recent10.filter(t=>t.won).length / recent10.length;
+  const wr5       = recent5.filter(t=>t.won).length  / recent5.length;
 
-  log('adapt', `═══ Adaptive Tuning (${trades.length} trades, ${(winRate*100).toFixed(0)}% win rate) ═══`);
+  // EWMA is most responsive — use it as primary signal
+  const effectiveWR = ewmaWinRate;
+
+  const isEmergency = effectiveWR < ADAPT_EMERGENCY;
+  const isUnderTarget = effectiveWR < ADAPT_TARGET_WR;
+  const isOverperforming = effectiveWR > ADAPT_TARGET_WR + 0.15;
+
+  if (!isUnderTarget && !isOverperforming) return; // at sweet spot, no change needed
 
   const changes = {};
+  const reasons = [];
 
-  // ── 1. Confidence threshold ──
-  // Find the confidence level where win rate is consistently good
-  const highConf  = trades.filter(t => t.confidence >= 75);
-  const lowConf   = trades.filter(t => t.confidence < 75);
-  const highWR    = highConf.length > 3 ? highConf.filter(t=>t.won).length / highConf.length : null;
-  const lowWR     = lowConf.length  > 3 ? lowConf.filter(t=>t.won).length  / lowConf.length  : null;
+  // ─── EMERGENCY MODE: win rate < 40% ───────────────────────────
+  if (isEmergency) {
+    log(log_prefix, `🚨 EMERGENCY: EWMA win rate ${(effectiveWR*100).toFixed(0)}% — aggressive correction`);
 
-  if (highWR !== null && lowWR !== null) {
-    if (highWR > lowWR + 0.15) {
-      // High confidence trades win much more — raise the bar
-      const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, CONFIG.minConfidence + 5);
-      if (newConf !== CONFIG.minConfidence) { CONFIG.minConfidence = newConf; changes.minConfidence = newConf; }
-    } else if (lowWR > 0.6 && winRate > 0.6) {
-      // Even lower confidence trades are winning — can loosen slightly
-      const newConf = Math.max(ADAPT_BOUNDS.minConfidence.min, CONFIG.minConfidence - 3);
-      if (newConf !== CONFIG.minConfidence) { CONFIG.minConfidence = newConf; changes.minConfidence = newConf; }
+    // 1. Drastically raise minimum confidence
+    const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, CONFIG.minConfidence + _step(CONFIG.minConfidence, 80, 2));
+    if (newConf !== CONFIG.minConfidence) { CONFIG.minConfidence = Math.round(newConf); changes.minConfidence = CONFIG.minConfidence; reasons.push('Emergency: raise confidence threshold'); }
+
+    // 2. Tighten RSI to only deepest extremes
+    const newRSI = Math.max(ADAPT_BOUNDS.rsiOversold.min, CONFIG.rsiOversold - _step(CONFIG.rsiOversold, 25, 1.5));
+    if (Math.abs(newRSI - CONFIG.rsiOversold) > 0.5) { CONFIG.rsiOversold = Math.round(newRSI); changes.rsiOversold = CONFIG.rsiOversold; reasons.push('Emergency: tighten RSI oversold'); }
+
+    // 3. Cut position size immediately
+    const newPct = Math.max(ADAPT_BOUNDS.maxPositionPct.min, CONFIG.maxPositionPct * 0.6);
+    if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.005) { CONFIG.maxPositionPct = +newPct.toFixed(3); changes.maxPositionPct = (CONFIG.maxPositionPct*100).toFixed(1)+'%'; reasons.push('Emergency: cut position size'); }
+
+    // 4. Widen stops — exits might be too tight
+    const stopWins   = recent10.filter(t => t.won && t.exitReason !== 'STOP_LOSS').length;
+    const stopLosses = recent10.filter(t => !t.won && t.exitReason === 'STOP_LOSS').length;
+    if (stopLosses > stopWins) {
+      const newMult = Math.min(ADAPT_BOUNDS.atrStopMult.max, CONFIG.atrStopMult + 0.3);
+      if (newMult !== CONFIG.atrStopMult) { CONFIG.atrStopMult = +newMult.toFixed(1); changes.atrStopMult = CONFIG.atrStopMult; reasons.push('Emergency: widen ATR stop'); }
     }
-  }
 
-  // ── 2. RSI thresholds ──
-  // Find where winning long trades cluster by RSI
-  const longWins  = trades.filter(t => t.won && t.side === 'long');
-  const longLoses = trades.filter(t => !t.won && t.side === 'long');
+  } else if (isUnderTarget) {
+    // ─── UNDER TARGET: fine-tune proportionally ──────────────────
+    const step = _step(effectiveWR, ADAPT_TARGET_WR);
 
-  if (longWins.length >= 3 && longLoses.length >= 3) {
-    const avgWinRSI  = longWins.reduce((a,t) => a + t.rsi, 0) / longWins.length;
-    const avgLossRSI = longLoses.reduce((a,t) => a + t.rsi, 0) / longLoses.length;
+    // 1. Confidence fine-tuning using sweet spot detection
+    const highConf = recent20.filter(t => t.confidence >= CONFIG.minConfidence + 10);
+    const lowConf  = recent20.filter(t => t.confidence >= CONFIG.minConfidence && t.confidence < CONFIG.minConfidence + 10);
+    const highWR   = highConf.length >= 3 ? highConf.filter(t=>t.won).length / highConf.length : null;
+    const lowWR    = lowConf.length  >= 3 ? lowConf.filter(t=>t.won).length  / lowConf.length  : null;
 
-    // If wins cluster at lower RSI than losses, tighten the oversold threshold
-    if (avgWinRSI < avgLossRSI - 5) {
-      const newRSI = Math.max(ADAPT_BOUNDS.rsiOversold.min, CONFIG.rsiOversold - 2);
-      if (newRSI !== CONFIG.rsiOversold) { CONFIG.rsiOversold = newRSI; changes.rsiOversold = newRSI; }
-    } else if (avgWinRSI > avgLossRSI + 5) {
-      // Wins happening at higher RSI — loosen slightly
-      const newRSI = Math.min(ADAPT_BOUNDS.rsiOversold.max, CONFIG.rsiOversold + 2);
-      if (newRSI !== CONFIG.rsiOversold) { CONFIG.rsiOversold = newRSI; changes.rsiOversold = newRSI; }
+    if (highWR !== null && lowWR !== null && highWR > lowWR + 0.12) {
+      // Higher confidence trades win clearly more — raise threshold toward sweet spot
+      const target = CONFIG.minConfidence + step;
+      const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, target);
+      if (Math.abs(newConf - CONFIG.minConfidence) > 0.5) { CONFIG.minConfidence = Math.round(newConf); changes.minConfidence = CONFIG.minConfidence; reasons.push(`Confidence sweet spot: ${highWR.toFixed(0)*100}% vs ${lowWR.toFixed(0)*100}%`); }
+    } else if (lowWR !== null && lowWR < 0.45) {
+      // Even minimum confidence trades losing — raise floor
+      const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, CONFIG.minConfidence + step * 0.5);
+      if (Math.abs(newConf - CONFIG.minConfidence) > 0.5) { CONFIG.minConfidence = Math.round(newConf); changes.minConfidence = CONFIG.minConfidence; reasons.push('Low confidence trades underperforming'); }
     }
+
+    // 2. RSI sweet spot detection
+    const bestLong = _bestRSIBucket('long');
+    if (bestLong.rsi !== null && bestLong.wr > ADAPT_TARGET_WR) {
+      // Wins cluster at a specific RSI level — move threshold toward it
+      const direction = bestLong.rsi < CONFIG.rsiOversold ? -1 : 1;
+      const newRSI = CONFIG.rsiOversold + direction * step * 0.5;
+      const clamped = Math.max(ADAPT_BOUNDS.rsiOversold.min, Math.min(ADAPT_BOUNDS.rsiOversold.max, newRSI));
+      if (Math.abs(clamped - CONFIG.rsiOversold) > 0.5) { CONFIG.rsiOversold = Math.round(clamped); changes.rsiOversold = CONFIG.rsiOversold; reasons.push(`RSI sweet spot at ${bestLong.rsi} (${(bestLong.wr*100).toFixed(0)}% WR)`); }
+    }
+
+    // 3. Position sizing — Kelly-inspired fractional sizing
+    // Optimal f = (bp - q) / b where b=avg win/loss ratio, p=win rate, q=loss rate
+    const winTrades  = recent20.filter(t=>t.won);
+    const loseTrades = recent20.filter(t=>!t.won);
+    if (winTrades.length >= 3 && loseTrades.length >= 3) {
+      const avgWin  = winTrades.reduce((a,t) => a + Math.abs(t.pnlPct||t.pnl), 0) / winTrades.length;
+      const avgLoss = loseTrades.reduce((a,t) => a + Math.abs(t.pnlPct||t.pnl), 0) / loseTrades.length;
+      if (avgLoss > 0) {
+        const b = avgWin / avgLoss;
+        const kellyF = (b * wr20 - (1 - wr20)) / b;
+        // Use half-Kelly for safety, bounded by our limits
+        const halfKelly = Math.max(ADAPT_BOUNDS.maxPositionPct.min, Math.min(ADAPT_BOUNDS.maxPositionPct.max, kellyF * 0.5));
+        // Move toward Kelly fraction gradually (max 20% change per adaptation)
+        const delta = (halfKelly - CONFIG.maxPositionPct) * 0.2;
+        const newPct = CONFIG.maxPositionPct + delta;
+        if (Math.abs(delta) > 0.003) { CONFIG.maxPositionPct = +newPct.toFixed(3); changes.maxPositionPct = (CONFIG.maxPositionPct*100).toFixed(1)+'%'; reasons.push(`Kelly sizing: ${(halfKelly*100).toFixed(1)}% optimal (b=${b.toFixed(2)})`); }
+      }
+    }
+
+    // 4. Exit timing analysis
+    // If stop-loss exits are disproportionately high, stops are too tight
+    const slExits   = recent20.filter(t => t.exitReason === 'STOP_LOSS').length;
+    const tpExits   = recent20.filter(t => t.exitReason?.startsWith('TAKE_PROFIT') || t.exitReason === 'TP1' || t.exitReason === 'TP2' || t.exitReason === 'TP3').length;
+    if (slExits > tpExits * 2 && wr20 < ADAPT_TARGET_WR) {
+      const newMult = Math.min(ADAPT_BOUNDS.atrStopMult.max, CONFIG.atrStopMult + 0.15);
+      if (newMult !== CONFIG.atrStopMult) { CONFIG.atrStopMult = +newMult.toFixed(2); changes.atrStopMult = CONFIG.atrStopMult; reasons.push(`SL exits (${slExits}) >> TP exits (${tpExits}) — widening stop`); }
+    }
+
+    // 5. Break-even timing
+    // If many trades reach +1% then reverse, move break-even earlier
+    const almostWins = recent20.filter(t => !t.won && t.exitReason === 'STOP_LOSS');
+    if (almostWins.length > recent20.length * 0.3) {
+      const newBE = Math.max(ADAPT_BOUNDS.breakEvenAt.min, CONFIG.breakEvenAt - 0.005);
+      if (newBE !== CONFIG.breakEvenAt) { CONFIG.breakEvenAt = +newBE.toFixed(3); changes.breakEvenAt = (CONFIG.breakEvenAt*100).toFixed(1)+'%'; reasons.push('Many near-wins — earlier break-even'); }
+    }
+
+  } else if (isOverperforming) {
+    // ─── OVERPERFORMING: loosen constraints to get more trades ───
+    const step = _step(effectiveWR, ADAPT_TARGET_WR + 0.15) * 0.3; // smaller steps when loosening
+
+    // Lower confidence threshold slightly to catch more setups
+    const newConf = Math.max(ADAPT_BOUNDS.minConfidence.min, CONFIG.minConfidence - step);
+    if (Math.abs(newConf - CONFIG.minConfidence) > 0.5) { CONFIG.minConfidence = Math.round(newConf); changes.minConfidence = CONFIG.minConfidence; reasons.push(`Overperforming (${(effectiveWR*100).toFixed(0)}%) — expanding entry criteria`); }
+
+    // Increase position size slightly (Kelly says bet more when edge is strong)
+    const newPct = Math.min(ADAPT_BOUNDS.maxPositionPct.max, CONFIG.maxPositionPct * 1.05);
+    if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.003) { CONFIG.maxPositionPct = +newPct.toFixed(3); changes.maxPositionPct = (CONFIG.maxPositionPct*100).toFixed(1)+'%'; reasons.push('Strong edge — increasing position size'); }
   }
 
-  // ── 3. Position sizing ──
-  // Reduce size on losing streaks, increase on winning streaks
-  const last10    = trades.slice(-10);
-  const last10WR  = last10.filter(t=>t.won).length / last10.length;
-  const last5     = trades.slice(-5);
-  const last5WR   = last5.filter(t=>t.won).length / last5.length;
+  if (Object.keys(changes).length === 0) return;
 
-  if (last5WR === 0) {
-    // 5 straight losses — cut position size significantly
-    const newPct = Math.max(ADAPT_BOUNDS.maxPositionPct.min, CONFIG.maxPositionPct * 0.7);
-    if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.01) { CONFIG.maxPositionPct = newPct; changes.maxPositionPct = +(newPct*100).toFixed(1)+'%'; }
-    log('adapt', '⚠ 5 straight losses — reducing position size to ' + (newPct*100).toFixed(1) + '%');
-  } else if (last5WR === 1.0 && last10WR >= 0.7) {
-    // 5 straight wins and hot streak — increase size slightly
-    const newPct = Math.min(ADAPT_BOUNDS.maxPositionPct.max, CONFIG.maxPositionPct * 1.1);
-    if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.01) { CONFIG.maxPositionPct = newPct; changes.maxPositionPct = +(newPct*100).toFixed(1)+'%'; }
-    log('adapt', '🔥 Hot streak — increasing position size to ' + (newPct*100).toFixed(1) + '%');
-  } else if (last10WR < 0.4) {
-    // Poor recent performance — reset position size toward default
-    const newPct = Math.max(ADAPT_BOUNDS.maxPositionPct.min, Math.min(ADAPT_DEFAULTS.maxPositionPct, CONFIG.maxPositionPct));
-    if (Math.abs(newPct - CONFIG.maxPositionPct) > 0.01) { CONFIG.maxPositionPct = newPct; changes.maxPositionPct = +(newPct*100).toFixed(1)+'%'; }
-  }
+  // Log and persist
+  const summary = `EWMA WR: ${(ewmaWinRate*100).toFixed(1)}% | Last5: ${(wr5*100).toFixed(0)}% | Last10: ${(wr10*100).toFixed(0)}% | Last20: ${(wr20*100).toFixed(0)}%`;
+  log(log_prefix, `🧠 Adapted after trade ${n}: ${summary}`);
+  log(log_prefix, `   Changes: ${JSON.stringify(changes)}`);
+  log(log_prefix, `   Reasons: ${reasons.join(' | ')}`);
 
-  // ── 4. ATR stop multiplier ──
-  // If too many stop losses, widen the stop
-  const stoppedOut = trades.filter(t => !t.won).length / trades.length;
-  if (stoppedOut > 0.5 && winRate < 0.45) {
-    const newMult = Math.min(ADAPT_BOUNDS.atrStopMult.max, CONFIG.atrStopMult + 0.2);
-    if (newMult !== CONFIG.atrStopMult) { CONFIG.atrStopMult = +newMult.toFixed(1); changes.atrStopMult = CONFIG.atrStopMult; }
-    log('adapt', `Stop too tight — widening ATR mult to ${CONFIG.atrStopMult}`);
-  } else if (winRate > 0.7 && CONFIG.atrStopMult > ADAPT_DEFAULTS.atrStopMult) {
-    // Winning well — can tighten stops back toward default
-    const newMult = Math.max(ADAPT_DEFAULTS.atrStopMult, CONFIG.atrStopMult - 0.1);
-    if (newMult !== CONFIG.atrStopMult) { CONFIG.atrStopMult = +newMult.toFixed(1); changes.atrStopMult = CONFIG.atrStopMult; }
-  }
-
-  if (Object.keys(changes).length === 0) {
-    log('adapt', 'No adjustments needed — current settings performing well');
-    return;
-  }
-
-  log('adapt', `Adjustments: ${JSON.stringify(changes)}`);
-
-  // Save to Supabase so dashboard shows current adapted settings
+  // Save to Supabase
   try {
     await sbFetch('tc_settings?id=eq.1', 'PATCH', {
       rsi_oversold:     CONFIG.rsiOversold,
@@ -440,25 +542,25 @@ async function runAdaptiveTuning() {
       atr_stop_mult:    CONFIG.atrStopMult,
       updated_at:       new Date().toISOString(),
     });
-    await syncLog('adapt', `🧠 Auto-tuned: ${JSON.stringify(changes)} | WinRate=${(winRate*100).toFixed(0)}% over ${trades.length} trades`);
+    await syncLog('adapt', `🧠 Adapted | ${summary} | ${JSON.stringify(changes)}`);
   } catch(e) {}
 
-  // Send Discord alert about the adjustment
-  if (CONFIG.discordWebhook) {
+  // Discord alert for significant changes (emergency or major adjustments)
+  if (CONFIG.discordWebhook && (isEmergency || Object.keys(changes).length >= 2)) {
     const fetch = await getFetch();
-    const changeStr = Object.entries(changes).map(([k,v]) => `**${k}** → ${v}`).join('\n');
     fetch(CONFIG.discordWebhook, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ embeds: [{
-        title: '🧠 TradeCore Auto-Tuned Settings',
-        color: winRate >= 0.5 ? 0x7fff6e : 0xffb547,
+        title: isEmergency ? '🚨 TradeCore Emergency Adaptation' : '🧠 TradeCore Auto-Tuned',
+        color: isEmergency ? 0xff0000 : effectiveWR >= ADAPT_TARGET_WR ? 0x7fff6e : 0xffb547,
         fields: [
-          { name: 'Win Rate', value: `${(winRate*100).toFixed(0)}% (${wins.length}W / ${losses.length}L)`, inline: true },
-          { name: 'Trades Analyzed', value: String(trades.length), inline: true },
-          { name: 'Changes Made', value: changeStr || 'None', inline: false },
+          { name: 'EWMA Win Rate', value: `${(ewmaWinRate*100).toFixed(1)}%`, inline: true },
+          { name: 'Last 10 Trades', value: `${(wr10*100).toFixed(0)}%`, inline: true },
+          { name: 'Target', value: `${(ADAPT_TARGET_WR*100).toFixed(0)}%`, inline: true },
+          { name: 'Changes', value: Object.entries(changes).map(([k,v])=>`**${k}** → ${v}`).join('\n') || 'None', inline: false },
+          { name: 'Why', value: reasons.slice(0,3).join('\n') || '—', inline: false },
         ],
-        footer: { text: 'TradeCore Adaptive Engine' },
+        footer: { text: `TradeCore Adaptive Engine v2 | ${n} trades analyzed` },
         timestamp: new Date().toISOString(),
       }]}),
     }).catch(() => {});
@@ -466,7 +568,7 @@ async function runAdaptiveTuning() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// END ADAPTIVE LEARNING ENGINE
+// END ADAPTIVE LEARNING ENGINE v2
 // ═══════════════════════════════════════════════════════════════════
 
 // ─────────────────────────────────────────────
@@ -1910,7 +2012,7 @@ async function coverShort(sym, price, reason) {
   const pnl = (pos.entryPrice - price) * qty;
   portfolio += pnl; // add profit (or subtract loss)
   pnl > 0 ? totalWins++ : totalLosses++;
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short' });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0 });
   delete shortPositions[sym];
   alpacaShorts.delete(sym);
 
@@ -2046,7 +2148,7 @@ async function exitPosition(sym, price, reason) {
   const pnl = qtyToSell * price - qtyToSell * avgCost;
   portfolio += qtyToSell * price;
   pnl > 0 ? totalWins++ : totalLosses++;
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long' });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0 });
   delete positions[sym];
   alpacaPositions.delete(sym);
 
@@ -2939,7 +3041,7 @@ async function exitScalp(sym, price, reason) {
 
   portfolio += direction === 'long' ? qty * price : pnl;
   pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++);
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: 50, session: getCurrentSession(), side: pos?.direction||'long' });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: 50, session: getCurrentSession(), side: pos?.direction||'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*pos.qty) : 0 });
 
   const holdSecs = Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 1000);
   const icons = { SCALP_TP:'🎯', SCALP_SL:'🛑', SCALP_TRAIL:'📉', SCALP_TIME:'⏰', SCALP_REVERSE:'↩️', SCALP_MANUAL:'🖐' };
