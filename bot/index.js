@@ -1283,69 +1283,75 @@ async function runSimScan() {
     log('sim', `🎮 Sim portfolio reset to $${portfolio.toFixed(2)}`);
   }
 
-  // Advance one bar
-  const snapshot = simAdvanceCursor();
-  if (!snapshot) return;
+  // Advance multiple bars per scan — speeds up replay significantly
+  // At 5 bars/scan × every 15s = covers 75 min of market data per real minute
+  const SIM_BARS_PER_SCAN = 5;
+  let lastSnapshot = null;
+  let lastBarTime = null;
 
-  const barTime = simState.currentTime;
-  log('sim', `─── 🎮 SIM BAR [${barTime?.slice(11,16)||'?'}] cursor:${simState.cursor}/${simState.totalBars} ───`);
+  for (let step = 0; step < SIM_BARS_PER_SCAN; step++) {
+    const snapshot = simAdvanceCursor();
+    if (!snapshot) break;
+    lastSnapshot = snapshot;
+    lastBarTime = simState.currentTime;
 
-  // Manage existing positions using replayed prices
-  for (const sym of Object.keys(positions)) {
-    const bars5m = snapshot[sym];
-    if (!bars5m || bars5m.length < 5) continue;
-    const price = bars5m[bars5m.length - 1].c;
-    priceHistory5m[sym] = bars5m.map(b => b.c);
-    await managePosition(sym, price, bars5m);
-  }
-  for (const sym of Object.keys(shortPositions)) {
-    const bars5m = snapshot[sym];
-    if (!bars5m || bars5m.length < 5) continue;
-    const price = bars5m[bars5m.length - 1].c;
-    await manageShort(sym, price, bars5m);
-  }
-
-  // Generate signals using replayed bars
-  const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
-  for (const sym of Object.keys(snapshot)) {
-    if (positions[sym] || shortPositions[sym]) continue;
-    const bars5m = snapshot[sym];
-    if (!bars5m || bars5m.length < 30) continue;
-
-    // Build proper 15-min bars by aggregating 3 consecutive 5-min bars
-    const bars15m = [];
-    for (let i = 0; i + 2 < bars5m.length; i += 3) {
-      const chunk = bars5m.slice(i, i + 3);
-      bars15m.push({
-        t: chunk[0].t,
-        o: chunk[0].o,
-        h: Math.max(...chunk.map(b => b.h)),
-        l: Math.min(...chunk.map(b => b.l)),
-        c: chunk[chunk.length - 1].c,
-        v: chunk.reduce((a, b) => a + b.v, 0),
-      });
+    // Manage existing positions
+    for (const sym of Object.keys(positions)) {
+      const bars5m = snapshot[sym];
+      if (!bars5m || bars5m.length < 5) continue;
+      const price = bars5m[bars5m.length - 1].c;
+      priceHistory5m[sym] = bars5m.map(b => b.c);
+      await managePosition(sym, price, bars5m);
+    }
+    for (const sym of Object.keys(shortPositions)) {
+      const bars5m = snapshot[sym];
+      if (!bars5m || bars5m.length < 5) continue;
+      const price = bars5m[bars5m.length - 1].c;
+      await manageShort(sym, price, bars5m);
     }
 
-    const price = bars5m[bars5m.length - 1].c;
-    priceHistory5m[sym] = bars5m.map(b => b.c);
+    // Generate signals
+    const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
+    for (const sym of Object.keys(snapshot)) {
+      if (positions[sym] || shortPositions[sym]) continue;
+      const bars5m = snapshot[sym];
+      if (!bars5m || bars5m.length < 30) continue;
 
-    let sig = generateSignal(sym, bars5m, bars15m.length >= 10 ? bars15m : null);
-    sig = applyDayBias(sig);
+      const bars15m = [];
+      for (let i = 0; i + 2 < bars5m.length; i += 3) {
+        const chunk = bars5m.slice(i, i + 3);
+        bars15m.push({
+          t: chunk[0].t, o: chunk[0].o,
+          h: Math.max(...chunk.map(b => b.h)),
+          l: Math.min(...chunk.map(b => b.l)),
+          c: chunk[chunk.length - 1].c,
+          v: chunk.reduce((a, b) => a + b.v, 0),
+        });
+      }
 
-    if (sig.signal !== 'HOLD') {
-      log('sim', `  ${sym} $${price.toFixed(2)} → ${sig.signal} (score:${sig.score} conf:${sig.confidence}%)`);
-    }
+      const price = bars5m[bars5m.length - 1].c;
+      priceHistory5m[sym] = bars5m.map(b => b.c);
 
-    // In sim mode use 1-scan confirmation — 3-scan would make replay too slow
-    const confirmed = sig.signal !== 'HOLD' && sig.score > 0;
-    if (!confirmed) continue;
+      let sig = generateSignal(sym, bars5m, bars15m.length >= 10 ? bars15m : null);
+      sig = applyDayBias(sig);
 
-    if (sig.signal === 'BUY' && totalOpen < CONFIG.maxOpenPositions) {
-      await enterPosition(sym, price, sig, bars5m, 'long');
-    } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled && totalOpen < CONFIG.maxOpenPositions) {
-      await enterPosition(sym, price, sig, bars5m, 'short');
+      if (sig.signal !== 'HOLD') {
+        log('sim', `  ${sym} $${price.toFixed(2)} → ${sig.signal} (score:${sig.score} conf:${sig.confidence}%)`);
+      }
+
+      const confirmed = sig.signal !== 'HOLD' && sig.score > 0;
+      if (!confirmed) continue;
+
+      if (sig.signal === 'BUY' && totalOpen < CONFIG.maxOpenPositions) {
+        await enterPosition(sym, price, sig, bars5m, 'long');
+      } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled && totalOpen < CONFIG.maxOpenPositions) {
+        await enterPosition(sym, price, sig, bars5m, 'short');
+      }
     }
   }
+
+  if (!lastSnapshot) return;
+  const barTime = lastBarTime;
 
   // Sync simulated portfolio to Supabase so dashboard updates live
   const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
