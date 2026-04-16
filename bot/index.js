@@ -2179,18 +2179,20 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     log('buy', `✅ LONG ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (-${stopPct}%) | conf=${sigInfo.confidence}%`);
     await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal: atrVal14 });
     await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
-    // Immediately write correct total_value (cash + position market value)
-    // Prevents dashboard from showing a brief spike of cash-only value
-    if (isSimMode()) {
-      const correctEquity = portfolio + price * qty;
-      await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
-        cash: +portfolio.toFixed(2),
-        total_value: +correctEquity.toFixed(2),
-        updated_at: new Date().toISOString(),
-      });
-    } else {
-      await syncPortfolio();
-    }
+
+    // Immediately write correct total_value = cash + full position market value
+    // This prevents any poll from seeing a "cash-only" value that looks like a loss spike
+    const allPosVal = Object.entries(positions).reduce((a, [s, pos]) => {
+      const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
+      return a + cur * (pos.qtyRemaining || pos.qty);
+    }, 0);
+    const correctEquity = portfolio + allPosVal;
+    await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+      cash:        +portfolio.toFixed(2),
+      total_value: +correctEquity.toFixed(2),
+      updated_at:  new Date().toISOString(),
+    });
+    if (!isSimMode()) syncPortfolio().catch(()=>{}); // background sync with Alpaca
 
   } else {
     // SHORT — borrow shares to sell, profit if price falls
@@ -2223,6 +2225,16 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     log('short', `🔴 SHORT ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (+${stopPct}%) | conf=${sigInfo.confidence}%`);
     await sendDiscordAlert('short', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal });
     await syncTrade({ sym, side: 'SHORT', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
+    // Write correct total_value immediately after short entry too
+    const allPosValS = Object.entries(positions).reduce((a, [s, pos]) => {
+      const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
+      return a + cur * (pos.qtyRemaining || pos.qty);
+    }, 0);
+    await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+      cash:        +portfolio.toFixed(2),
+      total_value: +(portfolio + allPosValS).toFixed(2),
+      updated_at:  new Date().toISOString(),
+    });
   }
 
   await syncAll();
