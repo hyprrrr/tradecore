@@ -3543,7 +3543,7 @@ async function exitPosition(sym, price, reason) {
   alpacaPositions.delete(sym);
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
-  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱', PEAK_EXIT:'🔔', INTRADAY_CLOSE:'🔔' }[reason] || '📤';
+  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱', PEAK_EXIT:'🔔', INTRADAY_CLOSE:'🔔', MICRO_MOVE_EXIT:'💤' }[reason] || '📤';
   log('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
   await sendDiscordAlert('sell', sym, qtyToSell, price, pnl, reason);
   await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
@@ -3952,6 +3952,42 @@ async function managePosition(sym, price, bars) {
   }
 
   // ── PEAK DETECTION — exit when strong reversal signals fire at meaningful profit ──
+  // ── MICRO-MOVE DETECTOR ────────────────────────────────────────
+  // Detects trades that are only moving in tiny increments (cents) and never
+  // building into real profit. These drain time and lock up capital.
+  //
+  // Triggers when ALL of these are true:
+  //   1. Trade has been open for at least 5 bars (25 min)
+  //   2. Max favorable excursion is tiny (< 0.3% or < $0.10 per share)
+  //   3. Price range of last 5 bars is very small (< 0.2% total range)
+  //   4. Current P&L is positive but microscopic (making cents not dollars)
+  //   5. RSI is not deeply oversold (no imminent bounce expected)
+  //
+  // Exit immediately — free up capital for a real opportunity
+  if (pos.breakEvenSet && bars && bars.length >= 10 && holdMins >= 15) {
+    const last5       = bars.slice(-5);
+    const last5high   = Math.max(...last5.map(b => b.h));
+    const last5low    = Math.min(...last5.map(b => b.l));
+    const last5range  = (last5high - last5low) / price;   // range of last 5 bars as %
+    const mfe         = (pos.highWater - pos.entryPrice) / pos.entryPrice;
+    const pnlPerShare = price - pos.entryPrice;            // actual cents moved
+    const rsiNow      = rsi(bars.map(b => b.c), 14);
+
+    // Is the trade stuck in a micro-range?
+    const microRange  = last5range < 0.002;                // last 5 bars moved < 0.2%
+    const microProfit = mfe < 0.003;                       // best move < 0.3%
+    const microCents  = Math.abs(pnlPerShare) < 0.15;      // less than 15 cents per share
+    const notOversold = rsiNow > 38;                       // no oversold bounce expected
+    const inProfit    = chg >= 0;                          // currently at or above entry
+
+    if (microRange && microProfit && microCents && notOversold && inProfit) {
+      const totalPnl = pnlPerShare * (pos.qtyRemaining || pos.qty);
+      log('sell', `💤 ${sym} MICRO-MOVE EXIT — stuck in ${(last5range*100).toFixed(2)}% range for ${holdMins.toFixed(0)}min | MFE=${(mfe*100).toFixed(2)}% | P&L=+$${totalPnl.toFixed(2)} — freeing capital`);
+      await syncLog('sell', `💤 Micro-move exit: ${sym} @ $${price.toFixed(2)} | range=${(last5range*100).toFixed(2)}% over 5 bars | total=$${totalPnl.toFixed(2)}`);
+      return exitPosition(sym, price, 'MICRO_MOVE_EXIT');
+    }
+  }
+
   // Only runs when trade is up 2%+ to avoid exiting early on small moves
   if (pos.breakEvenSet && chg >= CONFIG.peakMinProfit && bars && bars.length >= 10) {
     const peak = detectPeak(sym, bars, pos);
@@ -4885,6 +4921,21 @@ async function scalpPositionMonitor() {
         log('scalp', `⏰ Time stop: ${sym} held ${holdMins.toFixed(1)}m P&L: ${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)}`);
         await exitScalp(sym, price, 'SCALP_TIME');
         continue;
+      }
+
+      // ── EXIT 5: Micro-move detector ──
+      // Scalps that only move cents in 3+ minutes are dead — exit immediately
+      if (holdMins >= 3) {
+        const mfe = direction === 'long'
+          ? (pos.highWater - entryPrice) / entryPrice
+          : (entryPrice - pos.lowWater)  / entryPrice;
+        const pnlPerShare = Math.abs(price - entryPrice);
+        // Stuck: barely moved from entry, tiny total range, not in loss (stop would handle that)
+        if (mfe < 0.001 && pnlPerShare < 0.08 && pnlNow >= 0) {
+          log('scalp', `💤 ${sym} SCALP MICRO-MOVE — ${holdMins.toFixed(1)}m, only ${(mfe*100).toFixed(3)}% move — exiting`);
+          await exitScalp(sym, price, 'SCALP_MICRO_MOVE');
+          continue;
+        }
       }
 
       // Still holding — log status
