@@ -76,7 +76,7 @@ const CONFIG = {
   minConfidence:     60,
   adaptTargetWR:     0.60,
   adaptEmergencyWR:  0.40,
-  confirmCount:      4,
+  confirmCount:      2,
   peakMinProfit:     0.020,  // 2% min profit before peak detection runs
   peakSignalsReq:    2,      // signals needed for peak exit
   peakRsiExit:       80,     // RSI level for immediate exit
@@ -84,9 +84,9 @@ const CONFIG = {
   fadePullback:      0.020,  // 2% pullback from high triggers fade exit
   hardMaxLoss:       0.030,  // 3% max loss per trade (hard ceiling)
   initialStopPct:    0.020,  // 2% initial stop before break-even // move SL to entry once up X%
-  tp1Pct:            +(process.env.TP1_PCT           || 4)  / 100, // sell 33% here
-  tp2Pct:            +(process.env.TP2_PCT           || 8)  / 100, // sell 33% here
-  tp3Pct:            +(process.env.TP3_PCT           || 14) / 100, // sell final 34% here
+  tp1Pct:            +(process.env.TP1_PCT           || 1.5) / 100, // sell 33% at +1.5%
+  tp2Pct:            +(process.env.TP2_PCT           || 3.0) / 100, // sell 33% at +3%
+  tp3Pct:            +(process.env.TP3_PCT           || 5.0) / 100, // sell rest at +5%
   timeStopHours:     +(process.env.TIME_STOP_HOURS   || 6),        // exit flat trade after N hours
   timeStopMinPct:    +(process.env.TIME_STOP_MIN_PCT || 0.5) / 100,// only exit if gain < X%
   atrStopMult:       +(process.env.ATR_STOP_MULT     || 2.0),      // SL = entry - (ATR * mult)
@@ -355,9 +355,9 @@ const ADAPT_DEFAULTS = {
   minConfidence:  60,
   atrStopMult:    2.0,
   maxPositionPct: 0.15,
-  tp1Pct:         0.04,
-  tp2Pct:         0.08,
-  tp3Pct:         0.14,
+  tp1Pct:         0.015,
+  tp2Pct:         0.030,
+  tp3Pct:         0.050,
   breakEvenAt:    0.02,
 };
 
@@ -367,9 +367,9 @@ const ADAPT_BOUNDS = {
   minConfidence:  { min: 45, max: 90 },
   atrStopMult:    { min: 1.2, max: 3.5 },
   maxPositionPct: { min: 0.03, max: 0.25 },
-  tp1Pct:         { min: 0.02, max: 0.08 },
-  tp2Pct:         { min: 0.05, max: 0.15 },
-  tp3Pct:         { min: 0.08, max: 0.25 },
+  tp1Pct:         { min: 0.010, max: 0.030 },
+  tp2Pct:         { min: 0.025, max: 0.060 },
+  tp3Pct:         { min: 0.040, max: 0.100 },
   breakEvenAt:    { min: 0.01, max: 0.05 },
 };
 
@@ -2918,9 +2918,9 @@ function generateSignal(sym, bars5m, bars15m) {
     reasons.push(`Only ${passedGates}/${minGates} gates passed — need more confluence`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
-  // Require 2+ bonus confirmations (was 1) — eliminates borderline setups
-  if (bonus < 2) {
-    reasons.push(`Only ${bonus} bonus signal (need 2+) — waiting for stronger setup`);
+  // Require at least 1 bonus confirmation
+  if (bonus < 1) {
+    reasons.push(`No bonus confluence — waiting for stronger setup`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
 
@@ -3236,10 +3236,6 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
       atrAtEntry: atrVal14, stopPrice,
       breakEvenSet: false, tp1Hit: false, tp2Hit: false,
       srLevels, sigInfo, direction: 'long',
-      // Trap-aware initial TPs (overridden by dynamic TP as trade progresses)
-      dynamicTP1: +initTP1.toFixed(4),
-      dynamicTP2: +initTP2.toFixed(4),
-      dynamicTP3: +initTP3.toFixed(4),
       // Rich entry analytics for post-trade learning
       entryAnalytics: {
         stopDistPct:    +((price - stopPrice) / price * 100).toFixed(3),
@@ -3706,66 +3702,32 @@ function detectPeak(sym, bars, pos) {
 // ADVANCED POSITION MANAGEMENT
 // ─────────────────────────────────────────────
 
-// ── Dynamic Take Profit Calculator ───────────────────────────────
-// Analyzes actual price movement since entry and sets realistic TP
-// levels based on ATR, recent momentum, and how far the trade has moved.
-// Prevents TP from being too high (trade reverses before hitting it)
-// or too low (exits early, leaves money on the table).
+// ── Take Profit Calculator ────────────────────────────────────────
+// Simple, clean ATR-based targets with minimum floors.
+// Goal: targets that are ACTUALLY reachable given the stock's volatility.
+// 
+// TP1 = 2× ATR  (minimum 1.5%)   — first profit lock
+// TP2 = 4× ATR  (minimum 3.0%)   — main target
+// TP3 = 7× ATR  (minimum 5.0%)   — let winner run
+//
+// These are FLOORS not ceilings — uses CONFIG values if they're higher.
 function calcDynamicTP(pos, price, bars) {
   if (!bars || bars.length < 14) return null;
 
-  const atrVal   = atr(bars, 14);
-  const atrPct   = atrVal / price;
-  const chg      = (price - pos.entryPrice) / pos.entryPrice;
-  const mfe      = (pos.highWater - pos.entryPrice) / pos.entryPrice;
-  const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
+  const atrVal = atr(bars, 14);
+  const atrPct = atrVal / price;
 
-  // Measure live velocity — how fast is it moving right now?
-  const last3closes = bars.slice(-3).map(b => b.c);
-  const velocity = last3closes.length >= 3
-    ? (last3closes[last3closes.length-1] - last3closes[0]) / last3closes[0]
-    : 0;
+  // ATR-based targets with hard minimums so they're always reachable
+  const tp1 = Math.max(CONFIG.tp1Pct, atrPct * 2,  0.015); // at least 1.5%
+  const tp2 = Math.max(CONFIG.tp2Pct, atrPct * 4,  0.030); // at least 3.0%
+  const tp3 = Math.max(CONFIG.tp3Pct, atrPct * 7,  0.050); // at least 5.0%
 
-  // Current RSI to detect overbought
-  const closes = bars.map(b => b.c);
-  const currentRSI = rsi(closes, 14);
-  const isOverbought = currentRSI > 70;
-
-  // Base TP on actual ATR — no caps, scales naturally to stock volatility
-  let tp1 = atrPct * 1.5;   // 1.5x ATR
-  let tp2 = atrPct * 3.0;   // 3x ATR
-  let tp3 = atrPct * 5.0;   // 5x ATR
-
-  // CHASE MODE: trade already ran past TP1 — push TPs forward to capture the move
-  if (mfe > tp1 * 1.5) {
-    tp1 = mfe * 0.8;          // just below current high water
-    tp2 = mfe + atrPct * 2;   // extension target
-    tp3 = mfe + atrPct * 4;   // full extension
-  }
-
-  // MOMENTUM BOOST: strong velocity = expand TPs
-  if (velocity > atrPct * 0.5) {
-    tp1 *= 1.4; tp2 *= 1.4; tp3 *= 1.5;
-  }
-
-  // OVERBOUGHT: RSI > 70, reduce TP3 — not much more left in the move
-  if (isOverbought) {
-    tp3 = Math.min(tp3, mfe + atrPct);
-  }
-
-  // FLAT: barely moving after 45 min — lower TPs to get out
-  if (holdMins > 45 && mfe < atrPct * 0.5) {
-    tp1 = Math.max(chg + 0.001, atrPct * 0.5);
-    tp2 = tp1 + atrPct * 0.5;
-    tp3 = tp1 + atrPct;
-  }
-
-  // Always stay ahead of current price
-  tp1 = Math.max(tp1, chg + 0.002);
-  tp2 = Math.max(tp2, tp1 + atrPct * 0.5);
-  tp3 = Math.max(tp3, tp2 + atrPct);
-
-  return { tp1:+tp1.toFixed(4), tp2:+tp2.toFixed(4), tp3:+tp3.toFixed(4), atrPct:+atrPct.toFixed(4), velocity:+velocity.toFixed(4), rsi:+currentRSI.toFixed(1) };
+  return {
+    tp1: +tp1.toFixed(4),
+    tp2: +tp2.toFixed(4),
+    tp3: +tp3.toFixed(4),
+    atrPct: +atrPct.toFixed(4),
+  };
 }
 
 // ── Market Close Time Check ───────────────────────────────────────
@@ -3805,37 +3767,10 @@ async function managePosition(sym, price, bars) {
     }
   }
 
-  // ── DYNAMIC TP — update per-position TP levels every bar ─────────
-  // Only adjust if trade hasn't hit TP1 yet (still in initial phase)
-  if (!pos.tp1Hit && bars && bars.length >= 14) {
-    const dtp = calcDynamicTP(pos, price, bars);
-    if (dtp) {
-      // TPs can EXPAND when momentum is strong (chase the move)
-      // TPs only TIGHTEN when momentum dies (flat/overbought)
-      const prevTP1 = pos.dynamicTP1 || CONFIG.tp1Pct;
-      const prevTP2 = pos.dynamicTP2 || CONFIG.tp2Pct;
-      const prevTP3 = pos.dynamicTP3 || CONFIG.tp3Pct;
-
-      // In chase mode (dtp.tp1 < prevTP1) = TP moved closer, that's a tighten — allow
-      // In expand mode (dtp.tp1 > prevTP1) = TP moved further, allow if velocity is strong
-      const expanding = dtp.tp1 > prevTP1;
-      const velocityOk = (dtp.velocity || 0) > 0 || (dtp.rsi || 50) < 65;
-
-      if (!expanding || velocityOk) {
-        positions[sym].dynamicTP1 = dtp.tp1;
-        positions[sym].dynamicTP2 = dtp.tp2;
-        positions[sym].dynamicTP3 = dtp.tp3;
-        if (expanding) {
-          log('tp', `📈 ${sym} TP expanding: TP1=${(dtp.tp1*100).toFixed(2)}% TP2=${(dtp.tp2*100).toFixed(2)}% TP3=${(dtp.tp3*100).toFixed(2)}% (RSI=${dtp.rsi} vel=${(dtp.velocity*100).toFixed(2)}%)`);
-        }
-      }
-    }
-  }
-
-  // Use dynamic TP if available, otherwise fall back to CONFIG values
-  const effectiveTP1 = pos.dynamicTP1 || CONFIG.tp1Pct;
-  const effectiveTP2 = pos.dynamicTP2 || CONFIG.tp2Pct;
-  const effectiveTP3 = pos.dynamicTP3 || CONFIG.tp3Pct;
+  // TP targets — fixed from CONFIG (4% / 8% / 14% defaults, adaptive engine tunes these)
+  const effectiveTP1 = CONFIG.tp1Pct;
+  const effectiveTP2 = CONFIG.tp2Pct;
+  const effectiveTP3 = CONFIG.tp3Pct;
 
   // Update high water mark
   if (price > pos.highWater) positions[sym].highWater = price;
@@ -3874,82 +3809,38 @@ async function managePosition(sym, price, bars) {
   // After TP1 hit:  trail 1.5% below high water on remaining shares
   // After TP2 hit:  trail 1.0% below high water on final runner
 
-  const hwChg = (pos.highWater - pos.entryPrice) / pos.entryPrice;
-
-  // Tier 1 — ATR-scaled break-even
-  // Low-vol (ATR 0.4%): BE at 0.16%, high-vol (ATR 1.5%): BE at 0.6%
-  // Stops constant BE exits on slow-moving stocks like NIO/DRCL
+  const hwChg     = (pos.highWater - pos.entryPrice) / pos.entryPrice;
   const posAtrPct = bars && bars.length >= 14 ? atr(bars, 14) / price : 0.008;
-  const scaledBE  = Math.max(0.002, Math.min(0.010, posAtrPct * 0.4));
-  if (!pos.breakEvenSet && chg >= scaledBE) {
-    positions[sym].stopPrice   = pos.entryPrice * 1.0001;
+
+  // Break-even: lock at 1x ATR above entry (gives real room before locking)
+  const beThreshold = Math.max(posAtrPct * 1.0, 0.005);
+  if (!pos.breakEvenSet && chg >= beThreshold) {
+    positions[sym].stopPrice    = pos.entryPrice * 1.0001;
     positions[sym].breakEvenSet = true;
-    log('risk', `🔒 ${sym} BE locked @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}% | BE=${(scaledBE*100).toFixed(2)}%)`);
-    await syncLog('sys', `🔒 Break-even: ${sym} @ $${pos.entryPrice.toFixed(2)}`);
+    log('risk', `🔒 ${sym} BE @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
+    await syncLog('sys', `🔒 Break-even: ${sym}`);
   }
 
-  // Tier 2 — trail 0.8% below high water once up 1%
-  if (pos.breakEvenSet && hwChg >= CONFIG.trailT2At && !pos.tp1Hit) {
-    const trail = pos.highWater * (1 - 0.008);
-    if (trail > positions[sym].stopPrice) {
-      positions[sym].stopPrice = trail;
-      log('risk', `📈 ${sym} trail T2: stop → $${trail.toFixed(2)} (hw=$${pos.highWater.toFixed(2)})`);
-    }
-  }
-
-  // Tier 3 — trail 1.5% below high water once up 2%
-  if (pos.breakEvenSet && hwChg >= CONFIG.trailT3At && !pos.tp1Hit) {
-    const trail = pos.highWater * (1 - 0.015);
-    if (trail > positions[sym].stopPrice) {
-      positions[sym].stopPrice = trail;
-      log('risk', `📈 ${sym} trail T3: stop → $${trail.toFixed(2)} (hw=$${pos.highWater.toFixed(2)})`);
-    }
-  }
-
-  // Tier 4 — trail 2% below high water once up 4%+ (let runner breathe)
-  if (pos.breakEvenSet && hwChg >= CONFIG.trailT4At && !pos.tp1Hit) {
-    const trail = pos.highWater * (1 - 0.020);
-    if (trail > positions[sym].stopPrice) {
-      positions[sym].stopPrice = trail;
-      log('risk', `📈 ${sym} trail T4: stop → $${trail.toFixed(2)} (hw=$${pos.highWater.toFixed(2)})`);
-    }
-  }
-
-  // After TP1 — tighter trail on remaining shares (1.5%)
+  // Trailing stop ONLY activates after TP1 hit -- never before
+  // This is the critical fix: trails were killing trades before reaching any TP
   if (pos.tp1Hit && !pos.tp2Hit) {
-    const trail = pos.highWater * (1 - 0.015);
-    if (trail > positions[sym].stopPrice) {
-      positions[sym].stopPrice = trail;
-    }
+    const trail = pos.highWater * (1 - Math.max(posAtrPct * 2, 0.015));
+    if (trail > positions[sym].stopPrice) positions[sym].stopPrice = trail;
   }
-
-  // After TP2 — very tight trail on final runner (1%)
   if (pos.tp1Hit && pos.tp2Hit) {
-    const trail = pos.highWater * (1 - 0.010);
-    if (trail > positions[sym].stopPrice) {
-      positions[sym].stopPrice = trail;
-    }
+    const trail = pos.highWater * (1 - Math.max(posAtrPct * 1.5, 0.010));
+    if (trail > positions[sym].stopPrice) positions[sym].stopPrice = trail;
   }
 
-  // Check if trailing stop was hit
+  // Stop hit check
   if (pos.breakEvenSet && price <= positions[sym].stopPrice) {
-    const pct = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
-    const reason = price <= pos.entryPrice * 1.001 ? 'BREAK_EVEN_STOP' : 'TRAILING_STOP';
-    log('risk', `${reason === 'BREAK_EVEN_STOP' ? '🔒' : '📉'} ${sym} ${reason} @ $${price.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct}%)`);
+    const pct    = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
+    const reason = price <= pos.entryPrice * 1.002 ? 'BREAK_EVEN_STOP' : 'TRAILING_STOP';
+    log('risk', `🔒 ${sym} ${reason} @ $${price.toFixed(2)} (${pct}%)`);
     return exitPosition(sym, price, reason);
   }
 
-  // ── Momentum fade exit — catches peaks before full trail triggers ──
-  // Requires: already up 2%+, pulled back 2%+ from high, 3 consecutive red bars
-  if (pos.breakEvenSet && bars && bars.length >= 5 && chg >= CONFIG.fadeMinProfit) {
-    const last3 = bars.slice(-3).map(b => b.c);
-    const fallingBars = last3[2] < last3[1] && last3[1] < last3[0];
-    const fromHW = (pos.highWater - price) / pos.highWater;
-    if (fallingBars && fromHW >= CONFIG.fadePullback) {
-      log('sell', `📉 ${sym} momentum fade: ${(fromHW*100).toFixed(1)}% from peak, 3 red bars — exiting at profit`);
-      return exitPosition(sym, price, 'TRAILING_STOP');
-    }
-  }
+  // Momentum fade removed -- trailing stop after TP1 handles this cleanly
 
   // ── PEAK DETECTION — exit when strong reversal signals fire at meaningful profit ──
   // ── MICRO-MOVE DETECTOR ────────────────────────────────────────
@@ -5125,8 +5016,9 @@ function confirmSignal(sym, sig) {
     prev.sigInfo = sig;
     pendingSignals.set(sym, prev);
 
-    // Shorts need 5 consecutive confirmations (~75s), longs need CONFIG.confirmCount
-    const required = sig.signal === 'SELL' ? 5 : (CONFIG.confirmCount || 4);
+    // Shorts need 3 consecutive confirmations, longs need 2
+    // 4 confirmations = 60s delay — move is often over before entry
+    const required = sig.signal === 'SELL' ? 3 : (CONFIG.confirmCount || 2);
 
     if (prev.count >= required) {
       pendingSignals.delete(sym);
