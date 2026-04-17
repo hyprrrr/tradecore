@@ -5925,6 +5925,73 @@ async function handleSlashCommand(commandName, options) {
     return { content: `⚠ No open position found for **${sym}**\nOpen positions: ${[...Object.keys(positions), ...Object.keys(shortPositions), ...Object.keys(scalpPositions)].join(', ') || 'none'}` };
   }
 
+  // ── /exitall ──
+  if (commandName === 'exitall') {
+    const allSyms = [
+      ...Object.keys(positions),
+      ...Object.keys(shortPositions),
+      ...Object.keys(scalpPositions),
+    ];
+
+    if (!allSyms.length) {
+      return { content: '📭 No open positions to close.' };
+    }
+
+    const results = [];
+    let totalPnl = 0;
+
+    for (const sym of Object.keys(positions)) {
+      try {
+        const pos   = positions[sym];
+        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const pnl   = (price - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
+        await exitPosition(sym, price, 'MANUAL_DISCORD');
+        totalPnl += pnl;
+        results.push(`${pnl >= 0 ? '🟢' : '🔴'} **${sym}** LONG @ $${price.toFixed(2)} → ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+      } catch(e) {
+        results.push(`⚠ **${sym}** failed: ${e.message}`);
+      }
+    }
+
+    for (const sym of Object.keys(shortPositions)) {
+      try {
+        const pos   = shortPositions[sym];
+        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const pnl   = (pos.entryPrice - price) * (pos.qtyRemaining || pos.qty);
+        await coverShort(sym, price, 'MANUAL_DISCORD');
+        totalPnl += pnl;
+        results.push(`${pnl >= 0 ? '🟢' : '🔴'} **${sym}** SHORT @ $${price.toFixed(2)} → ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+      } catch(e) {
+        results.push(`⚠ **${sym}** failed: ${e.message}`);
+      }
+    }
+
+    for (const sym of Object.keys(scalpPositions)) {
+      try {
+        const pos   = scalpPositions[sym];
+        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const pnl   = pos.direction === 'long'
+          ? (price - pos.entryPrice) * pos.qty
+          : (pos.entryPrice - price) * pos.qty;
+        await exitScalp(sym, price, 'SCALP_MANUAL');
+        totalPnl += pnl;
+        results.push(`${pnl >= 0 ? '🟢' : '🔴'} **${sym}** SCALP @ $${price.toFixed(2)} → ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+      } catch(e) {
+        results.push(`⚠ **${sym}** failed: ${e.message}`);
+      }
+    }
+
+    await syncLog('warn', `🚨 EXIT ALL: ${allSyms.length} positions closed via Discord | P&L: ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`);
+
+    return { content: [
+      `🚨 **EXIT ALL — ${allSyms.length} position${allSyms.length > 1 ? 's' : ''} closed**`,
+      '',
+      results.join('\n'),
+      '',
+      `**Total P&L: ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}**`,
+    ].join('\n') };
+  }
+
   // ── /status ──
   if (commandName === 'status') {
     const openPnl = Object.entries(positions).reduce((a, [s, p]) => {
@@ -6014,7 +6081,8 @@ http.createServer(async (req, res) => {
     try {
       const fetch = await getFetch();
       const commands = [
-        { name:'exit',      description:'Exit an open position immediately', options:[{name:'symbol',description:'Ticker (e.g. AAPL)',type:3,required:true}] },
+        { name:'exit',      description:'Exit a specific open position immediately', options:[{name:'symbol',description:'Ticker (e.g. AAPL)',type:3,required:true}] },
+        { name:'exitall',   description:'🚨 Close ALL open positions immediately and pause the bot' },
         { name:'status',    description:'Show bot status and all open positions' },
         { name:'positions', description:'List all open positions with P&L' },
         { name:'pause',     description:'Pause the bot — no new trades' },
