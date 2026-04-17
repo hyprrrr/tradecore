@@ -846,7 +846,7 @@ function saveSupabaseConfig(){
   const key=document.getElementById('sbKeyInput').value.trim();
   if(!url||!key){ alert('Enter both URL and key'); return; }
   localStorage.setItem(SB_URL_KEY,url); localStorage.setItem(SB_KEY_KEY,key);
-  closeModal(); equityHistory=[]; equityLoaded=false; testConnection();
+  closeModal(); equityHistory=[]; equityLoaded=false; equityResetAt=Date.now(); testConnection();
 }
 async function testConnection(){
   setStatus('testing');
@@ -999,11 +999,12 @@ function onModeChange(){
   if(prog) prog.style.display=simOn?'block':'none';
 
   if(!simOn){
-    equityHistory=[]; equityLoaded=false; drawChart();
+    equityHistory=[]; equityLoaded=false; equityResetAt=Date.now(); drawChart();
     document.getElementById('portfolioVal').textContent='Syncing…';
-    let fp=0; const fi=setInterval(async()=>{ await poll(); if(++fp>=6) clearInterval(fi); },2500);
+    // Poll every 1s for 15 seconds to pick up restored positions quickly
+    let fp=0; const fi=setInterval(async()=>{ await poll(); if(++fp>=15) clearInterval(fi); },1000);
   } else {
-    equityHistory=[]; equityLoaded=false; drawChart();
+    equityHistory=[]; equityLoaded=false; equityResetAt=Date.now(); drawChart();
   }
 
   saveSettings().then(()=>showToast(simOn?'🎮 Sim ON':'✅ Live mode','green')).catch(()=>{});
@@ -1053,23 +1054,24 @@ async function testDiscord(){
 // ══════════════════════════════════════════════════════════
 let equityHistory=[], equityLoaded=false;
 let stableEquity=0;
+let equityResetAt=0; // timestamp of last reset — relaxes spike filter briefly after reset
 
 function processEquity(raw, startCap){
   if(!raw || raw<=0 || raw>startCap*3) return false;
   const last=equityHistory[equityHistory.length-1];
+  // Always accept the first point
   if(!last){
     equityHistory.push(raw);
     stableEquity=raw;
     return true;
   }
-  // Reject >1% change in one poll (spike filter)
+  // Relax spike filter for 10 seconds after a reset (sim→live transition)
+  const relaxed = (Date.now() - equityResetAt) < 10000;
   const pct=Math.abs((raw-last)/last);
-  if(pct>0.01) return false;
-  // Only add a new point if equity moved by more than $1
-  // This stops micro-noise from creating hundreds of jagged points
-  if(Math.abs(raw-last)<1.0) return true; // accept as stable but don't add duplicate
+  if(!relaxed && pct>0.05) return false; // >5% change — spike (relaxed from 1% to handle sim→live jump)
+  if(Math.abs(raw-last)<1.0) return true; // stable — don't add duplicate point
   equityHistory.push(raw);
-  if(equityHistory.length>300) equityHistory.shift(); // fewer points = smoother curve
+  if(equityHistory.length>300) equityHistory.shift();
   stableEquity=raw;
   return true;
 }
