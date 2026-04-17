@@ -1199,8 +1199,15 @@ async function sbPatch(table,q,body){
 function dtbl(n){ return $('simEnabled')?.checked?`sim_${n}`:n; }
 async function testConnection(){
   const d=await sbGet('tc_portfolio','?id=eq.1');
-  if(d&&d.length>0){ setStatus('live'); loadSettings(); }
-  else{ setStatus('offline'); if(!getSbUrl()) openModal(); }
+  if(d&&d.length>0){
+    setStatus('live');
+    await loadSettings(); // wait for settings (esp sim mode) before polling
+    poll();               // first poll immediately
+    setInterval(poll,2000);
+  } else {
+    setStatus('offline');
+    if(!getSbUrl()) openModal();
+  }
 }
 function setStatus(s){
   const e=$('statusBadge');
@@ -1218,8 +1225,8 @@ function procEq(raw,cap){
   if(!raw||raw<=0||raw>cap*3) return false;
   const last=eqHist[eqHist.length-1];
   if(!last){ eqHist.push(raw); stableEq=raw; return true; }
-  const relaxed=(Date.now()-eqResetAt)<12000;
-  if(!relaxed&&Math.abs((raw-last)/last)>0.05) return false;
+  const relaxed=(Date.now()-eqResetAt)<20000;
+  if(!relaxed&&Math.abs((raw-last)/last)>0.08) return false; // 8% spike filter
   if(Math.abs(raw-last)<1) return true;
   eqHist.push(raw); if(eqHist.length>300) eqHist.shift(); stableEq=raw; return true;
 }
@@ -1326,12 +1333,19 @@ let pollN=0, lastPosHash='', lastTradeN=0, lastLogTs='';
 async function poll(){
   pollN++;
   const fetchTrades=pollN%4===0;
-  const [port,positions,trades,logs]=await Promise.all([
+  const simOn = $('simEnabled')?.checked;
+  const [port,rawPositions,trades,logs]=await Promise.all([
     sbGet(dtbl('tc_portfolio'),'?id=eq.1'),
     sbGet(dtbl('tc_positions'),'?order=updated_at.desc'),
     fetchTrades?sbGet(dtbl('tc_trades'),'?order=created_at.desc&limit=200'):Promise.resolve(null),
     sbGet(dtbl('tc_logs'),'?order=created_at.desc&limit=100'),
   ]);
+  // If sim mode active but main table empty, try sim table (handles race on page load)
+  let positions = rawPositions;
+  if(simOn && (!rawPositions || rawPositions.length===0)) {
+    const simPos = await sbGet('sim_tc_positions','?order=updated_at.desc');
+    if(simPos && simPos.length>0) positions = simPos;
+  }
   if(!port||!port.length){ setStatus('offline'); return; }
   setStatus('live');
 
@@ -1344,7 +1358,11 @@ async function poll(){
   const sv=posData.filter(x=>x.side?.includes('SCALP')).reduce((s,x)=>s+(+x.current_price||+x.entry_price||0)*Math.abs(+x.qty||0),0);
   const comp=dbC>0&&dbC!==cap?dbC+lv+sp+sv:0;
   const raw=(dbT>0&&dbT!==cap)?dbT:(comp>cap*.3?comp:dbT||cap);
-  if(eqHist.length===0&&raw>0){ eqHist.push(raw); stableEq=raw; chartTgt=raw; chartDsp=raw; }
+  if(eqHist.length===0&&raw>0){
+    eqHist.push(raw); stableEq=raw; chartTgt=raw; chartDsp=raw;
+    // Also reset chart display so it doesn't interpolate from 0
+    if(chartCtx) { const cv=$('equityChart'); if(cv) { cv.width=cv.offsetWidth; cv.height=cv.offsetHeight; } }
+  }
   else procEq(raw,cap);
   const eq=stableEq||raw||cap;
   const diff=eq-cap, dayPnl=+p.day_pnl||0;
@@ -1384,7 +1402,7 @@ async function poll(){
   if($('scPositions')) $('scPositions').textContent=posData.length;
   if($('scPosStatus')) $('scPosStatus').textContent=p.circuit_breaker?'⏸ Paused':'Trading active';
   setVal('scWR', wr+'%', wr>=55?'up':wr>=45?'neu':'dn');
-  if($('scWL')) $('scWL').textContent=`${tw+tl} trades`;
+  if($('scWL')) $('scWL').textContent=`${tw}W / ${tl}L · ${tw+tl} trades`;
 
   // Stat cell accent
   ['sc-portfolio','sc-daypnl','sc-wr'].forEach(id=>{
@@ -1409,9 +1427,13 @@ async function poll(){
   // Sync time
   if($('syncInfo')) $('syncInfo').textContent='Updated '+new Date().toLocaleTimeString();
 
-  // Positions
-  const ph=JSON.stringify(posData.map(x=>x.symbol+(x.pnl||0)+(x.current_price||0)));
+  // Positions — always re-render to keep current_price fresh
+  // Include updated_at in hash so we catch price updates even when pnl hasn't changed
+  const ph=JSON.stringify(posData.map(x=>x.symbol+(x.pnl||0)+(x.current_price||0)+(x.updated_at||'')));
   if(ph!==lastPosHash){ lastPosHash=ph; renderPositions(posData); }
+  // Always update the count badges even if positions haven't changed
+  if($('posCountBadge')) $('posCountBadge').textContent=posData.length;
+  if($('scPositions')) $('scPositions').textContent=posData.length;
 
   // Trades
   if(trades!==null&&trades.length!==lastTradeN){ lastTradeN=trades.length; renderTrades(trades); if($('tradesBadge')) $('tradesBadge').textContent=trades.length; if($('feedCount')) $('feedCount').textContent=trades.length; }
@@ -1532,7 +1554,7 @@ function renderScreener(p){
       $('screenerTime').textContent=new Date().toLocaleTimeString();
       sl.innerHTML=picks.slice(0,10).map(pk=>{
         const sym=pk.symbol||pk.sym||pk;
-        const score=pk.score||pk.s||0, chg=pk.change||pk.c||0;
+        const score=+(pk.score||pk.s||0), chg=+(pk.change||pk.c||0)||0;
         return `<div class="scr-row">
           <span class="scr-sym">${sym}</span>
           <div class="scr-bar-track"><div class="scr-bar-fill" style="width:${Math.min(100,score)}%"></div></div>
@@ -1546,7 +1568,7 @@ function renderScreener(p){
       $('picksTime').textContent=new Date().toLocaleTimeString();
       pl.innerHTML=picks.slice(0,18).map(pk=>{
         const sym=pk.symbol||pk.sym||pk;
-        const score=pk.score||pk.s||0, chg=pk.change||pk.c||0;
+        const score=+(pk.score||pk.s||0), chg=+(pk.change||pk.c||0)||0;
         return `<div class="pick-row">
           <span class="pick-sym">${sym}</span>
           <div class="pick-bar-track"><div class="pick-bar-fill" style="width:${Math.min(100,score)}%"></div></div>
@@ -1591,7 +1613,7 @@ function onStrategyChange(){
 }
 
 function loadSettings(){
-  sbGet('tc_settings','?id=eq.1').then(data=>{
+  return sbGet('tc_settings','?id=eq.1').then(data=>{
     if(!data||!data.length) return;
     const s=data[0];
     if(s.symbols){ symbols=s.symbols.split(',').map(x=>x.trim().toUpperCase()); renderSymbolTags(); }
@@ -1664,7 +1686,7 @@ renderSymbolTags();
 buildSessionMap();
 startChart();
 switchTab('overview');
-if(getSbUrl()&&getSbKey()){ testConnection(); setInterval(poll,2000); }
+if(getSbUrl()&&getSbKey()){ testConnection(); }
 else openModal();
 </script>
 </body>
