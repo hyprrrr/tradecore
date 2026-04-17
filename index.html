@@ -1101,16 +1101,23 @@ async function poll(){
   const posData=positions||[];
   const startCap=getStartingCapital();
 
-  // Compute true equity = cash + all open position market values
-  // Don't rely on total_value from DB — it can lag on restore
-  const cashVal  = +p.cash || +p.total_value || startCap;
-  const longVal  = posData.filter(x=>!x.side?.includes('SHORT'))
+  // Portfolio value — trust total_value from bot (written by syncPricesOnly from Alpaca)
+  // Only fall back to computing from positions if total_value looks stale (equals startCap exactly)
+  const dbTotal = +p.total_value || 0;
+  const dbCash  = +p.cash || 0;
+
+  // Compute from positions as a sanity check
+  const longMktVal  = posData.filter(x=>!x.side?.includes('SHORT'))
     .reduce((s,x)=>s+(+x.current_price||+x.entry_price||0)*Math.abs(+x.qty||0),0);
-  const shortPnl = posData.filter(x=>x.side?.includes('SHORT'))
+  const shortPnl    = posData.filter(x=>x.side?.includes('SHORT'))
     .reduce((s,x)=>s+(+x.pnl||0),0);
-  // If we have positions, use computed equity; else use DB value
-  const computedEq = posData.length>0 && cashVal>0 ? cashVal+longVal+shortPnl : +p.total_value||startCap;
-  const rawEq      = computedEq > startCap*0.3 && computedEq < startCap*3 ? computedEq : +p.total_value||startCap;
+  const computedEq  = dbCash > 0 && dbCash !== startCap ? dbCash + longMktVal + shortPnl : 0;
+
+  // Use total_value if it's real (not the $100k sim default)
+  // Use computed if total_value looks like the sim reset value
+  const rawEq = (dbTotal > 0 && dbTotal !== startCap)
+    ? dbTotal
+    : (computedEq > startCap * 0.3 ? computedEq : dbTotal || startCap);
 
   if(equityHistory.length===0 && rawEq>0){
     equityHistory.push(rawEq);
