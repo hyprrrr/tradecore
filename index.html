@@ -617,6 +617,23 @@ input:checked+.tog-slider::before{transform:translateX(14px);background:var(--bg
     </div>
   </div>
 
+  <!-- Strategy Selector — prominent, always visible -->
+  <div style="margin-bottom:12px;padding:12px;background:var(--card);border-radius:8px;border:1px solid var(--border)">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <div style="font-size:10px;font-weight:700;letter-spacing:2px;color:var(--accent)">🧠 TRADING STRATEGY</div>
+      <div id="activeStrategyBadge" style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(0,229,255,0.15);color:var(--accent);font-weight:700;letter-spacing:1px">RSI + MACD</div>
+    </div>
+    <select class="setting-select" id="strategy" style="width:100%;margin-bottom:6px" onchange="onStrategyChange()">
+      <option value="rsi_macd">📊 RSI + MACD (Default) — balanced, all-market</option>
+      <option value="smc">🏦 SMC — Smart Money Concepts (FVG, OB, BOS, DOL)</option>
+      <option value="ict">⏰ ICT — Kill zones, OTE, liquidity sweeps</option>
+      <option value="vwap_reversion">📈 VWAP Mean Reversion — range markets</option>
+      <option value="order_flow">📉 Order Flow + Delta — volume pressure</option>
+      <option value="wyckoff">🔄 Wyckoff — accumulation/distribution phases</option>
+    </select>
+    <div id="strategyDesc" style="font-size:9px;color:var(--muted);line-height:1.6">Classic RSI oversold/overbought + MACD confirmation. Best all-round strategy for trending markets during regular hours.</div>
+  </div>
+
   <div id="modeStatus" style="font-size:9px;color:var(--muted);margin-bottom:12px;letter-spacing:1px" id="modeStatusText">—</div>
 
   <div id="simProgress" class="sim-prog">
@@ -880,7 +897,7 @@ function loadSettings(){
       if(s[id]!==undefined){ const el=document.getElementById(id); if(el){ el.value=s[id]; const v=document.getElementById(id+'V'); if(v) v.textContent=s[id]+sfx; }}
     });
   }catch(e){ console.warn('loadSettings:',e); }
-  renderSymbolTags(); updateRenderVars(); onModeChange();
+  renderSymbolTags(); updateRenderVars(); onModeChange(); onStrategyChange();
 }
 
 async function saveSettings(){
@@ -939,6 +956,25 @@ async function saveSettings(){
       showToast(res.ok||res.status===201 ? '✓ Saved' : '✓ Local only','green');
     }catch(e){ showToast('✓ Saved locally','green'); }
   } else showToast('✓ Saved locally','green');
+}
+
+const STRATEGY_INFO = {
+  rsi_macd:       { name:'RSI + MACD',       desc:'Classic RSI oversold/overbought + MACD confirmation. Best all-round for trending markets.' },
+  smc:            { name:'SMC',               desc:'Smart Money Concepts — FVG, Order Blocks, BOS, Draw on Liquidity. Reads institutional positioning.' },
+  ict:            { name:'ICT',               desc:'Inner Circle Trader — Kill Zones (NY/London open), OTE 62-79% fib, liquidity sweeps before entry.' },
+  vwap_reversion: { name:'VWAP Reversion',    desc:'Buy at VWAP -2σ, sell at +2σ. Best in sideways/ranging markets. Needs ADX < 35.' },
+  order_flow:     { name:'Order Flow',         desc:'Volume delta per bar — detects absorption and buy/sell pressure. Best for volatile markets.' },
+  wyckoff:        { name:'Wyckoff',            desc:'Accumulation/distribution phase detection via volume. Catches springs (fake low) and upthrusts (fake high).' },
+};
+
+function onStrategyChange() {
+  const val  = document.getElementById('strategy').value;
+  const info = STRATEGY_INFO[val] || STRATEGY_INFO.rsi_macd;
+  const badge = document.getElementById('activeStrategyBadge');
+  const desc  = document.getElementById('strategyDesc');
+  if (badge) badge.textContent = info.name;
+  if (desc)  desc.textContent  = info.desc;
+  saveSettings();
 }
 
 function onModeChange(){
