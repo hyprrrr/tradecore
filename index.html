@@ -609,6 +609,12 @@ input:checked+.tog-slider::before{transform:translateX(14px);background:var(--bg
       </div>
       <div class="mode-card-desc">Hold weeks → months<br>50/200 MA + sector ETF<br>TP at +15% / +25% / +40%<br>8% trailing stop</div>
     </div>
+    <div class="mode-card" id="recoveryCard" onclick="document.getElementById('recoveryEnabled').click()">
+      <div class="mode-card-title">🔄 RECOVERY
+        <label class="toggle" onclick="event.stopPropagation()"><input type="checkbox" id="recoveryEnabled" onchange="onModeChange()"><span class="tog-slider"></span></label>
+      </div>
+      <div class="mode-card-desc">After a loss — hunts<br>counter-trade to claw back<br>80% conf required<br>Expires in 30 min</div>
+    </div>
     <div class="mode-card" id="simCard" onclick="document.getElementById('simEnabled').click()">
       <div class="mode-card-title">🎮 SIMULATE
         <label class="toggle" onclick="event.stopPropagation()"><input type="checkbox" id="simEnabled" onchange="onModeChange()"><span class="tog-slider"></span></label>
@@ -882,6 +888,7 @@ function loadSettings(){
     if(s.scalpEnabled!==undefined) document.getElementById('scalpEnabled').checked=s.scalpEnabled;
     if(s.shortsEnabled!==undefined) document.getElementById('shortsEnabled').checked=s.shortsEnabled;
     if(s.positionEnabled!==undefined) document.getElementById('positionEnabled').checked=s.positionEnabled;
+    if(s.recoveryEnabled!==undefined) document.getElementById('recoveryEnabled').checked=s.recoveryEnabled;
     document.getElementById('simEnabled').checked=false;
     const smap={scalpTp:'%',scalpSl:'%',scalpHold:'m',scalpMax:'',scalpPosPct:'%',scalpMinScore:''};
     Object.entries(smap).forEach(([id,sfx])=>{ if(s[id]!==undefined&&document.getElementById(id)){ document.getElementById(id).value=s[id]; const v=document.getElementById(id+'V'); if(v) v.textContent=s[id]+sfx; }});
@@ -923,7 +930,7 @@ async function saveSettings(){
     scalpSymbols:g('scalpSymbols'),
     alertBuy:gc('alertBuy'), alertSell:gc('alertSell'), alertDaily:true,
     swingEnabled:gc('swingEnabled'), scalpEnabled:gc('scalpEnabled'),
-    simEnabled:gc('simEnabled'), shortsEnabled:gc('shortsEnabled'), positionEnabled:gc('positionEnabled'),
+    simEnabled:gc('simEnabled'), shortsEnabled:gc('shortsEnabled'), positionEnabled:gc('positionEnabled'), recoveryEnabled:gc('recoveryEnabled'),
   };
   localStorage.setItem('tc_settings',JSON.stringify(s));
   updateRenderVars();
@@ -947,7 +954,7 @@ async function saveSettings(){
           fade_min_profit:s.fadeMinProfit, fade_pullback:s.fadePullback,
           hard_max_loss:s.hardMaxLoss, initial_stop_pct:s.initialStopPct,
           discord_webhook:s.discord, trend_filter:true, volume_filter:true, regime_filter:true, correlation_filter:true,
-          swing_enabled:s.swingEnabled, scalp_mode:s.scalpEnabled, sim_mode:s.simEnabled, shorts_enabled:s.shortsEnabled, position_trading:s.positionEnabled,
+          swing_enabled:s.swingEnabled, scalp_mode:s.scalpEnabled, sim_mode:s.simEnabled, shorts_enabled:s.shortsEnabled, position_trading:s.positionEnabled, recovery_mode:s.recoveryEnabled,
           scalp_tp_pct:s.scalpTp, scalp_sl_pct:s.scalpSl, scalp_max_hold_mins:s.scalpHold,
           scalp_max_positions:s.scalpMax, scalp_position_pct:s.scalpPosPct, scalp_min_score:s.scalpMinScore,
           scalp_symbols:s.scalpSymbols, updated_at:new Date().toISOString()
