@@ -3181,14 +3181,12 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     // With immediate trailing stops, we use a tighter initial stop
     // The trade only needs to go +0.3% before break-even locks in
     // So initial stop should be just wide enough to avoid normal noise
-    const atrVal14  = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.02;
-    // Use 1× ATR as initial stop — tight enough to limit loss, wide enough to avoid noise
-    const atrStop   = price - (atrVal14 * Math.min(CONFIG.atrStopMult, 1.5));
-    // Hard cap: never risk more than 2% on initial stop
-    const capStop   = price * (1 - (CONFIG.initialStopPct || 0.02));
-    // In sim: minimum 1.5% stop to avoid being shaken by bar spread
-    const simFloor  = isSimMode() ? price * (1 - 0.015) : atrStop;
-    const stopPrice = Math.max(atrStop, capStop, isSimMode() ? simFloor : capStop);
+    const atrVal14  = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
+    // Stop = 2× ATR below entry — wide enough to avoid noise, tight enough to limit loss
+    const atrStop   = price - (atrVal14 * 2);
+    // Hard cap: never risk more than 1.5% on initial stop
+    const capStop   = price * 0.985;
+    const stopPrice = Math.max(atrStop, capStop);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       // For live mode — verify Alpaca doesn't already have this position
@@ -3278,13 +3276,11 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
 
   } else {
     // SHORT — borrow shares to sell, profit if price falls
-    // Stop loss ABOVE entry for shorts
-    // SHORT entry — tighter initial stop, break-even locks at +0.3% move
-    const atrVal14s = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.02;
-    const atrStopS  = price + (atrVal14s * Math.min(CONFIG.atrStopMult, 1.5));
-    const capStopS  = price * (1 + (CONFIG.initialStopPct || 0.02)); // hard cap 2% max initial risk
-    const simCeilS  = isSimMode() ? price * (1 + 0.015) : atrStopS;
-    const stopPrice = Math.min(atrStopS, capStopS, isSimMode() ? simCeilS : capStopS);
+    // Stop loss ABOVE entry for shorts — 2× ATR, capped at 1.5%
+    const atrVal14s = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
+    const atrStopS  = price + (atrVal14s * 2);
+    const capStopS  = price * 1.015;
+    const stopPrice = Math.min(atrStopS, capStopS);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       try { await placeSmartOrder(sym, qty, 'sell', false); } // sell to open short
@@ -3767,14 +3763,20 @@ async function managePosition(sym, price, bars) {
     }
   }
 
-  // TP targets — fixed from CONFIG (4% / 8% / 14% defaults, adaptive engine tunes these)
-  const effectiveTP1 = CONFIG.tp1Pct;
-  const effectiveTP2 = CONFIG.tp2Pct;
-  const effectiveTP3 = CONFIG.tp3Pct;
-
-  // Update high water mark
+  // Update high water mark first so everything below uses latest value
   if (price > pos.highWater) positions[sym].highWater = price;
   if (price < pos.lowWater)  positions[sym].lowWater  = price;
+
+  // ── ATR-ADAPTIVE TAKE PROFITS ─────────────────────────────────
+  // TPs scale to the stock's actual ATR so they're always reachable.
+  // A stock with ATR 0.1% should have TP1 at 0.15%, not 1.5%.
+  // A stock with ATR 0.8% should have TP1 at 1.2%, not 1.5%.
+  const posAtr    = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
+  const posAtrPct = posAtr / price;
+  // TP tiers: 1.5×, 3×, 5× ATR — naturally scales to stock's real movement
+  const effectiveTP1 = Math.max(posAtrPct * 1.5, 0.003); // min 0.3%
+  const effectiveTP2 = Math.max(posAtrPct * 3.0, 0.006); // min 0.6%
+  const effectiveTP3 = Math.max(posAtrPct * 5.0, 0.010); // min 1.0%
 
   // Track MFE (max favorable) and MAE (max adverse) for post-trade analysis
   if (pos.entryAnalytics) {
@@ -3784,11 +3786,10 @@ async function managePosition(sym, price, bars) {
     positions[sym].entryAnalytics.mae = +mae.toFixed(3);
   }
 
-  // ── 1. Hard stop loss ──
-  // This fires regardless of break-even state — absolute maximum loss per trade
-  const hardStop = pos.entryPrice * (1 - (isSimMode() ? 0.015 : 0.02));
+  // ── 1. Hard stop loss — 2× ATR below entry ──
+  const hardStop = pos.entryPrice - (posAtr * 2);
   if (price <= Math.max(pos.stopPrice, hardStop) && !pos.breakEvenSet) {
-    log('risk', `${sym} stop hit @ $${price.toFixed(2)} (stop=$${pos.stopPrice.toFixed(2)})`);
+    log('risk', `🛑 ${sym} stop @ $${price.toFixed(2)} | stop=$${pos.stopPrice.toFixed(2)} hardStop=$${hardStop.toFixed(2)}`);
     return exitPosition(sym, price, 'STOP_LOSS');
   }
 
@@ -3809,11 +3810,10 @@ async function managePosition(sym, price, bars) {
   // After TP1 hit:  trail 1.5% below high water on remaining shares
   // After TP2 hit:  trail 1.0% below high water on final runner
 
-  const hwChg     = (pos.highWater - pos.entryPrice) / pos.entryPrice;
-  const posAtrPct = bars && bars.length >= 14 ? atr(bars, 14) / price : 0.008;
+  const hwChg = (pos.highWater - pos.entryPrice) / pos.entryPrice;
 
-  // Break-even: lock at 1x ATR above entry (gives real room before locking)
-  const beThreshold = Math.max(posAtrPct * 1.0, 0.005);
+  // Break-even: lock when up 0.5× ATR — stock made a real move, protect it
+  const beThreshold = Math.max(posAtrPct * 0.5, 0.002); // min 0.2%
   if (!pos.breakEvenSet && chg >= beThreshold) {
     positions[sym].stopPrice    = pos.entryPrice * 1.0001;
     positions[sym].breakEvenSet = true;
@@ -3821,14 +3821,13 @@ async function managePosition(sym, price, bars) {
     await syncLog('sys', `🔒 Break-even: ${sym}`);
   }
 
-  // Trailing stop ONLY activates after TP1 hit -- never before
-  // This is the critical fix: trails were killing trades before reaching any TP
+  // Trailing stop only after TP1 — trail 1× ATR below high water
   if (pos.tp1Hit && !pos.tp2Hit) {
-    const trail = pos.highWater * (1 - Math.max(posAtrPct * 2, 0.015));
+    const trail = pos.highWater * (1 - Math.max(posAtrPct, 0.008));
     if (trail > positions[sym].stopPrice) positions[sym].stopPrice = trail;
   }
   if (pos.tp1Hit && pos.tp2Hit) {
-    const trail = pos.highWater * (1 - Math.max(posAtrPct * 1.5, 0.010));
+    const trail = pos.highWater * (1 - Math.max(posAtrPct * 0.75, 0.005));
     if (trail > positions[sym].stopPrice) positions[sym].stopPrice = trail;
   }
 
@@ -3934,9 +3933,9 @@ async function managePosition(sym, price, bars) {
     }
   }
 
-  // Log status
-  const tpNext = !pos.tp1Hit ? `TP1@+${(CONFIG.tp1Pct*100).toFixed(0)}%` : !pos.tp2Hit ? `TP2@+${(CONFIG.tp2Pct*100).toFixed(0)}%` : `TP3@+${(CONFIG.tp3Pct*100).toFixed(0)}%`;
-  const stopDist = ((price - pos.stopPrice) / price * 100).toFixed(2);
+  // Log status with actual effective TP values so they're visible in bot log
+  const tpNext    = !pos.tp1Hit ? `TP1@+${(effectiveTP1*100).toFixed(2)}%` : !pos.tp2Hit ? `TP2@+${(effectiveTP2*100).toFixed(2)}%` : `TP3@+${(effectiveTP3*100).toFixed(2)}%`;
+  const stopDist  = ((price - pos.stopPrice) / price * 100).toFixed(2);
   log('pos', `${sym} ${chg>=0?'+':''}${(chg*100).toFixed(2)}% | SL=$${pos.stopPrice.toFixed(2)}(${stopDist}% away) | ${tpNext} | BE:${pos.breakEvenSet?'✅':'❌'} TP1:${pos.tp1Hit?'✅':'❌'} TP2:${pos.tp2Hit?'✅':'❌'}`);
 }
 
