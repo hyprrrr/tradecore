@@ -1120,19 +1120,12 @@ async function syncPortfolio() {
 }
 
 async function syncPositions() {
-  // Build the full list of all open positions across all types
   const allPositions = [];
 
   // Swing longs
   for (const [sym, pos] of Object.entries(positions)) {
-    // Use real-time price if available, otherwise use entry price
-    // Never use a price that's more than 5% away from entry on first write — protects against stale data
-    const rawCur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
-    const ageSecs = (Date.now() - new Date(pos.entryTime).getTime()) / 1000;
-    // In first 30s, only use price if it's within 5% of entry (no stale bar prices)
-    const cur = (ageSecs < 30 && Math.abs(rawCur - pos.entryPrice) / pos.entryPrice > 0.05)
-      ? pos.entryPrice
-      : rawCur;
+    // Use real-time price — no age guard needed, priceHistory5m is seeded on restore
+    const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.highWater || pos.entryPrice;
     const qty    = pos.qtyRemaining || pos.qty;
     const pnl    = (cur - pos.entryPrice) * qty;
     const pnlPct = pos.entryPrice > 0 ? ((cur - pos.entryPrice) / pos.entryPrice) * 100 : 0;
@@ -5838,6 +5831,14 @@ loadRemoteConfig().then(async () => {
   connectPolygon();       // Polygon.io free real-time (if POLYGON_API_KEY set)
 });
 setTimeout(syncPricesOnly, 5000);
+
+// Sync prices every 10 seconds regardless of market hours
+// This ensures P&L is always up to date even before/after market open
+setInterval(async () => {
+  if (!isSimMode() && CONFIG.alpacaKey && Object.keys(positions).length + Object.keys(shortPositions).length > 0) {
+    await syncPricesOnly();
+  }
+}, 10000);
 
 // Re-subscribe to any new positions every 30 seconds
 // (catches positions opened after initial subscription)
