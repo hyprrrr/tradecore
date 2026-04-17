@@ -260,9 +260,12 @@ async function loadRemoteConfig() {
             log('warn', 'Alpaca fetch failed — reset to starting capital, will re-sync on next scan');
           }
 
-          // 5. Restore real open positions from Alpaca
+          // 5. Restore real open positions from Alpaca and sync prices
           await syncAlpacaPositions();
-          await syncPositions();
+          await syncPricesOnly();   // immediately populate current_price for all positions
+          await syncPositions();    // write to Supabase so dashboard shows them
+          await syncPortfolio();    // update equity/cash values
+          log('sys', `✅ Live account fully restored — ${Object.keys(positions).length} positions synced`);
 
         } else {
           // Entering sim — full clean reset so every sim run starts fresh
