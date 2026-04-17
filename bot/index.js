@@ -4675,6 +4675,7 @@ async function syncAlpacaPositions() {
           cost:         +p.avg_entry_price * +p.qty,
           entryTime:    new Date(),
           highWater:    +p.current_price,
+          lowWater:     +p.current_price,
           atrAtEntry:   0,
           stopPrice:    +p.avg_entry_price * (1 - CONFIG.stopLossPct),
           breakEvenSet: false,
@@ -4683,7 +4684,9 @@ async function syncAlpacaPositions() {
           srLevels:     [],
           sigInfo:      { confidence: 0, reasons: ['Restored from Alpaca on restart'] },
         };
-        log('sys', `Restored: ${p.symbol} ${p.qty}x @ $${p.avg_entry_price}`);
+        // Seed price history so current_price shows correctly in dashboard immediately
+        priceHistory5m[p.symbol] = [+p.current_price];
+        log('sys', `Restored: ${p.symbol} ${p.qty}x @ $${p.avg_entry_price} cur=$${p.current_price}`);
         await syncLog('sys', `Restored ${p.symbol} from Alpaca after restart`);
         // Make sure it exists in Supabase positions table
         await syncPositions();
