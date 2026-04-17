@@ -106,13 +106,13 @@ const CONFIG = {
   shortsEnabled:       process.env.ENABLE_SHORTS === 'true',
   recoveryMode:        process.env.RECOVERY_MODE === 'true',
   minConfidence:       +(process.env.MIN_CONFIDENCE || 60), // adaptive — auto-adjusted by learning engine
-  scalpSymbols:        (process.env.SCALP_SYMBOLS || 'SPY,QQQ,AAPL,TSLA,NVDA').split(',').map(s => s.trim().toUpperCase()),
-  scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.4)  / 100, // take profit at +0.4%
-  scalpSlPct:          +(process.env.SCALP_SL_PCT        || 0.2)  / 100, // stop loss at -0.2%
-  scalpMaxHoldMins:    +(process.env.SCALP_MAX_HOLD_MINS || 8),           // exit if held > 8 minutes
-  scalpMaxPositions:   +(process.env.SCALP_MAX_POSITIONS || 2),           // max concurrent scalp positions
-  scalpPositionPct:    +(process.env.SCALP_POSITION_PCT  || 20)  / 100,  // 20% of portfolio per scalp
-  scalpMinScore:       +(process.env.SCALP_MIN_SCORE     || 70),          // higher confidence required
+  scalpSymbols:        (process.env.SCALP_SYMBOLS || 'NVDA,TSLA,MSTR,COIN,AMD,META,AAPL,SPY,QQQ').split(',').map(s => s.trim().toUpperCase()),
+  scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.3)  / 100, // 0.3% TP (2x ATR)
+  scalpSlPct:          +(process.env.SCALP_SL_PCT        || 0.15) / 100, // 0.15% SL (1x ATR)
+  scalpMaxHoldMins:    +(process.env.SCALP_MAX_HOLD_MINS || 4),           // max 4 min
+  scalpMaxPositions:   +(process.env.SCALP_MAX_POSITIONS || 1),           // 1 at a time — focus
+  scalpPositionPct:    +(process.env.SCALP_POSITION_PCT  || 10)  / 100,  // 10% per scalp — smaller risk
+  scalpMinScore:       +(process.env.SCALP_MIN_SCORE     || 75),          // 75 = high bar
   scalpTrailingPct:    +(process.env.SCALP_TRAILING_PCT  || 0.15) / 100, // tight trailing stop 0.15%
 
   // Supabase
@@ -4994,145 +4994,143 @@ async function fetchLatestTrade(symbol) {
  *   Volatility: ATR expanding (means a move is starting)
  */
 function generateScalpSignal(sym, bars1m) {
-  if (!bars1m || bars1m.length < 15) {
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Need 15+ 1m bars'] };
+  if (!bars1m || bars1m.length < 20) {
+    return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Need 20+ 1m bars'] };
   }
 
   const closes  = bars1m.map(b => b.c);
   const highs   = bars1m.map(b => b.h);
   const lows    = bars1m.map(b => b.l);
-  const opens   = bars1m.map(b => b.o);
   const volumes = bars1m.map(b => b.v);
   const price   = closes[closes.length - 1];
-  const prev    = closes[closes.length - 2];
-  const pprev   = closes[closes.length - 3];
-
-  let buy = 0, sell = 0;
   const reasons = [];
 
-  // ── 1. EMA 9 / 21 — primary trend on 1m ──
-  const e9  = ema(closes, 9);
-  const e21 = ema(closes, 21);
-  const pe9  = ema(closes.slice(0, -1), 9);
-  const pe21 = ema(closes.slice(0, -1), 21);
+  // ── HARD BLOCKS — reject immediately if conditions aren't right ──
 
-  if (e9 > e21)  { buy  += 20; reasons.push(`EMA9 > EMA21 (${e9.toFixed(2)} > ${e21.toFixed(2)})`); }
-  else           { sell += 20; reasons.push(`EMA9 < EMA21 (${e9.toFixed(2)} < ${e21.toFixed(2)})`); }
-
-  // EMA crossover on 1m = strong immediate signal
-  if (pe9 <= pe21 && e9 > e21) { buy  += 20; reasons.push('🔀 EMA9/21 bullish cross on 1m'); }
-  if (pe9 >= pe21 && e9 < e21) { sell += 20; reasons.push('🔀 EMA9/21 bearish cross on 1m'); }
-
-  // ── 2. VWAP — most important intraday level ──
-  const vw = vwap(bars1m);
-  const vwapDist = (price - vw) / vw;
-
-  if (vwapDist > 0.001) {
-    buy  += 15;
-    reasons.push(`Above VWAP by ${(vwapDist*100).toFixed(2)}% ($${vw.toFixed(2)})`);
-  } else if (vwapDist < -0.001) {
-    sell += 15;
-    reasons.push(`Below VWAP by ${(Math.abs(vwapDist)*100).toFixed(2)}% ($${vw.toFixed(2)})`);
-  } else {
-    // Sitting exactly on VWAP — wait for a break
-    reasons.push(`At VWAP ($${vw.toFixed(2)}) — waiting for break`);
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons };
-  }
-
-  // ── 3. Price momentum — last 3 candles ──
-  const last3Bull = price > prev && prev > pprev;
-  const last3Bear = price < prev && prev < pprev;
-
-  if (last3Bull) { buy  += 15; reasons.push('3 consecutive bullish closes'); }
-  if (last3Bear) { sell += 15; reasons.push('3 consecutive bearish closes'); }
-
-  // ── 4. Current candle body direction and size ──
-  const lastBar   = bars1m[bars1m.length - 1];
-  const body      = Math.abs(lastBar.c - lastBar.o);
-  const range     = lastBar.h - lastBar.l;
-  const bodyRatio = range > 0 ? body / range : 0;
-
-  // Strong body (>60% of range) = conviction
-  if (bodyRatio > 0.6) {
-    if (lastBar.c > lastBar.o) { buy  += 10; reasons.push(`Strong bull candle (body ${(bodyRatio*100).toFixed(0)}%)`); }
-    else                       { sell += 10; reasons.push(`Strong bear candle (body ${(bodyRatio*100).toFixed(0)}%)`); }
-  }
-
-  // ── 5. Wick rejection — pin bars show reversal or continuation ──
-  const upperWick = lastBar.h - Math.max(lastBar.c, lastBar.o);
-  const lowerWick = Math.min(lastBar.c, lastBar.o) - lastBar.l;
-
-  // Long lower wick (buyers rejected the lows) = bullish
-  if (lowerWick > body * 1.5 && lowerWick > 0.01) {
-    buy  += 10;
-    reasons.push(`Lower wick rejection (${(lowerWick/price*100).toFixed(2)}%)`);
-  }
-  // Long upper wick (sellers rejected the highs) = bearish
-  if (upperWick > body * 1.5 && upperWick > 0.01) {
-    sell += 10;
-    reasons.push(`Upper wick rejection (${(upperWick/price*100).toFixed(2)}%)`);
-  }
-
-  // ── 6. Volume confirmation — must be above 1.2x average ──
-  const avgVol = volumes.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, volumes.length);
-  const curVol = volumes[volumes.length - 1];
-  const volRatio = avgVol > 0 ? curVol / avgVol : 1;
-
-  if (volRatio >= 1.5) {
-    // High volume — strongly confirms whichever direction
-    buy > sell ? buy += 20 : sell += 20;
-    reasons.push(`Volume ${volRatio.toFixed(1)}x avg — strong confirmation`);
-  } else if (volRatio >= 1.2) {
-    buy > sell ? buy += 10 : sell += 10;
-    reasons.push(`Volume ${volRatio.toFixed(1)}x avg — moderate confirmation`);
-  } else if (volRatio < 0.7) {
-    // Low volume scalp = dangerous, likely to reverse
-    reasons.push(`⚠ Low volume (${volRatio.toFixed(1)}x) — scalp rejected`);
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons };
-  }
-
-  // ── 7. ATR expansion — volatility must be alive for scalping ──
+  // 1. ATR must be meaningful — frozen markets kill scalps
   const atrVal = atr(bars1m, 10);
-  const atrPct = price > 0 ? (atrVal / price) * 100 : 0;
-
-  if (atrPct < 0.05) {
-    // Market is frozen — spread will eat any gain
-    reasons.push(`⚠ ATR too low (${atrPct.toFixed(3)}%) — market frozen`);
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons };
+  const atrPct = price > 0 ? atrVal / price : 0;
+  if (atrPct < 0.0003) { // 0.03% minimum — stock must be moving
+    return { signal: 'HOLD', confidence: 0, score: 0,
+      reasons: [`ATR too low (${(atrPct*100).toFixed(3)}%) — market frozen`] };
   }
-  if (atrPct > 0.08) {
+
+  // 2. Volume must be present
+  const avgVol  = volumes.slice(-15).reduce((a,b)=>a+b,0) / 15;
+  const curVol  = volumes[volumes.length-1];
+  const volRatio = avgVol > 0 ? curVol / avgVol : 1;
+  if (volRatio < 0.6) {
+    return { signal: 'HOLD', confidence: 0, score: 0,
+      reasons: [`Volume too low (${volRatio.toFixed(1)}x) — no liquidity`] };
+  }
+
+  // ── SCORING — need strong confluence from multiple sources ──
+  let buy = 0, sell = 0;
+
+  // ── A. VWAP position — the most important intraday level ──
+  const vw       = vwap(bars1m);
+  const vwapDist = (price - vw) / vw;
+  // Require meaningful separation from VWAP (not just sitting on it)
+  if (vwapDist > 0.002) {
+    buy += 25; reasons.push(`Above VWAP +${(vwapDist*100).toFixed(2)}% ✅`);
+  } else if (vwapDist < -0.002) {
+    sell += 25; reasons.push(`Below VWAP ${(vwapDist*100).toFixed(2)}% ✅`);
+  } else {
+    return { signal: 'HOLD', confidence: 0, score: 0,
+      reasons: [`Too close to VWAP (${(vwapDist*100).toFixed(3)}%) — no edge`] };
+  }
+
+  // ── B. EMA stack on 1m — trend direction ──
+  const e5  = ema(closes, 5);
+  const e13 = ema(closes, 13);
+  const e21 = ema(closes, 21);
+  const pe5 = ema(closes.slice(0,-1), 5);
+  const pe13 = ema(closes.slice(0,-1), 13);
+
+  // All three stacked = strong trend
+  if (price > e5 && e5 > e13 && e13 > e21) {
+    buy += 20; reasons.push(`EMA stack bull: price>E5>E13>E21 ✅`);
+  } else if (price < e5 && e5 < e13 && e13 < e21) {
+    sell += 20; reasons.push(`EMA stack bear: price<E5<E13<E21 ✅`);
+  } else if (e5 > e13) {
+    buy += 10; reasons.push(`EMA5 > EMA13 ✅`);
+  } else if (e5 < e13) {
+    sell += 10; reasons.push(`EMA5 < EMA13 ✅`);
+  }
+
+  // Fresh crossover = extra points (momentum just started)
+  if (pe5 <= pe13 && e5 > e13) { buy  += 15; reasons.push(`Fresh EMA5/13 bullish cross 🔥`); }
+  if (pe5 >= pe13 && e5 < e13) { sell += 15; reasons.push(`Fresh EMA5/13 bearish cross 🔥`); }
+
+  // ── C. Momentum — last 2 bars must agree (not 3, less lag) ──
+  const last = closes[closes.length-1], prev = closes[closes.length-2];
+  const prev2 = closes[closes.length-3];
+  if (last > prev && prev > prev2) { buy  += 15; reasons.push(`Momentum up ✅`); }
+  if (last < prev && prev < prev2) { sell += 15; reasons.push(`Momentum down ✅`); }
+
+  // ── D. Candle quality — need a real move, not noise ──
+  const lastBar  = bars1m[bars1m.length-1];
+  const body     = Math.abs(lastBar.c - lastBar.o);
+  const range    = lastBar.h - lastBar.l || 0.0001;
+  const bodyPct  = body / range;
+  // Require solid body (>50% of range) — indecision candles = no trade
+  if (bodyPct < 0.40) {
+    return { signal: 'HOLD', confidence: 0, score: 0,
+      reasons: [`Weak candle body (${(bodyPct*100).toFixed(0)}% of range) — indecision`] };
+  }
+  if (bodyPct > 0.65) {
+    lastBar.c > lastBar.o ? buy += 10 : sell += 10;
+    reasons.push(`Strong candle (${(bodyPct*100).toFixed(0)}% body) ✅`);
+  }
+
+  // ── E. Volume surge confirms move ──
+  if (volRatio >= 2.0) {
+    buy > sell ? buy += 20 : sell += 20;
+    reasons.push(`Volume surge ${volRatio.toFixed(1)}x ✅`);
+  } else if (volRatio >= 1.3) {
     buy > sell ? buy += 10 : sell += 10;
-    reasons.push(`ATR ${atrPct.toFixed(3)}% — good volatility`);
+    reasons.push(`Volume ${volRatio.toFixed(1)}x ✅`);
   }
 
-  // ── 8. Higher highs / lower lows structure ──
-  const recentHighs = highs.slice(-5);
-  const recentLows  = lows.slice(-5);
-  const higherHighs = recentHighs[4] > recentHighs[3] && recentHighs[3] > recentHighs[2];
-  const lowerLows   = recentLows[4]  < recentLows[3]  && recentLows[3]  < recentLows[2];
-
-  if (higherHighs && buy > sell)  { buy  += 10; reasons.push('Structure: higher highs forming'); }
-  if (lowerLows   && sell > buy)  { sell += 10; reasons.push('Structure: lower lows forming'); }
-
-  // ── 9. RSI on 1m — only for extreme readings ──
-  const r1m = rsi(closes, 9); // shorter period for 1m scalping
-  if (r1m < 25)      { buy  += 10; reasons.push(`1m RSI oversold (${r1m.toFixed(0)})`); }
-  else if (r1m > 75) { sell += 10; reasons.push(`1m RSI overbought (${r1m.toFixed(0)})`); }
-
-  // ── Final score ──
-  const total      = buy + sell;
-  const confidence = total > 0 ? Math.round(Math.max(buy, sell) / total * 100) : 0;
-  const minScore   = CONFIG.scalpMinScore;
-
-  if (buy >= minScore && buy > sell * 1.5)  {
-    return { signal: 'BUY',  confidence, score: buy,  reasons, atr: atrVal, vwap: vw, rsi: r1m };
+  // ── F. RSI 1m — confirm not already exhausted ──
+  const r1m = rsi(closes, 9);
+  // Don't buy overbought, don't sell oversold
+  if (buy > sell && r1m > 80) {
+    return { signal: 'HOLD', confidence: 0, score: 0,
+      reasons: [`RSI ${r1m.toFixed(0)} overbought — scalp buy too late`] };
   }
-  if (sell >= minScore && sell > buy * 1.5) {
-    return { signal: 'SELL', confidence, score: sell, reasons, atr: atrVal, vwap: vw, rsi: r1m };
+  if (sell > buy && r1m < 20) {
+    return { signal: 'HOLD', confidence: 0, score: 0,
+      reasons: [`RSI ${r1m.toFixed(0)} oversold — scalp sell too late`] };
+  }
+  if (buy > sell && r1m < 55) { buy  += 10; reasons.push(`RSI ${r1m.toFixed(0)} has room to run ✅`); }
+  if (sell > buy && r1m > 45) { sell += 10; reasons.push(`RSI ${r1m.toFixed(0)} has room to fall ✅`); }
+
+  // ── G. Structure: higher highs or lower lows ──
+  const rh = highs.slice(-4);
+  const rl = lows.slice(-4);
+  if (rh[3]>rh[2] && rh[2]>rh[1] && buy>sell)  { buy  += 10; reasons.push(`Higher highs structure ✅`); }
+  if (rl[3]<rl[2] && rl[2]<rl[1] && sell>buy)  { sell += 10; reasons.push(`Lower lows structure ✅`); }
+
+  // ── FINAL DECISION ──
+  // Need strong directional conviction — buy must be 2x sell (or vice versa)
+  // and total score must exceed threshold
+  const minScore = CONFIG.scalpMinScore || 70;
+  const total    = buy + sell;
+  const conf     = total > 0 ? Math.round(Math.max(buy,sell)/total*100) : 0;
+
+  // Require clear direction AND minimum score AND volume present
+  if (buy >= minScore && buy >= sell * 2.0 && volRatio >= 0.8) {
+    reasons.push(`✅ Scalp BUY: score=${buy} conf=${conf}% ATR=${(atrPct*100).toFixed(3)}%`);
+    return { signal:'BUY',  confidence:conf, score:buy,  reasons, atr:atrVal, vwap:vw, rsi:r1m };
+  }
+  if (sell >= minScore && sell >= buy * 2.0 && volRatio >= 0.8) {
+    reasons.push(`✅ Scalp SELL: score=${sell} conf=${conf}% ATR=${(atrPct*100).toFixed(3)}%`);
+    return { signal:'SELL', confidence:conf, score:sell, reasons, atr:atrVal, vwap:vw, rsi:r1m };
   }
 
-  reasons.push(`Score insufficient (buy=${buy} sell=${sell} need ${minScore})`);
-  return { signal: 'HOLD', confidence, score: Math.max(buy, sell), reasons, atr: atrVal, vwap: vw };
+  return { signal:'HOLD', confidence:conf, score:Math.max(buy,sell),
+    reasons:[...reasons, `Insufficient conviction (buy=${buy} sell=${sell} need=${minScore} ratio=${(Math.max(buy,sell)/Math.max(1,Math.min(buy,sell))).toFixed(1)}x)`] };
 }
 
 /**
@@ -5156,12 +5154,22 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   if (cost > portfolio) { log('scalp', `Scalp ${sym}: insufficient cash`); return; }
 
   // Tight stops — scalping lives and dies by discipline
+  // Stop = 1× ATR, TP = 2× ATR → guaranteed 2:1 R:R minimum
   const atrVal   = sigInfo.atr || price * 0.002;
-  const slOffset = Math.max(atrVal * 0.5, price * CONFIG.scalpSlPct);
-  const tpOffset = Math.max(atrVal * 1.0, price * CONFIG.scalpTpPct);
+  const slDist   = Math.max(atrVal * 1.0, price * 0.001); // 1× ATR, min 0.1%
+  const tpDist   = Math.max(atrVal * 2.0, price * 0.002); // 2× ATR, min 0.2% → always 2:1
 
-  const stopPrice = direction === 'long'  ? price - slOffset : price + slOffset;
-  const tpPrice   = direction === 'long'  ? price + tpOffset : price - tpOffset;
+  const stopPrice = direction === 'long'  ? price - slDist : price + slDist;
+  const tpPrice   = direction === 'long'  ? price + tpDist : price - tpDist;
+
+  // Hard check: TP must be > $0.05/share after estimated spread cost
+  // Entering a scalp where the spread eats the gain is an instant loss
+  const estimatedSpread = price * 0.0002; // ~0.02% typical spread
+  const netTP = tpDist - estimatedSpread;
+  if (netTP < 0.03) {
+    log('scalp', `🚫 ${sym} scalp skipped — TP ($${tpDist.toFixed(3)}) too close to spread ($${estimatedSpread.toFixed(3)})`);
+    return;
+  }
 
   // Place order
   const side = direction === 'long' ? 'buy' : 'sell';
@@ -5276,16 +5284,18 @@ async function scalpPositionMonitor() {
 
   try {
     for (const [sym, pos] of Object.entries(scalpPositions)) {
-      // Use cached price first — no API call needed for the check
-      // priceHistory5m is updated every 15s by syncPricesOnly
-      let price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+      // CRITICAL: skip first 3 seconds after entry
+      // Stale bar prices from before entry can immediately trigger stop loss
+      const ageSecs = (Date.now() - new Date(pos.entryTime).getTime()) / 1000;
+      if (ageSecs < 3) continue;
 
-      // If cache is stale (>15s old) or missing, fetch live
-      if (!price) {
+      // Always fetch a fresh price for stop/TP decisions
+      // Never use a price that might predate the entry
+      let price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+      if (!price || price <= 0) {
         price = await fetchLatestTrade(sym);
         if (!price) continue;
-        if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
-        priceHistory5m[sym].push(price);
+        priceHistory5m[sym] = [price];
       }
 
       const { direction, entryPrice, stopPrice, tpPrice } = pos;
@@ -5336,27 +5346,35 @@ async function scalpPositionMonitor() {
       }
 
       // ── EXIT 4: Time stop ──
-      if (holdMins >= CONFIG.scalpMaxHoldMins) {
+      // Max 4 minutes — scalps that haven't moved must be cut loose
+      const maxMins = Math.min(CONFIG.scalpMaxHoldMins, 4);
+      if (holdMins >= maxMins) {
         log('scalp', `⏰ Time stop: ${sym} held ${holdMins.toFixed(1)}m P&L: ${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)}`);
         await exitScalp(sym, price, 'SCALP_TIME');
         continue;
       }
 
-      // ── EXIT 5: Micro-move detector ──
-      // Scalps that only move cents in 3+ minutes are dead — exit immediately
-      if (holdMins >= 3) {
+      // ── EXIT 5: Momentum death ──
+      if (holdMins >= 1.5) {
         const mfe = direction === 'long'
           ? (pos.highWater - entryPrice) / entryPrice
-          : (entryPrice - pos.lowWater)  / entryPrice;
-        const pnlPerShare = Math.abs(price - entryPrice);
-        // Stuck: barely moved from entry, tiny total range, not in loss (stop would handle that)
-        if (mfe < 0.001 && pnlPerShare < 0.08 && pnlNow >= 0) {
-          log('scalp', `💤 ${sym} SCALP MICRO-MOVE — ${holdMins.toFixed(1)}m, only ${(mfe*100).toFixed(3)}% move — exiting`);
+          : (entryPrice - pos.lowWater) / entryPrice;
+        const curChg = direction === 'long'
+          ? (price - entryPrice) / entryPrice
+          : (entryPrice - price) / entryPrice;
+        // Was profitable but giving back >50% of gains — lock it
+        if (mfe > 0.001 && curChg < mfe * 0.5) {
+          log('scalp', `📉 ${sym} momentum reverting MFE=${(mfe*100).toFixed(3)}% now=${(curChg*100).toFixed(3)}%`);
+          await exitScalp(sym, price, 'SCALP_TRAIL');
+          continue;
+        }
+        // Micro-move: 2min in and barely moved
+        if (holdMins >= 2 && mfe < 0.0005 && Math.abs(price-entryPrice) < 0.05 && pnlNow >= 0) {
+          log('scalp', `💤 ${sym} scalp dead (${holdMins.toFixed(1)}m) — freeing capital`);
           await exitScalp(sym, price, 'SCALP_MICRO_MOVE');
           continue;
         }
       }
-
       // Still holding — log status
       log('scalp', `⚡ ${sym} ${direction.toUpperCase()} $${entryPrice.toFixed(2)}→$${price.toFixed(2)} P&L:${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)} SL=$${pos.stopPrice.toFixed(2)} TP=$${tpPrice.toFixed(2)} ${holdMins.toFixed(1)}m`);
     }
