@@ -1191,11 +1191,29 @@ async function syncPositions() {
     });
   }
 
-  // Wipe and rewrite all positions atomically
-  // Use symbol=neq.ZZZZ as a "match all" filter since Supabase requires a filter for DELETE
-  await sbFetch(tbl('tc_positions')+'?symbol=neq.____NONE____', 'DELETE');
+  // Update each position individually — never wipe the whole table
+  // This eliminates the delete→insert gap that caused positions to flash away
   if (allPositions.length > 0) {
-    await sbFetch(tbl('tc_positions'), 'POST', allPositions);
+    for (const pos of allPositions) {
+      // Try PATCH first (update existing), then POST (insert new)
+      const patched = await sbFetch(
+        tbl('tc_positions') + `?symbol=eq.${pos.symbol}`,
+        'PATCH', pos
+      );
+      // If nothing was updated (no row exists), insert it
+      const patchedEmpty = !patched || (Array.isArray(patched) && patched.length === 0);
+      if (patchedEmpty) {
+        await sbFetch(tbl('tc_positions'), 'POST', pos);
+      }
+    }
+    // Remove rows for symbols no longer open
+    const openSyms = allPositions.map(p => p.symbol);
+    await sbFetch(
+      tbl('tc_positions') + `?symbol=not.in.(${openSyms.join(',')})`,
+      'DELETE'
+    );
+  } else {
+    await sbFetch(tbl('tc_positions') + '?symbol=neq.____NONE____', 'DELETE');
   }
 }
 
