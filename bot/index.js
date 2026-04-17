@@ -2733,13 +2733,13 @@ function generateSignal(sym, bars5m, bars15m) {
   const price = c5[c5.length - 1];
 
   // ── PRE-GATE: Minimum volatility ──────────────────────────────
-  // Reject stocks that don't move enough to reach TP1 before BE triggers
-  // NIO, DRCL, PYPL type stocks hit +0.3% then immediately reverse = constant BE exits
+  // Skip in sim mode — historical bars can have low ATR during off-hours
+  // In live mode reject stocks that don't move enough to reach TP1
   const atrNow = atr(bars5m, 14);
   const atrPct = price > 0 ? atrNow / price : 0;
-  if (atrPct < 0.004) { // 0.4% ATR minimum
+  if (!isSimMode() && atrPct < 0.002) { // 0.2% ATR minimum for live only
     return { signal: 'HOLD', confidence: 0, score: 0,
-      reasons: [`ATR too low (${(atrPct*100).toFixed(2)}% < 0.4% min) — not enough movement`], rsi: 50 };
+      reasons: [`ATR too low (${(atrPct*100).toFixed(2)}% < 0.2% min) — not moving`], rsi: 50 };
   }
 
   const reasons = [];
