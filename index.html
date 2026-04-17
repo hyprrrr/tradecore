@@ -1361,125 +1361,175 @@ function updateAdaptive(p){
 // ══════════════════════════════════════════════════════════
 // CHART — crisp, fast canvas rendering
 // ══════════════════════════════════════════════════════════
-let chartCtx=null, animFrame=null;
+// ═══════════════════════════════════════════════════
+// 60FPS EQUITY CHART — requestAnimationFrame loop
+// Interpolates smoothly between data points so the
+// line glides in real-time instead of jumping on poll
+// ═══════════════════════════════════════════════════
+let chartCtx = null;
+let chartRAF  = null;
 
-function drawChart(){
-  const canvas=document.getElementById('equityChart');
-  if(!canvas) return;
-  const container=canvas.parentElement;
-  const W=container.offsetWidth, H=container.offsetHeight;
-  if(W<=0||H<=0) return;
+// Displayed value — lerps toward target every frame for smooth animation
+let chartDisplayed = 0;
+let chartTarget    = 0;
+let chartW = 0, chartH = 0;
 
-  canvas.width=W; canvas.height=H;
-  if(!chartCtx) chartCtx=canvas.getContext('2d');
-  const ctx=chartCtx;
-  ctx.clearRect(0,0,W,H);
+// Start the 60fps render loop once
+function startChartLoop() {
+  const canvas = document.getElementById('equityChart');
+  if (!canvas || chartRAF) return;
+  chartCtx = canvas.getContext('2d');
+  function loop() {
+    renderChart();
+    chartRAF = requestAnimationFrame(loop);
+  }
+  chartRAF = requestAnimationFrame(loop);
+}
 
-  const startCap=getStartingCapital();
-  const data=equityHistory.length>=2?equityHistory:null;
+// Called by poll() — just updates the target, animation does the rest
+function drawChart() {
+  if (!chartRAF) startChartLoop();
+  // Update target from latest equity history
+  if (equityHistory.length > 0) {
+    chartTarget = equityHistory[equityHistory.length - 1];
+    if (chartDisplayed === 0) chartDisplayed = chartTarget;
+  }
+}
 
-  // Baseline
-  const PAD_TOP=80, PAD_BOT=20, PAD_L=20, PAD_R=20;
-  const cH=H-PAD_TOP-PAD_BOT, cW=W-PAD_L-PAD_R;
+function renderChart() {
+  const canvas = document.getElementById('equityChart');
+  if (!canvas) return;
+  const container = canvas.parentElement;
+  const W = container.offsetWidth, H = container.offsetHeight;
+  if (W <= 0 || H <= 0) return;
 
-  const minV=data?Math.min(...data,startCap)*0.998:startCap*0.99;
-  const maxV=data?Math.max(...data,startCap)*1.002:startCap*1.01;
-  const range=maxV-minV||1;
+  // Resize only when dimensions change — avoids clearing on every frame
+  if (canvas.width !== W || canvas.height !== H) {
+    canvas.width = W; canvas.height = H;
+    chartW = W; chartH = H;
+  }
 
-  const toX=i=>PAD_L+(i/(data.length-1))*cW;
-  const toY=v=>PAD_TOP+cH-((v-minV)/range)*cH;
-  const baseY=toY(startCap);
+  // Lerp displayed value toward target — 8% per frame at 60fps = smooth ~200ms glide
+  const LERP = 0.08;
+  if (chartTarget > 0) {
+    chartDisplayed = chartDisplayed + (chartTarget - chartDisplayed) * LERP;
+  }
 
-  // Grid lines
-  ctx.setLineDash([2,6]);
-  ctx.strokeStyle='rgba(15,32,53,0.8)';
-  ctx.lineWidth=1;
-  for(let i=0;i<4;i++){
-    const y=PAD_TOP+(cH/3)*i;
-    ctx.beginPath(); ctx.moveTo(PAD_L,y); ctx.lineTo(W-PAD_R,y); ctx.stroke();
+  const ctx = chartCtx;
+  ctx.clearRect(0, 0, W, H);
+
+  const startCap = getStartingCapital();
+  const PAD_TOP = 80, PAD_BOT = 20, PAD_L = 20, PAD_R = 20;
+  const cH = H - PAD_TOP - PAD_BOT, cW = W - PAD_L - PAD_R;
+
+  // Use actual history for the line, but append the interpolated current value
+  const rawData = equityHistory.length >= 2 ? [...equityHistory] : null;
+  // Replace the last point with the smoothly interpolated value so the endpoint glides
+  if (rawData && chartDisplayed > 0) rawData[rawData.length - 1] = chartDisplayed;
+
+  const data = rawData;
+  const minV = data ? Math.min(...data, startCap) * 0.998 : startCap * 0.99;
+  const maxV = data ? Math.max(...data, startCap) * 1.002 : startCap * 1.01;
+  const range = maxV - minV || 1;
+
+  const toX = i => PAD_L + (i / Math.max(data.length - 1, 1)) * cW;
+  const toY = v => PAD_TOP + cH - ((v - minV) / range) * cH;
+  const baseY = toY(startCap);
+
+  // Grid
+  ctx.setLineDash([2, 6]);
+  ctx.strokeStyle = 'rgba(15,32,53,0.8)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const y = PAD_TOP + (cH / 3) * i;
+    ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(W - PAD_R, y); ctx.stroke();
   }
   ctx.setLineDash([]);
 
-  // Baseline (starting capital)
-  ctx.strokeStyle='rgba(42,74,100,0.6)';
-  ctx.lineWidth=1;
-  ctx.setLineDash([5,8]);
-  ctx.beginPath(); ctx.moveTo(PAD_L,baseY); ctx.lineTo(W-PAD_R,baseY); ctx.stroke();
+  // Baseline
+  ctx.strokeStyle = 'rgba(42,74,100,0.6)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 8]);
+  ctx.beginPath(); ctx.moveTo(PAD_L, baseY); ctx.lineTo(W - PAD_R, baseY); ctx.stroke();
   ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(42,74,100,0.8)';
+  ctx.font = '8px JetBrains Mono';
+  ctx.textAlign = 'left';
+  ctx.fillText('$' + startCap.toLocaleString(), PAD_L + 4, baseY - 4);
 
-  // Baseline label
-  ctx.fillStyle='rgba(42,74,100,0.8)';
-  ctx.font='8px JetBrains Mono';
-  ctx.textAlign='left';
-  ctx.fillText('$'+startCap.toLocaleString(), PAD_L+4, baseY-4);
-
-  if(!data){
-    ctx.fillStyle='rgba(42,74,100,0.5)';
-    ctx.font='10px JetBrains Mono';
-    ctx.textAlign='center';
-    ctx.fillText('EQUITY CURVE BUILDS AS BOT TRADES', W/2, H/2);
+  if (!data) {
+    ctx.fillStyle = 'rgba(42,74,100,0.5)';
+    ctx.font = '10px JetBrains Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('EQUITY CURVE BUILDS AS BOT TRADES', W / 2, H / 2);
     return;
   }
 
-  const last=data[data.length-1];
-  const isUp=last>=startCap;
-  const lineColor=isUp?'#00ff88':'#ff4466';
-  const fillTop=isUp?'rgba(0,255,136,0.15)':'rgba(255,68,102,0.12)';
-  const fillBot=isUp?'rgba(0,255,136,0)':'rgba(255,68,102,0)';
+  const last    = chartDisplayed || data[data.length - 1];
+  const isUp    = last >= startCap;
+  const lineCol = isUp ? '#00ff88' : '#ff4466';
+  const fillTop = isUp ? 'rgba(0,255,136,0.15)' : 'rgba(255,68,102,0.12)';
 
-  // Fill gradient
-  const grad=ctx.createLinearGradient(0,PAD_TOP,0,H-PAD_BOT);
-  grad.addColorStop(0,fillTop);
-  grad.addColorStop(1,fillBot);
+  const grad = ctx.createLinearGradient(0, PAD_TOP, 0, H - PAD_BOT);
+  grad.addColorStop(0, fillTop);
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
 
-  // Smooth bezier path helper
-  function smoothPath(pts){
-    ctx.moveTo(pts[0][0],pts[0][1]);
-    for(let i=0;i<pts.length-1;i++){
-      const x0=pts[i][0],y0=pts[i][1];
-      const x1=pts[i+1][0],y1=pts[i+1][1];
-      const cpx=(x0+x1)/2;
-      ctx.bezierCurveTo(cpx,y0,cpx,y1,x1,y1);
+  // Catmull-Rom spline — smoother than bezier for financial charts
+  function catmullRom(pts) {
+    if (pts.length < 2) return;
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[Math.max(i - 1, 0)];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = pts[Math.min(i + 2, pts.length - 1)];
+      const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+      const cp1y = p1[1] + (p2[1] - p0[1]) / 6;
+      const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+      const cp2y = p2[1] - (p3[1] - p1[1]) / 6;
+      ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1]);
     }
   }
-  const pts=data.map((v,i)=>[toX(i),toY(v)]);
 
-  // Fill under curve
+  const pts = data.map((v, i) => [toX(i), toY(v)]);
+
+  // Fill
   ctx.beginPath();
-  ctx.moveTo(pts[0][0],H-PAD_BOT);
-  ctx.lineTo(pts[0][0],pts[0][1]);
-  smoothPath(pts);
-  ctx.lineTo(pts[pts.length-1][0],H-PAD_BOT);
+  ctx.moveTo(pts[0][0], H - PAD_BOT);
+  ctx.lineTo(pts[0][0], pts[0][1]);
+  catmullRom(pts);
+  ctx.lineTo(pts[pts.length-1][0], H - PAD_BOT);
   ctx.closePath();
-  ctx.fillStyle=grad;
+  ctx.fillStyle = grad;
   ctx.fill();
 
-  // Smooth line
+  // Line
   ctx.beginPath();
-  smoothPath(pts);
-  ctx.strokeStyle=lineColor;
-  ctx.lineWidth=2;
-  ctx.lineJoin='round';
-  ctx.lineCap='round';
+  catmullRom(pts);
+  ctx.strokeStyle = lineCol;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
   ctx.stroke();
 
-  // End dot
-  const ex=toX(data.length-1), ey=toY(last);
-  ctx.beginPath(); ctx.arc(ex,ey,4,0,Math.PI*2);
-  ctx.fillStyle=lineColor; ctx.fill();
-  ctx.beginPath(); ctx.arc(ex,ey,7,0,Math.PI*2);
-  ctx.strokeStyle=lineColor; ctx.lineWidth=1; ctx.globalAlpha=0.3; ctx.stroke();
-  ctx.globalAlpha=1;
+  // Glowing end dot — pulses at 60fps
+  const ex = pts[pts.length-1][0];
+  const ey = pts[pts.length-1][1];
+  const pulse = 0.4 + 0.6 * Math.abs(Math.sin(Date.now() / 600));
+  ctx.beginPath(); ctx.arc(ex, ey, 4, 0, Math.PI * 2);
+  ctx.fillStyle = lineCol; ctx.fill();
+  ctx.beginPath(); ctx.arc(ex, ey, 8, 0, Math.PI * 2);
+  ctx.strokeStyle = lineCol; ctx.lineWidth = 1.5;
+  ctx.globalAlpha = pulse * 0.5; ctx.stroke(); ctx.globalAlpha = 1;
 
-  // End label
-  const diff=last-startCap;
-  const pct=(diff/startCap*100).toFixed(2);
-  const label=`$${Math.round(last).toLocaleString()} (${diff>=0?'+':''}${pct}%)`;
-  ctx.font='bold 10px JetBrains Mono';
-  ctx.fillStyle=lineColor;
-  ctx.textAlign='right';
-  const lx=Math.min(ex,W-PAD_R-4);
-  ctx.fillText(label, lx, ey-10);
+  // Live label
+  const diff = last - startCap;
+  const pct  = (diff / startCap * 100).toFixed(2);
+  const label = `$${Math.round(last).toLocaleString()} (${diff >= 0 ? '+' : ''}${pct}%)`;
+  ctx.font = 'bold 10px JetBrains Mono';
+  ctx.fillStyle = lineCol;
+  ctx.textAlign = 'right';
+  ctx.fillText(label, Math.min(ex, W - PAD_R - 4), ey - 12);
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1515,11 +1565,15 @@ function showToast(msg, type=''){
 // ══════════════════════════════════════════════════════════
 // BOOT
 // ══════════════════════════════════════════════════════════
-window.addEventListener('resize', drawChart);
+window.addEventListener('resize', () => {
+  // Force canvas resize on next render frame
+  const c = document.getElementById('equityChart');
+  if (c) { c.width = 0; c.height = 0; }
+});
 
 loadSettings();
 updateSessionMap();
-drawChart();
+startChartLoop(); // 60fps render loop — runs forever
 
 if(getSbUrl()&&getSbKey()){
   testConnection();
