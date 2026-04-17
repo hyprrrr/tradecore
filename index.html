@@ -1225,10 +1225,19 @@ function procEq(raw,cap){
   if(!raw||raw<=0||raw>cap*3) return false;
   const last=eqHist[eqHist.length-1];
   if(!last){ eqHist.push(raw); stableEq=raw; return true; }
+
+  // Spike filter: reject any single-poll jump > 2% unless we're in a relaxed window
+  // This prevents position open/close events from creating visual spikes
   const relaxed=(Date.now()-eqResetAt)<20000;
-  if(!relaxed&&Math.abs((raw-last)/last)>0.08) return false; // 8% spike filter
-  if(Math.abs(raw-last)<1) return true;
-  eqHist.push(raw); if(eqHist.length>300) eqHist.shift(); stableEq=raw; return true;
+  const pctChange=Math.abs((raw-last)/last);
+  if(!relaxed && pctChange>0.02) {
+    // Big jump — could be legitimate profit or a stale-data spike
+    // Accept it if multiple consecutive polls confirm it (use stableEq as anchor)
+    const pctFromStable=Math.abs((raw-stableEq)/stableEq);
+    if(pctFromStable>0.05) return false; // >5% from stable = reject as spike
+  }
+  if(Math.abs(raw-last)<0.50) return true; // micro-change, stable
+  eqHist.push(raw); if(eqHist.length>400) eqHist.shift(); stableEq=raw; return true;
 }
 function startChart(){
   const cv=$('equityChart'); if(!cv||chartRAF) return;
@@ -1329,6 +1338,7 @@ function renderChart(){
 // POLL
 // ═══════════════════════════════════════
 let pollN=0, lastPosHash='', lastTradeN=0, lastLogTs='';
+let lastKnownPositions=[], emptyPosCount=0; // prevent flash-to-empty
 
 async function poll(){
   pollN++;
@@ -1352,12 +1362,10 @@ async function poll(){
   const p=port[0], posData=positions||[], cap=getStartingCapital();
 
   // Equity
-  const dbT=+p.total_value||0, dbC=+p.cash||0;
-  const lv=posData.filter(x=>!x.side?.includes('SHORT')).reduce((s,x)=>s+(+x.current_price||+x.entry_price||0)*Math.abs(+x.qty||0),0);
-  const sp=posData.filter(x=>x.side?.includes('SHORT')).reduce((s,x)=>s+(+x.pnl||0),0);
-  const sv=posData.filter(x=>x.side?.includes('SCALP')).reduce((s,x)=>s+(+x.current_price||+x.entry_price||0)*Math.abs(+x.qty||0),0);
-  const comp=dbC>0&&dbC!==cap?dbC+lv+sp+sv:0;
-  const raw=(dbT>0&&dbT!==cap)?dbT:(comp>cap*.3?comp:dbT||cap);
+  const dbT=+p.total_value||0;
+  // Use total_value from bot directly — it's the authoritative source written every scan
+  // Computed equity causes spikes when positions open/close mid-poll
+  const raw = dbT > 0 ? dbT : cap;
   if(eqHist.length===0&&raw>0){
     eqHist.push(raw); stableEq=raw; chartTgt=raw; chartDsp=raw;
     // Also reset chart display so it doesn't interpolate from 0
@@ -1427,11 +1435,19 @@ async function poll(){
   // Sync time
   if($('syncInfo')) $('syncInfo').textContent='Updated '+new Date().toLocaleTimeString();
 
-  // Positions — always re-render to keep current_price fresh
-  // Include updated_at in hash so we catch price updates even when pnl hasn't changed
-  const ph=JSON.stringify(posData.map(x=>x.symbol+(x.pnl||0)+(x.current_price||0)+(x.updated_at||'')));
+  // Position flash prevention:
+  // If we suddenly get 0 positions but had some before, wait 3 polls to confirm they're gone
+  // This prevents the DELETE→INSERT gap from clearing the display momentarily
+  if(posData.length > 0) {
+    lastKnownPositions = posData;
+    emptyPosCount = 0;
+  } else if(lastKnownPositions.length > 0) {
+    emptyPosCount++;
+    if(emptyPosCount < 3) posData.splice(0, 0, ...lastKnownPositions); // restore temporarily
+    else lastKnownPositions = [];
+  }
+  const ph=JSON.stringify(posData.map(x=>x.symbol+(x.pnl||0).toFixed(2)+(x.current_price||0)+(x.updated_at||'')));
   if(ph!==lastPosHash){ lastPosHash=ph; renderPositions(posData); }
-  // Always update the count badges even if positions haven't changed
   if($('posCountBadge')) $('posCountBadge').textContent=posData.length;
   if($('scPositions')) $('scPositions').textContent=posData.length;
 
