@@ -1101,17 +1101,26 @@ async function poll(){
   const posData=positions||[];
   const startCap=getStartingCapital();
 
-  // Process equity — strict spike filter
-  // Always seed from total_value if history is empty — never show blank chart
-  if(equityHistory.length===0 && p.total_value>0){
-    equityHistory.push(+p.total_value);
-    stableEquity=+p.total_value;
-    chartTarget=+p.total_value;
-    chartDisplayed=+p.total_value;
+  // Compute true equity = cash + all open position market values
+  // Don't rely on total_value from DB — it can lag on restore
+  const cashVal  = +p.cash || +p.total_value || startCap;
+  const longVal  = posData.filter(x=>!x.side?.includes('SHORT'))
+    .reduce((s,x)=>s+(+x.current_price||+x.entry_price||0)*Math.abs(+x.qty||0),0);
+  const shortPnl = posData.filter(x=>x.side?.includes('SHORT'))
+    .reduce((s,x)=>s+(+x.pnl||0),0);
+  // If we have positions, use computed equity; else use DB value
+  const computedEq = posData.length>0 && cashVal>0 ? cashVal+longVal+shortPnl : +p.total_value||startCap;
+  const rawEq      = computedEq > startCap*0.3 && computedEq < startCap*3 ? computedEq : +p.total_value||startCap;
+
+  if(equityHistory.length===0 && rawEq>0){
+    equityHistory.push(rawEq);
+    stableEquity=rawEq;
+    chartTarget=rawEq;
+    chartDisplayed=rawEq;
   } else {
-    processEquity(+p.total_value, startCap);
+    processEquity(rawEq, startCap);
   }
-  const displayEq = stableEquity || +p.total_value || startCap;
+  const displayEq = stableEquity || rawEq || startCap;
 
   // Update all displays
   updateHeader(p, posData, displayEq, startCap);
