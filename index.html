@@ -1111,7 +1111,10 @@ async function poll(){
     .reduce((s,x)=>s+(+x.current_price||+x.entry_price||0)*Math.abs(+x.qty||0),0);
   const shortPnl    = posData.filter(x=>x.side?.includes('SHORT'))
     .reduce((s,x)=>s+(+x.pnl||0),0);
-  const computedEq  = dbCash > 0 && dbCash !== startCap ? dbCash + longMktVal + shortPnl : 0;
+  // Include scalp positions — when cash drops on scalp entry, add back the position value
+  const scalpMktVal = posData.filter(x=>x.side?.includes('SCALP'))
+    .reduce((s,x)=>s+(+x.current_price||+x.entry_price||0)*Math.abs(+x.qty||0),0);
+  const computedEq  = dbCash > 0 && dbCash !== startCap ? dbCash + longMktVal + shortPnl + scalpMktVal : 0;
 
   // Use total_value if it's real (not the $100k sim default)
   // Use computed if total_value looks like the sim reset value
