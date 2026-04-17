@@ -1325,8 +1325,10 @@ function injectLiveBar(sym, bar) {
 let liveBar5m = {}; // sym → completed bars from live ticks this session
 
 // Get bars with live tick data merged in — called by managePosition instead of raw REST bars
+// In sim mode: just return the bars directly (no live stream)
 function getLiveBars(sym, restBars) {
   if (!restBars || restBars.length === 0) return restBars;
+  if (isSimMode()) return restBars; // sim has no live stream, bars are already current
 
   // Start with REST bars
   const merged = [...restBars];
@@ -1344,7 +1346,6 @@ function getLiveBars(sym, restBars) {
     const live = liveBar[sym];
     const lastMerged = merged[merged.length - 1];
     if (lastMerged && lastMerged.time === live.time) {
-      // Replace last bar with live version (it's the same candle, more up to date)
       merged[merged.length - 1] = {
         t: live.t, o: live.o, h: live.h, l: live.l, c: live.c, v: live.v,
         time: live.time, live: true,
@@ -2121,10 +2122,10 @@ async function runSimScan() {
     for (const sym of Object.keys(positions)) {
       const bars5m = snapshot[sym];
       if (!bars5m || bars5m.length < 5) continue;
-      // Merge live tick bars so indicators use real-time data not stale REST bars
-      const liveBars = getLiveBars(sym, bars5m);
-      const price = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || liveBars[liveBars.length-1].c;
-      await managePosition(sym, price, liveBars);
+      // Use the bar close price directly in sim — no WebSocket in sim
+      const price = bars5m[bars5m.length - 1].c;
+      priceHistory5m[sym] = bars5m.map(b => b.c);
+      await managePosition(sym, price, bars5m);
     }
     for (const sym of Object.keys(shortPositions)) {
       const bars5m = snapshot[sym];
@@ -2133,10 +2134,14 @@ async function runSimScan() {
       await manageShort(sym, price, bars5m);
     }
 
-    // Generate signals
-    const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
+    // Generate signals — recalculate totalOpen inside loop so each entry is counted
     for (const sym of Object.keys(snapshot)) {
       if (positions[sym] || shortPositions[sym]) continue;
+
+      // Hard stop — recalculate after every entry
+      const openNow = Object.keys(positions).length + Object.keys(shortPositions).length;
+      if (openNow >= CONFIG.maxOpenPositions) break;
+
       const bars5m = snapshot[sym];
       if (!bars5m || bars5m.length < 30) continue;
 
@@ -2153,25 +2158,22 @@ async function runSimScan() {
       }
 
       const price = bars5m[bars5m.length - 1].c;
+      // Seed price history from bars — don't carry over stale data from previous run
       priceHistory5m[sym] = bars5m.map(b => b.c);
 
       let sig = generateSignalByStrategy(sym, bars5m, bars15m.length >= 10 ? bars15m : null) || generateSignal(sym, bars5m, bars15m.length >= 10 ? bars15m : null);
       sig = applyDayBias(sig);
 
       if (sig.signal !== 'HOLD') {
-        log('sim', `  ${sym} $${price.toFixed(2)} → ${sig.signal} (score:${sig.score} conf:${sig.confidence}%)`);
+        log('sim', `  ${sym} $${price.toFixed(2)} → ${sig.signal} conf:${sig.confidence}% score:${sig.score}`);
       }
 
-      const confirmed = sig.signal !== 'HOLD' && sig.score > 0;
-      if (!confirmed) continue;
+      // Must be a real confirmed signal — not just HOLD with score > 0
+      if (sig.signal === 'HOLD' || sig.confidence < 50) continue;
 
-      // Recalculate totalOpen after every entry — prevents same-scan over-entry
-      const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
-      if (totalOpen >= CONFIG.maxOpenPositions) continue;
-
-      if (sig.signal === 'BUY' && totalOpen < CONFIG.maxOpenPositions) {
+      if (sig.signal === 'BUY') {
         await enterPosition(sym, price, sig, bars5m, 'long');
-      } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled && totalOpen < CONFIG.maxOpenPositions) {
+      } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled) {
         await enterPosition(sym, price, sig, bars5m, 'short');
       }
     }
@@ -3020,18 +3022,17 @@ function generateSignal(sym, bars5m, bars15m) {
   reasons.push(`Volume ${volRatio.toFixed(1)}x avg ${volRatio >= 1.5 ? '✅' : ''}`);
   passedGates++;
 
-  // ── GATE 5: 15-minute timeframe must agree ──
-  // 5-minute signals against the 15-min trend are low probability
+  // ── GATE 5: 15-minute timeframe agreement (soft gate) ──
+  // Disagreement costs a gate pass but doesn't hard-block — reduces false kills
   if (c15) {
     const r15    = rsi(c15, CONFIG.rsiPeriod);
     const e8_15  = ema(c15, 8), e21_15 = ema(c15, 21);
-    const bull15 = e8_15 > e21_15 && r15 < 60;
-    const bear15 = e8_15 < e21_15 && r15 > 40;
+    const bull15 = e8_15 > e21_15 && r15 < 65;
+    const bear15 = e8_15 < e21_15 && r15 > 35;
     if      (direction === 'buy'  && bull15) { reasons.push(`15min bullish ✅`); passedGates++; }
     else if (direction === 'sell' && bear15) { reasons.push(`15min bearish ✅`); passedGates++; }
-    else {
-      return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, '15min disagrees — skip'], rsi: r };
-    }
+    else { reasons.push(`15min neutral — reduced confidence`); }
+    // No hard return — let other gates compensate
   }
 
   // ── GATE 6: ADX — only trade when market is trending ──
