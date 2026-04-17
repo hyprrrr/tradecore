@@ -52,14 +52,14 @@ const CONFIG = {
 
   discordWebhook: process.env.DISCORD_WEBHOOK || '',
 
-  symbols: (process.env.SYMBOLS || 'SPY,QQQ,AAPL,MSFT,NVDA,TSLA,EWJ,EWU,EWZ,EWC,FXI,EWA,EWG,EWY,INDA').split(',').map(s => s.trim().toUpperCase()),
+  symbols: (process.env.SYMBOLS || 'NVDA,AAPL,MSFT,TSLA,META,AMZN,GOOGL,AMD,SPY,QQQ,MSTR,COIN,PLTR,SOFI,HOOD').split(',').map(s => s.trim().toUpperCase()),
 
   strategy:      process.env.STRATEGY      || 'rsi_macd',
   rsiPeriod:     +(process.env.RSI_PERIOD     || 14),
   rsiOversold:   +(process.env.RSI_OVERSOLD   || 35),
   rsiOverbought: +(process.env.RSI_OVERBOUGHT || 65),
 
-  startingCapital:  +(process.env.CAPITAL          || 10000),
+  startingCapital:  +(process.env.CAPITAL          || 100000),
   maxPositionPct:   +(process.env.MAX_POSITION_PCT  || 15) / 100,
   maxOpenPositions: +(process.env.MAX_POSITIONS     || 3),
   stopLossPct:      +(process.env.STOP_LOSS_PCT     || 4)  / 100,
@@ -76,7 +76,7 @@ const CONFIG = {
   minConfidence:     60,
   adaptTargetWR:     0.60,
   adaptEmergencyWR:  0.40,
-  confirmCount:      2,
+  confirmCount:      1,  // 1 scan = 15s delay — fast enough for open market moves
   peakMinProfit:     0.020,  // 2% min profit before peak detection runs
   peakSignalsReq:    2,      // signals needed for peak exit
   peakRsiExit:       80,     // RSI level for immediate exit
