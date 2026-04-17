@@ -1045,20 +1045,24 @@ async function testDiscord(){
 // This is mathematically impossible for a real account
 // ══════════════════════════════════════════════════════════
 let equityHistory=[], equityLoaded=false;
-let stableEquity=0; // last accepted equity value — used for display when spike detected
+let stableEquity=0;
 
 function processEquity(raw, startCap){
-  if(!raw || raw<=0 || raw>startCap*3) return false; // clearly bad
+  if(!raw || raw<=0 || raw>startCap*3) return false;
   const last=equityHistory[equityHistory.length-1];
   if(!last){
     equityHistory.push(raw);
     stableEquity=raw;
     return true;
   }
+  // Reject >1% change in one poll (spike filter)
   const pct=Math.abs((raw-last)/last);
-  if(pct>0.01) return false; // >1% change in 3s — reject as spike
+  if(pct>0.01) return false;
+  // Only add a new point if equity moved by more than $1
+  // This stops micro-noise from creating hundreds of jagged points
+  if(Math.abs(raw-last)<1.0) return true; // accept as stable but don't add duplicate
   equityHistory.push(raw);
-  if(equityHistory.length>600) equityHistory.shift();
+  if(equityHistory.length>300) equityHistory.shift(); // fewer points = smoother curve
   stableEquity=raw;
   return true;
 }
@@ -1428,19 +1432,33 @@ function drawChart(){
   grad.addColorStop(0,fillTop);
   grad.addColorStop(1,fillBot);
 
+  // Smooth bezier path helper
+  function smoothPath(pts){
+    ctx.moveTo(pts[0][0],pts[0][1]);
+    for(let i=0;i<pts.length-1;i++){
+      const x0=pts[i][0],y0=pts[i][1];
+      const x1=pts[i+1][0],y1=pts[i+1][1];
+      const cpx=(x0+x1)/2;
+      ctx.bezierCurveTo(cpx,y0,cpx,y1,x1,y1);
+    }
+  }
+  const pts=data.map((v,i)=>[toX(i),toY(v)]);
+
+  // Fill under curve
   ctx.beginPath();
-  ctx.moveTo(toX(0),H-PAD_BOT);
-  data.forEach((v,i)=>{ if(i===0) ctx.lineTo(toX(i),toY(v)); else ctx.lineTo(toX(i),toY(v)); });
-  ctx.lineTo(toX(data.length-1),H-PAD_BOT);
+  ctx.moveTo(pts[0][0],H-PAD_BOT);
+  ctx.lineTo(pts[0][0],pts[0][1]);
+  smoothPath(pts);
+  ctx.lineTo(pts[pts.length-1][0],H-PAD_BOT);
   ctx.closePath();
   ctx.fillStyle=grad;
   ctx.fill();
 
-  // Line — crisp anti-aliased
+  // Smooth line
   ctx.beginPath();
-  data.forEach((v,i)=>{ if(i===0) ctx.moveTo(toX(i),toY(v)); else ctx.lineTo(toX(i),toY(v)); });
+  smoothPath(pts);
   ctx.strokeStyle=lineColor;
-  ctx.lineWidth=1.5;
+  ctx.lineWidth=2;
   ctx.lineJoin='round';
   ctx.lineCap='round';
   ctx.stroke();
