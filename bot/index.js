@@ -1191,27 +1191,20 @@ async function syncPositions() {
     });
   }
 
-  // Update each position individually — never wipe the whole table
-  // This eliminates the delete→insert gap that caused positions to flash away
+  // Sync positions atomically:
+  // 1. Delete stale symbols (no longer open)
+  // 2. Upsert each current position via PATCH (update) or POST (insert)
+  // Using PATCH with return=representation to detect if row existed
   if (allPositions.length > 0) {
-    for (const pos of allPositions) {
-      // Try PATCH first (update existing), then POST (insert new)
-      const patched = await sbFetch(
-        tbl('tc_positions') + `?symbol=eq.${pos.symbol}`,
-        'PATCH', pos
-      );
-      // If nothing was updated (no row exists), insert it
-      const patchedEmpty = !patched || (Array.isArray(patched) && patched.length === 0);
-      if (patchedEmpty) {
-        await sbFetch(tbl('tc_positions'), 'POST', pos);
-      }
-    }
-    // Remove rows for symbols no longer open
+    // Delete any rows for symbols NOT in our current open set
     const openSyms = allPositions.map(p => p.symbol);
     await sbFetch(
       tbl('tc_positions') + `?symbol=not.in.(${openSyms.join(',')})`,
       'DELETE'
     );
+    // Wipe and reinsert — most reliable approach, avoids PATCH detection issues
+    await sbFetch(tbl('tc_positions') + '?symbol=neq.____NONE____', 'DELETE');
+    await sbFetch(tbl('tc_positions'), 'POST', allPositions);
   } else {
     await sbFetch(tbl('tc_positions') + '?symbol=neq.____NONE____', 'DELETE');
   }
