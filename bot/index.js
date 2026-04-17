@@ -4663,39 +4663,58 @@ async function syncAlpacaPositions() {
     }
 
     // ── Update live set ──
-    alpacaPositions = liveSymbols;
+    alpacaPositions = new Set(data.filter(p => p.side === 'long').map(p => p.symbol));
+    alpacaShorts    = new Set(data.filter(p => p.side === 'short').map(p => p.symbol));
 
     // ── Restore positions after restart ──
     for (const p of data) {
-      if (!positions[p.symbol]) {
-        positions[p.symbol] = {
-          entryPrice:   +p.avg_entry_price,
-          qty:          +p.qty,
-          qtyRemaining: +p.qty,
-          cost:         +p.avg_entry_price * +p.qty,
+      const sym       = p.symbol;
+      const isShort   = p.side === 'short';
+      const curPrice  = +p.current_price || +p.avg_entry_price;
+      const entryPrice = +p.avg_entry_price;
+      const qty        = Math.abs(+p.qty);
+
+      // Seed price history immediately so P&L is correct on first poll
+      priceHistory5m[sym] = [curPrice];
+
+      if (isShort && !shortPositions[sym]) {
+        shortPositions[sym] = {
+          entryPrice, qty, qtyRemaining: qty,
+          cost:         entryPrice * qty,
           entryTime:    new Date(),
-          highWater:    +p.current_price,
-          lowWater:     +p.current_price,
+          highWater:    curPrice,
+          lowWater:     curPrice,
           atrAtEntry:   0,
-          stopPrice:    +p.avg_entry_price * (1 - CONFIG.stopLossPct),
-          breakEvenSet: false,
-          tp1Hit:       false,
-          tp2Hit:       false,
+          stopPrice:    entryPrice * (1 + CONFIG.stopLossPct),
+          breakEvenSet: false, tp1Hit: false, tp2Hit: false,
           srLevels:     [],
-          sigInfo:      { confidence: 0, reasons: ['Restored from Alpaca on restart'] },
+          direction:    'short',
+          sigInfo:      { confidence: 0, reasons: ['Restored from Alpaca'] },
         };
-        // Seed price history so current_price shows correctly in dashboard immediately
-        priceHistory5m[p.symbol] = [+p.current_price];
-        log('sys', `Restored: ${p.symbol} ${p.qty}x @ $${p.avg_entry_price} cur=$${p.current_price}`);
-        await syncLog('sys', `Restored ${p.symbol} from Alpaca after restart`);
-        // Make sure it exists in Supabase positions table
-        await syncPositions();
+        log('sys', `Restored SHORT: ${sym} ${qty}x @ $${entryPrice} cur=$${curPrice}`);
+        await syncLog('sys', `Restored SHORT ${sym} from Alpaca`);
+      } else if (!isShort && !positions[sym]) {
+        positions[sym] = {
+          entryPrice, qty, qtyRemaining: qty,
+          cost:         entryPrice * qty,
+          entryTime:    new Date(),
+          highWater:    curPrice,
+          lowWater:     curPrice,
+          atrAtEntry:   0,
+          stopPrice:    entryPrice * (1 - CONFIG.stopLossPct),
+          breakEvenSet: false, tp1Hit: false, tp2Hit: false,
+          srLevels:     [],
+          direction:    'long',
+          sigInfo:      { confidence: 0, reasons: ['Restored from Alpaca'] },
+        };
+        log('sys', `Restored LONG: ${sym} ${qty}x @ $${entryPrice} cur=$${curPrice}`);
+        await syncLog('sys', `Restored ${sym} from Alpaca after restart`);
       }
     }
 
-    if (liveSymbols.size > 0) {
-      log('acct', `Alpaca positions: ${[...liveSymbols].join(', ')}`);
-    }
+    // Write all restored positions to Supabase with correct current prices
+    await syncPositions();
+    log('acct', `Alpaca positions restored: ${data.map(p=>`${p.symbol}(${p.side})`).join(', ')}`);
   } catch (e) {
     log('error', `syncAlpacaPositions: ${e.message}`);
   }
