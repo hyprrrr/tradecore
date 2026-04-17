@@ -1252,7 +1252,7 @@ function updatePositions(posData){
     const sym=pos.symbol||'?';
     const cur=+pos.current_price||0;
     const entry=+pos.entry_price||0;
-    const qty=+pos.qty||0;
+    const qty=Math.abs(+pos.qty||0);
     const cost=+pos.cost||entry*qty;
     const side=(pos.side||'LONG').toUpperCase();
     const isShortPos=side.includes('SHORT');
