@@ -1102,7 +1102,15 @@ async function poll(){
   const startCap=getStartingCapital();
 
   // Process equity — strict spike filter
-  processEquity(+p.total_value, startCap);
+  // Always seed from total_value if history is empty — never show blank chart
+  if(equityHistory.length===0 && p.total_value>0){
+    equityHistory.push(+p.total_value);
+    stableEquity=+p.total_value;
+    chartTarget=+p.total_value;
+    chartDisplayed=+p.total_value;
+  } else {
+    processEquity(+p.total_value, startCap);
+  }
   const displayEq = stableEquity || +p.total_value || startCap;
 
   // Update all displays
@@ -1242,13 +1250,17 @@ function updatePositions(posData){
 
   el.innerHTML=posData.map(pos=>{
     const sym=pos.symbol||'?';
-    const pnl=+pos.pnl||0;
-    const pnlPct=+pos.pnl_pct||0;
     const cur=+pos.current_price||0;
     const entry=+pos.entry_price||0;
     const qty=+pos.qty||0;
     const cost=+pos.cost||entry*qty;
     const side=(pos.side||'LONG').toUpperCase();
+    const isShortPos=side.includes('SHORT');
+    // Calculate P&L from prices if DB value is stale (0)
+    const rawPnl=+pos.pnl||0;
+    const calcPnl=cur>0&&entry>0 ? (isShortPos?(entry-cur)*qty:(cur-entry)*qty) : rawPnl;
+    const pnl=Math.abs(calcPnl)>Math.abs(rawPnl)?calcPnl:rawPnl;
+    const pnlPct=entry>0&&qty>0?pnl/(entry*qty)*100:(+pos.pnl_pct||0);
     const holdMins=pos.entry_time?Math.round((Date.now()-new Date(pos.entry_time))/60000):0;
     const holdStr=holdMins<60?holdMins+'m':(holdMins/60).toFixed(1)+'h';
 
@@ -1260,7 +1272,7 @@ function updatePositions(posData){
     const badgeTxt=isShort?'SHORT':isScalp?'SCALP':'LONG';
 
     // Progress bar: how much of potential TP1 (4%) has been captured
-    const progress=Math.max(0,Math.min(100,pnlPct/4*100));
+    const progress=Math.max(0,Math.min(100,pnlPct/1.5*100)); // scaled to TP1 (1.5%)
     const barColor=pnl>=0?'var(--green)':'var(--red)';
 
     return `<div class="pos-item ${colClass}">
