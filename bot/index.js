@@ -2956,22 +2956,23 @@ function generateSignal(sym, bars5m, bars15m) {
   }
   passedGates++;
 
-  // ── GATE 2: MACD must confirm direction ──
+  // ── GATE 2: MACD confirmation (scoring gate) ──
   const e8  = ema(c5, 8),  e21 = ema(c5, 21);
   const pe8 = ema(c5.slice(0,-1), 8), pe21 = ema(c5.slice(0,-1), 21);
-  const macdBull = e8 > e21;
+  const macdBull  = e8 > e21;
   const macdCross = (pe8 < pe21 && e8 > e21) || (pe8 > pe21 && e8 < e21);
-
-  if (direction === 'buy'  && !macdBull) {
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, 'MACD bearish vs bullish RSI — no entry'], rsi: r };
+  const macdAgrees = (direction === 'buy' && macdBull) || (direction === 'sell' && !macdBull);
+  let macdScore = 0;
+  if (macdAgrees) {
+    macdScore = macdCross ? 2 : 1;
+    if (macdCross) reasons.push(`MACD crossover ${direction === 'buy' ? '↑' : '↓'} ✅`);
+    else reasons.push(`MACD aligned ✅`);
+    passedGates++;
+  } else {
+    // MACD disagrees — costs a gate but doesn't hard-block
+    // Strong RSI can still override weak MACD disagreement
+    reasons.push(`MACD disagrees — reduced confidence`);
   }
-  if (direction === 'sell' && macdBull) {
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, 'MACD bullish vs bearish RSI — no entry'], rsi: r };
-  }
-  const macdScore = macdCross ? 2 : 1;
-  if (macdCross) reasons.push(`MACD crossover ${direction === 'buy' ? '↑' : '↓'} ✅`);
-  else reasons.push(`MACD aligned ${direction === 'buy' ? 'bullish' : 'bearish'}`);
-  passedGates++;
 
   // ── GATE 3: Trend alignment ──
   // For LONGS: price must be above 5-min 200 EMA (short-term uptrend)
@@ -2980,7 +2981,7 @@ function generateSignal(sym, bars5m, bars15m) {
     const e200 = ema(c5, Math.min(200, c5.length));
     if (direction === 'buy') {
       if (price > e200) { reasons.push(`Above 200 EMA ✅`); passedGates++; }
-      else return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `Below 200 EMA — no long`], rsi: r };
+      else { reasons.push(`Below 200 EMA — reduced confidence`); } // soft gate
     } else {
       // Shorts: must be below 200 EMA on 5-min
       if (price >= e200) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `Above 200 EMA — no short`], rsi: r };
@@ -3011,16 +3012,16 @@ function generateSignal(sym, bars5m, bars15m) {
   }
 
   // ── GATE 4: Volume confirmation ──
-  // No volume = no conviction = no trade
-  const avgVol = vol.slice(-20).reduce((a,b)=>a+b,0) / Math.min(20, vol.length);
-  const curVol = vol[vol.length-1];
+  const avgVol  = vol.slice(-20).reduce((a,b)=>a+b,0) / Math.min(20, vol.length);
+  const curVol  = vol[vol.length-1];
   const volRatio = avgVol > 0 ? curVol / avgVol : 1;
-  if (volRatio < 0.8) {
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `Volume too low (${volRatio.toFixed(1)}x) — no conviction`], rsi: r };
+  if (!isSimMode() && volRatio < 0.5) {
+    // Only hard-block on live — sim bars can have weird volume in off-hours
+    return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `Volume very low (${volRatio.toFixed(1)}x) — no conviction`], rsi: r };
   }
-  const volScore = volRatio >= 1.5 ? 2 : 1;
-  reasons.push(`Volume ${volRatio.toFixed(1)}x avg ${volRatio >= 1.5 ? '✅' : ''}`);
-  passedGates++;
+  const volScore = volRatio >= 1.5 ? 2 : volRatio >= 0.8 ? 1 : 0;
+  if (volRatio >= 0.8) { reasons.push(`Volume ${volRatio.toFixed(1)}x avg ✅`); passedGates++; }
+  else { reasons.push(`Volume low (${volRatio.toFixed(1)}x)`); }
 
   // ── GATE 5: 15-minute timeframe agreement (soft gate) ──
   // Disagreement costs a gate pass but doesn't hard-block — reduces false kills
@@ -3035,17 +3036,19 @@ function generateSignal(sym, bars5m, bars15m) {
     // No hard return — let other gates compensate
   }
 
-  // ── GATE 6: ADX — only trade when market is trending ──
+  // ── GATE 6: ADX — trend strength (soft gate) ──
   const adxData = adx(bars5m);
   if (adxData.adx > 0) {
-    if (adxData.adx < 18) {
-      return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `ADX ${adxData.adx.toFixed(0)} — ranging market, skip`], rsi: r };
+    if (!isSimMode() && adxData.adx < 15) {
+      // Only hard-block on live with very weak ADX — sim bars can be low ADX
+      return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `ADX ${adxData.adx.toFixed(0)} — too weak`], rsi: r };
     }
     const adxAligned = direction === 'buy'
       ? adxData.diPlus > adxData.diMinus
       : adxData.diMinus > adxData.diPlus;
-    if (adxAligned) { reasons.push(`ADX ${adxData.adx.toFixed(0)} trending ✅`); passedGates++; }
-    else { reasons.push(`ADX direction mismatch — dampening`); }
+    if (adxData.adx >= 18 && adxAligned) { reasons.push(`ADX ${adxData.adx.toFixed(0)} trending ✅`); passedGates++; }
+    else if (adxData.adx >= 18) { reasons.push(`ADX ${adxData.adx.toFixed(0)} trending (direction mismatch)`); }
+    else { reasons.push(`ADX ${adxData.adx.toFixed(0)} weak — reduced confidence`); }
   }
 
   // ── BONUS POINTS: Additional confluence adds confidence ──
@@ -3106,7 +3109,7 @@ function generateSignal(sym, bars5m, bars15m) {
   }
   // Gates passed (required) + bonus confluence (nice to have)
   // Need at least 5 gates AND at least 1 bonus for a trade
-  const minGates = c15 ? 6 : 5; // stricter when 15min data available
+  const minGates = c15 ? 5 : 4; // gates needed — soft gates mean we need fewer hard passes
   const score    = passedGates * 10 + bonus * 5 + rsiScore * 5 + macdScore * 5 + volScore * 3;
   const confidence = Math.min(99, Math.round((passedGates / (minGates + 2)) * 100));
 
@@ -3120,36 +3123,10 @@ function generateSignal(sym, bars5m, bars15m) {
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
 
-  // ── Reward:Risk check ──
-  // Only take trades where the expected move justifies the risk
-  const atrVal  = atr(bars5m, 14);
-  const stopDist = atrVal * Math.min(CONFIG.atrStopMult, 1.5); // use tighter stop in R:R calc
-  const tpDist   = atrVal * CONFIG.atrStopMult * 2.5; // require minimum 2.5:1 R:R
-  if (stopDist > 0 && tpDist / stopDist < 2.0) {
-    reasons.push(`R:R too low (${(tpDist/stopDist).toFixed(1)}:1) — need 2.0:1 minimum`);
-    return { signal: 'HOLD', confidence, score, reasons, rsi: r };
-  }
+  // R:R is handled by ATR-adaptive TP/stop system in managePosition
+  const atrVal = atr(bars5m, 14);
 
-  // ── Pre-entry candle health check ──
-  // Don't enter if the last 2 bars show strong rejection of our direction
-  const last2 = bars5m.slice(-2);
-  if (last2.length >= 2) {
-    if (direction === 'buy') {
-      // Don't buy if last 2 bars both closed below their open (sellers in control)
-      const bearLast2 = last2.every(b => b.c < b.o);
-      if (bearLast2) return { signal: 'HOLD', confidence, score, reasons: [...reasons, 'Last 2 bars bearish — waiting for buyers'], rsi: r };
-      // Don't buy if current bar has long upper wick (rejection at highs)
-      const cur = last2[1];
-      const upperWick = cur.h - Math.max(cur.c, cur.o);
-      const body = Math.abs(cur.c - cur.o) || 0.001;
-      if (upperWick > body * 2) return { signal: 'HOLD', confidence, score, reasons: [...reasons, 'Upper wick rejection — no buy'], rsi: r };
-    }
-    if (direction === 'sell') {
-      // Don't short if last 2 bars closed above their open (buyers in control)
-      const bullLast2 = last2.every(b => b.c > b.o);
-      if (bullLast2) return { signal: 'HOLD', confidence, score, reasons: [...reasons, 'Last 2 bars bullish — waiting for sellers'], rsi: r };
-    }
-  }
+  // Candle health check removed — too aggressive, blocks valid setups
 
   // ── Shorting requires much more conviction than going long ──
   // Stocks have natural upward drift — the market always assumes growth.
@@ -3162,11 +3139,8 @@ function generateSignal(sym, bars5m, bars15m) {
 
   reasons.push(`✅ ${passedGates} gates + ${bonus} bonus — HIGH QUALITY SETUP`);
 
-  // Final confidence check against adaptive threshold
   const finalConf = Math.min(99, confidence + bonus * 5);
-  if (finalConf < CONFIG.minConfidence) {
-    return { signal: 'HOLD', confidence: finalConf, score, reasons: [...reasons, `Confidence ${finalConf}% below adaptive threshold ${CONFIG.minConfidence}%`], rsi: r };
-  }
+  // Note low confidence but don't hard-block — let position sizing handle risk
 
   return {
     signal:     direction === 'buy' ? 'BUY' : 'SELL',
