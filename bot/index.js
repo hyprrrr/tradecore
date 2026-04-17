@@ -104,6 +104,7 @@ const CONFIG = {
   positionTradingEnabled: process.env.POSITION_TRADING === 'true',
   scalpMode:           process.env.SCALP_MODE === 'true',
   shortsEnabled:       process.env.ENABLE_SHORTS === 'true',
+  recoveryMode:        process.env.RECOVERY_MODE === 'true',
   minConfidence:       +(process.env.MIN_CONFIDENCE || 60), // adaptive — auto-adjusted by learning engine
   scalpSymbols:        (process.env.SCALP_SYMBOLS || 'SPY,QQQ,AAPL,TSLA,NVDA').split(',').map(s => s.trim().toUpperCase()),
   scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.4)  / 100, // take profit at +0.4%
@@ -186,6 +187,7 @@ async function loadRemoteConfig() {
     if (s.scalp_mode     !== undefined) CONFIG.scalpMode             = !!s.scalp_mode;
     if (s.shorts_enabled !== undefined) CONFIG.shortsEnabled         = !!s.shorts_enabled;
     if (s.position_trading !== undefined) CONFIG.positionTradingEnabled = !!s.position_trading;
+    if (s.recovery_mode !== undefined) CONFIG.recoveryMode          = !!s.recovery_mode;
     if (s.sim_mode !== undefined) {
       const newMode = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
       if (newMode !== CONFIG.mode) {
@@ -804,7 +806,7 @@ async function fetchDailyBars(sym, days=250) {
   try {
     const end   = new Date().toISOString().split("T")[0];
     const start = new Date(Date.now()-days*86400000).toISOString().split("T")[0];
-    const url   = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=1Day&start=${start}&end=${end}&limit=${days}&feed=iex`;
+    const url   = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=1Day&start=${start}&end=${end}&limit=${days}&feed=${getDataFeed()}`;
     const data  = await alpacaFetch(url);
     return (data?.bars||[]).map(b=>({t:b.t,o:b.o,h:b.h,l:b.l,c:b.c,v:b.v||0}));
   } catch(e){ return []; }
@@ -1239,11 +1241,138 @@ let wsConnected    = false;
 let wsSubscribed   = new Set();
 let wsReconnectMs  = 2000;
 
+// ── Polygon.io free real-time WebSocket ──────────────────────────
+// Free tier gives real-time US stock quotes + trades
+// Get a free key at polygon.io → set POLYGON_API_KEY in Railway env vars
+// This runs alongside Alpaca WS — whichever updates first wins
+let polygonWs        = null;
+let polygonConnected = false;
+
+async function connectPolygon() {
+  const key = process.env.POLYGON_API_KEY;
+  if (!key || isSimMode()) return;
+  try {
+    const { WebSocket } = await import('ws');
+    polygonWs = new WebSocket('wss://socket.polygon.io/stocks');
+    polygonWs.on('open', () => {
+      polygonWs.send(JSON.stringify({ action:'auth', params:key }));
+    });
+    polygonWs.on('message', (raw) => {
+      try {
+        const msgs = JSON.parse(raw);
+        for (const msg of (Array.isArray(msgs) ? msgs : [msgs])) {
+          if (msg.ev==='status' && msg.status==='auth_success') {
+            polygonConnected = true;
+            log('stream', '✅ Polygon.io real-time feed live');
+            subscribePolygon([...Object.keys(positions),...Object.keys(shortPositions)]);
+          }
+          // Real-time quote (bid/ask mid)
+          if (msg.ev==='Q') {
+            const sym=msg.sym, mid=((msg.bp||0)+(msg.ap||0))/2;
+            if (!sym||!mid) continue;
+            if (!priceHistory5m[sym]) priceHistory5m[sym]=[];
+            const last=priceHistory5m[sym][priceHistory5m[sym].length-1];
+            if (!last||Math.abs(mid-last)/last>0.00005) {
+              priceHistory5m[sym].push(mid);
+              if (priceHistory5m[sym].length>500) priceHistory5m[sym].shift();
+            }
+            if (liveBar[sym]) { liveBar[sym].c=mid; liveBar[sym].h=Math.max(liveBar[sym].h,mid); liveBar[sym].l=Math.min(liveBar[sym].l,mid); }
+            if (positions[sym]) { if (mid>positions[sym].highWater) positions[sym].highWater=mid; if (mid<(positions[sym].lowWater||mid)) positions[sym].lowWater=mid; }
+          }
+          // Real-time trade print
+          if (msg.ev==='T') {
+            const sym=msg.sym, price=msg.p, size=msg.s||1;
+            if (!sym||!price) continue;
+            const barTime=Math.floor((msg.t||Date.now())/300000)*300000;
+            if (!liveBar[sym]||liveBar[sym].time!==barTime) {
+              if (liveBar[sym]) injectLiveBar(sym,liveBar[sym]);
+              liveBar[sym]={time:barTime,t:new Date(barTime).toISOString(),o:price,h:price,l:price,c:price,v:size};
+            } else { liveBar[sym].c=price; liveBar[sym].h=Math.max(liveBar[sym].h,price); liveBar[sym].l=Math.min(liveBar[sym].l,price); liveBar[sym].v+=size; }
+          }
+        }
+      } catch(e){}
+    });
+    polygonWs.on('close', ()=>{ polygonConnected=false; setTimeout(connectPolygon,5000); });
+    polygonWs.on('error', ()=>{});
+  } catch(e) { log('warn',`Polygon unavailable: ${e.message}`); }
+}
+
+function subscribePolygon(syms) {
+  if (!polygonWs||!polygonConnected||!syms?.length) return;
+  polygonWs.send(JSON.stringify({ action:'subscribe', params:syms.map(s=>`Q.${s},T.${s}`).join(',') }));
+}
+
+// Real-time bar builder — one entry per symbol, the currently forming 5-min bar
+// Gets injected into the bars array on every managePosition call
+// This is what makes indicators (ATR, RSI) update at tick speed not bar-close speed
+let liveBar = {}; // sym → { time, t, o, h, l, c, v }
+
+// Inject the live (incomplete) current bar into a bars array
+// Replaces the last bar if it's in the same 5-min window, otherwise appends
+function injectLiveBar(sym, bar) {
+  if (!bar || !liveBar5m) return;
+  if (!liveBar5m[sym]) liveBar5m[sym] = [];
+  const last = liveBar5m[sym][liveBar5m[sym].length - 1];
+  if (last && last.time === bar.time) {
+    liveBar5m[sym][liveBar5m[sym].length - 1] = { ...bar };
+  } else {
+    liveBar5m[sym].push({ ...bar });
+    if (liveBar5m[sym].length > 100) liveBar5m[sym].shift();
+  }
+}
+
+// Completed live bars storage — separate from REST bars so we can merge them
+let liveBar5m = {}; // sym → completed bars from live ticks this session
+
+// Get bars with live tick data merged in — called by managePosition instead of raw REST bars
+function getLiveBars(sym, restBars) {
+  if (!restBars || restBars.length === 0) return restBars;
+
+  // Start with REST bars
+  const merged = [...restBars];
+
+  // Append any completed live bars from this session that are newer than REST data
+  const lastRestTime = restBars[restBars.length - 1]?.t || '';
+  if (liveBar5m[sym]) {
+    for (const b of liveBar5m[sym]) {
+      if (b.t > lastRestTime) merged.push(b);
+    }
+  }
+
+  // Append or replace the currently forming bar (real-time incomplete candle)
+  if (liveBar[sym]) {
+    const live = liveBar[sym];
+    const lastMerged = merged[merged.length - 1];
+    if (lastMerged && lastMerged.time === live.time) {
+      // Replace last bar with live version (it's the same candle, more up to date)
+      merged[merged.length - 1] = {
+        t: live.t, o: live.o, h: live.h, l: live.l, c: live.c, v: live.v,
+        time: live.time, live: true,
+      };
+    } else {
+      merged.push({
+        t: live.t, o: live.o, h: live.h, l: live.l, c: live.c, v: live.v,
+        time: live.time, live: true,
+      });
+    }
+  }
+
+  return merged;
+}
+
+// Feed selection:
+// - SIP = consolidated tape (all exchanges), true real-time, requires live account
+// - IEX = IEX exchange only, ~15ms delay, works on paper accounts
+// - iex is used as fallback for sim/paper. On live accounts SIP is always better.
+function getDataFeed() {
+  // Allow override via env var
+  if (process.env.DATA_FEED) return process.env.DATA_FEED.toLowerCase();
+  return CONFIG.alpacaPaper ? 'iex' : 'sip';
+}
+
 function getStreamUrl() {
-  const paper = process.env.ALPACA_PAPER !== 'false';
-  return paper
-    ? 'wss://stream.data.alpaca.markets/v2/iex'
-    : 'wss://stream.data.alpaca.markets/v2/sip';
+  const feed = getDataFeed();
+  return `wss://stream.data.alpaca.markets/v2/${feed}`;
 }
 
 async function connectPriceStream() {
@@ -1263,25 +1392,90 @@ async function connectPriceStream() {
       try {
         const msgs = JSON.parse(raw);
         for (const msg of (Array.isArray(msgs) ? msgs : [msgs])) {
+
+          // ── Auth ──
           if (msg.T === 'success' && msg.msg === 'authenticated') {
             wsConnected = true; wsReconnectMs = 2000;
-            log('stream', '\u2705 Price stream live');
+            log('stream', '✅ Price stream live');
             subscribeOpenPositions();
           }
-          if (msg.T === 't') { // trade print
-            const sym = msg.S, price = +msg.p;
+
+          // ── Real-time trade print → build live bar ──
+          if (msg.T === 't') {
+            const sym   = msg.S;
+            const price = +msg.p;
+            const size  = +msg.s || 1;
+            const ts    = msg.t ? new Date(msg.t).getTime() : Date.now();
             if (!sym || !price) continue;
+
+            // 1. Update flat price history (used for P&L display)
             if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
             priceHistory5m[sym].push(price);
-            if (priceHistory5m[sym].length > 200) priceHistory5m[sym].shift();
+            if (priceHistory5m[sym].length > 500) priceHistory5m[sym].shift();
+
+            // 2. Build live 5-min bar from ticks
+            // Bar boundary = floor to nearest 5-min interval
+            const barTime = Math.floor(ts / 300000) * 300000;
+            if (!liveBar[sym] || liveBar[sym].time !== barTime) {
+              // New bar started — push completed bar into bar history
+              if (liveBar[sym]) {
+                injectLiveBar(sym, liveBar[sym]);
+              }
+              liveBar[sym] = {
+                time: barTime,
+                t:    new Date(barTime).toISOString(),
+                o:    price, h: price, l: price, c: price,
+                v:    size,
+              };
+            } else {
+              // Update current bar
+              const b = liveBar[sym];
+              b.c = price;
+              b.h = Math.max(b.h, price);
+              b.l = Math.min(b.l, price);
+              b.v += size;
+            }
+
+            // 3. Update position water marks immediately
             if (positions[sym]) {
               if (price > positions[sym].highWater) positions[sym].highWater = price;
-              if (price < (positions[sym].lowWater||price)) positions[sym].lowWater = price;
+              if (price < (positions[sym].lowWater || price)) positions[sym].lowWater = price;
             }
-            if (shortPositions[sym] && price < (shortPositions[sym].lowWater||price)) {
-              shortPositions[sym].lowWater = price;
+            if (shortPositions[sym]) {
+              if (price < (shortPositions[sym].lowWater || price)) shortPositions[sym].lowWater = price;
+              if (price > (shortPositions[sym].highWater || price)) shortPositions[sym].highWater = price;
             }
           }
+
+          // ── Quote (bid/ask) — sub-ms price updates between trades ──
+          if (msg.T === 'q') {
+            const sym = msg.S;
+            const mid = ((+msg.bp || 0) + (+msg.ap || 0)) / 2;
+            if (!sym || !mid) continue;
+
+            // Update price history with mid price for smoothest P&L display
+            if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
+            const lastP = priceHistory5m[sym][priceHistory5m[sym].length - 1];
+            // Only update if quote moved meaningfully (avoid flooding with identical quotes)
+            if (!lastP || Math.abs(mid - lastP) / lastP > 0.00005) {
+              priceHistory5m[sym].push(mid);
+              if (priceHistory5m[sym].length > 500) priceHistory5m[sym].shift();
+            }
+
+            // Update live bar with quote mid
+            if (liveBar[sym]) {
+              liveBar[sym].c = mid;
+              liveBar[sym].h = Math.max(liveBar[sym].h, mid);
+              liveBar[sym].l = Math.min(liveBar[sym].l, mid);
+            }
+
+            // Update water marks
+            if (positions[sym]) {
+              if (mid > positions[sym].highWater) positions[sym].highWater = mid;
+              if (mid < (positions[sym].lowWater || mid)) positions[sym].lowWater = mid;
+            }
+          }
+
           if (msg.T === 'error') log('warn', `Stream: ${msg.msg}`);
         }
       } catch(e) {}
@@ -1554,7 +1748,7 @@ async function fetchBars(symbol, timeframe, limit) {
   // Try Alpaca first
   try {
     const start = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
-    const url = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${start}&limit=${limit}&feed=iex`;
+    const url = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${start}&limit=${limit}&feed=${getDataFeed()}`;
     const data = await alpacaFetch(url);
     if (data.bars && data.bars.length >= 5) return data.bars;
   } catch (e) {}
@@ -1681,7 +1875,7 @@ async function runMarketScreener() {
   if (!CONFIG.alpacaKey) return [];
   try {
     const symbolsParam = UNIVERSE.join(',');
-    const url  = `${ALPACA_DATA_BASE}/v2/stocks/snapshots?symbols=${symbolsParam}&feed=iex`;
+    const url  = `${ALPACA_DATA_BASE}/v2/stocks/snapshots?symbols=${symbolsParam}&feed=${getDataFeed()}`;
     const data = await alpacaFetch(url);
     if (!data || typeof data !== 'object') { log('screen', 'Screener: no data'); return []; }
 
@@ -1785,7 +1979,7 @@ async function loadSimBars(symbols) {
 
   const results = await Promise.allSettled(symbols.map(async sym => {
     try {
-      const url = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=5Min&start=${startStr}&end=${endStr}&limit=1000&adjustment=raw&feed=iex`;
+      const url = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=5Min&start=${startStr}&end=${endStr}&limit=1000&adjustment=raw&feed=${getDataFeed()}`;
       const data = await alpacaFetch(url);
       const bars  = (data?.bars || []).map(b => ({
         t: b.t,
@@ -1927,9 +2121,10 @@ async function runSimScan() {
     for (const sym of Object.keys(positions)) {
       const bars5m = snapshot[sym];
       if (!bars5m || bars5m.length < 5) continue;
-      const price = bars5m[bars5m.length - 1].c;
-      priceHistory5m[sym] = bars5m.map(b => b.c);
-      await managePosition(sym, price, bars5m);
+      // Merge live tick bars so indicators use real-time data not stale REST bars
+      const liveBars = getLiveBars(sym, bars5m);
+      const price = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || liveBars[liveBars.length-1].c;
+      await managePosition(sym, price, liveBars);
     }
     for (const sym of Object.keys(shortPositions)) {
       const bars5m = snapshot[sym];
@@ -3516,13 +3711,13 @@ async function exitPosition(sym, price, reason) {
   const pos = positions[sym];
   if (!pos) return;
   const qtyToSell = pos.qtyRemaining || pos.qty;
-  const forceClose = reason === 'MANUAL_DISCORD'; // Discord commands always close in memory
+  const forceClose = reason === 'MANUAL_DISCORD';
 
   if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
     try { await placeOrder(sym, qtyToSell, 'sell'); }
     catch (e) {
       log('error', `Sell order failed ${sym}: ${e.message}`);
-      if (!forceClose) return; // only abort if not a forced manual close
+      if (!forceClose) return;
       log('warn', `Force-closing ${sym} in memory despite order failure`);
     }
   }
@@ -3535,17 +3730,167 @@ async function exitPosition(sym, price, reason) {
   alpacaPositions.delete(sym);
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
-  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱', PEAK_EXIT:'🔔', INTRADAY_CLOSE:'🔔', MICRO_MOVE_EXIT:'💤' }[reason] || '📤';
+  const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱', PEAK_EXIT:'🔔', INTRADAY_CLOSE:'🔔', MICRO_MOVE_EXIT:'💤', AI_EXIT:'🤖', AI_PARTIAL:'🤖' }[reason] || '📤';
   log('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
   await sendDiscordAlert('sell', sym, qtyToSell, price, pnl, reason);
   await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
   await syncAll();
   await syncLog('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
+
+  // ── RECOVERY MODE ─────────────────────────────────────────────
+  // Triggered when a trade closes at a loss
+  // Activates a focused hunt for a recovery trade on the same symbol
+  if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
+    triggerRecovery(sym, Math.abs(pnl), price, pos);
+  }
 }
 
 // ─────────────────────────────────────────────
 // SUPPORT / RESISTANCE
 // ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// RECOVERY MODE ENGINE
+// ═══════════════════════════════════════════════════════════════════
+// Activated after any losing trade.
+// Goal: recover the exact dollar loss with a high-conviction counter-trade
+// on the same symbol. Uses tighter rules than normal — only the very best
+// setups qualify so we don't compound the loss.
+//
+// Recovery rules (stricter than normal):
+//   - Same symbol only — we know its recent behavior
+//   - Minimum confidence 80% (vs normal 60%)
+//   - Target = exactly the loss amount (not % based)
+//   - Tighter stop = 1× ATR (vs normal 2× ATR)
+//   - Max 1 recovery trade at a time
+//   - Expires after 30 minutes if no setup found
+//   - Circuit break: if recovery trade also loses, mode deactivates
+// ═══════════════════════════════════════════════════════════════════
+
+let recoveryState = null; // { sym, targetPnl, lossPrice, startTime, attempts }
+
+function isInRecovery() { return !!recoveryState && CONFIG.recoveryMode; }
+
+function triggerRecovery(sym, lossAmt, lossPrice, lostPos) {
+  if (!CONFIG.recoveryMode) return;
+  if (isInRecovery()) return; // already recovering — don't stack
+
+  recoveryState = {
+    sym,
+    targetPnl:  lossAmt,       // exact dollar amount to recover
+    lossPrice,                 // price we lost at
+    lostDir:    lostPos.direction || 'long',
+    startTime:  Date.now(),
+    attempts:   0,
+    active:     true,
+  };
+
+  log('recovery', `🔴 RECOVERY MODE: need to recover $${lossAmt.toFixed(2)} on ${sym}`);
+  syncLog('sys', `🔴 Recovery mode: ${sym} lost $${lossAmt.toFixed(2)} — hunting counter-trade`);
+
+  // Alert Discord
+  if (CONFIG.discordWebhook) {
+    getFetch().then(fetch => fetch(CONFIG.discordWebhook, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ embeds: [{ title: `🔴 Recovery Mode: ${sym}`, color: 0xff4466,
+        fields: [
+          { name: 'Loss', value: `-$${lossAmt.toFixed(2)}`, inline: true },
+          { name: 'Target', value: `+$${lossAmt.toFixed(2)}`, inline: true },
+          { name: 'Expires', value: '30 minutes', inline: true },
+        ],
+        footer: { text: 'TradeCore Recovery Engine' },
+        timestamp: new Date().toISOString(),
+      }]}),
+    }).catch(() => {}));
+  }
+}
+
+function clearRecovery(reason) {
+  if (!recoveryState) return;
+  const elapsed = ((Date.now() - recoveryState.startTime) / 60000).toFixed(1);
+  log('recovery', `✅ Recovery ended: ${reason} (${elapsed}min active)`);
+  syncLog('sys', `Recovery ended: ${reason}`);
+  recoveryState = null;
+}
+
+async function runRecoveryScan(bars5m) {
+  if (!recoveryState || !recoveryState.active) return;
+  if (!CONFIG.recoveryMode) { clearRecovery('mode disabled'); return; }
+
+  const { sym, targetPnl, startTime, attempts } = recoveryState;
+
+  // Expire after 30 minutes
+  if (Date.now() - startTime > 30 * 60 * 1000) {
+    clearRecovery('expired (30min)');
+    return;
+  }
+
+  // Don't try if already in a position on this sym
+  if (positions[sym] || shortPositions[sym]) return;
+
+  const bars = bars5m[sym] || getLiveBars(sym, bars5m[sym]);
+  if (!bars || bars.length < 30) return;
+
+  const price   = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || bars[bars.length-1].c;
+  const atrVal  = atr(bars, 14);
+  const atrPct  = atrVal / price;
+  const closes  = bars.map(b => b.c);
+  const rsiVal  = rsi(closes, 14);
+  const vwapVal = vwap(bars.slice(-20));
+
+  // Generate signal using current strategy
+  const bars15m = [];
+  for (let i = 0; i + 2 < bars.length; i += 3) {
+    const chunk = bars.slice(i, i + 3);
+    bars15m.push({ t:chunk[0].t, o:chunk[0].o, h:Math.max(...chunk.map(b=>b.h)), l:Math.min(...chunk.map(b=>b.l)), c:chunk[chunk.length-1].c, v:chunk.reduce((a,b)=>a+b.v,0) });
+  }
+  const sig = generateSignalByStrategy(sym, bars, bars15m) || generateSignal(sym, bars, bars15m);
+
+  recoveryState.attempts++;
+
+  // Recovery requires high confidence — we can't afford another loss
+  const MIN_RECOVERY_CONF = 80;
+  if (sig.signal === 'HOLD' || sig.confidence < MIN_RECOVERY_CONF) {
+    log('recovery', `⏳ Recovery scan ${attempts+1}: ${sym} sig=${sig.signal} conf=${sig.confidence}% (need ${MIN_RECOVERY_CONF}%) — waiting`);
+    return;
+  }
+
+  // Calculate qty to exactly recover the loss
+  // Recovery target = lossAmt / (atr * 2) shares, capped at normal position size
+  const atrTarget  = atrVal * 2; // expect to capture 2× ATR
+  const recoveryQty = Math.max(1, Math.min(
+    Math.ceil(targetPnl / atrTarget),          // qty needed to recover at 2×ATR
+    Math.floor(portfolio * CONFIG.maxPositionPct / price) // normal max position
+  ));
+
+  log('recovery', `🎯 RECOVERY ENTRY: ${sym} ${sig.signal} conf=${sig.confidence}% qty=${recoveryQty} target=$${targetPnl.toFixed(2)}`);
+  await syncLog('recovery', `🎯 Recovery trade: ${sym} ${sig.signal} conf=${sig.confidence}% qty=${recoveryQty}`);
+
+  // Enter with recovery-specific settings (tighter stop, exact profit target)
+  const recoveryTP = targetPnl / (recoveryQty * price); // pct needed to recover
+  if (sig.signal === 'BUY') {
+    await enterPosition(sym, price, {
+      ...sig,
+      confidence: sig.confidence,
+      recoveryMode: true,
+      recoveryTarget: recoveryTP,
+    }, bars, 'long');
+  } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled) {
+    await enterPosition(sym, price, {
+      ...sig,
+      confidence: sig.confidence,
+      recoveryMode: true,
+      recoveryTarget: recoveryTP,
+    }, bars, 'short');
+  }
+
+  // Clear recovery state — win or lose, one shot
+  clearRecovery(`recovery trade entered (${sig.signal})`);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// END RECOVERY MODE ENGINE
+// ═══════════════════════════════════════════════════════════════════
+
 function calcSRLevels(bars) {
   if (!bars || bars.length < 10) return [];
   const levels = [];
@@ -3735,6 +4080,162 @@ function minsToClose() {
   const minsLeft = (closeHour * 60 + closeMin) - (et.getHours() * 60 + et.getMinutes());
   return minsLeft;
 }
+
+// ─────────────────────────────────────────────
+// AI TRADE ADVISOR — Claude Haiku
+// ─────────────────────────────────────────────
+// Runs every 2 minutes per open position.
+// Gets the full trade picture and decides:
+//   HOLD     — keep the position, no action
+//   TIGHTEN  — move stop closer to price
+//   PARTIAL  — take partial profit now
+//   EXIT     — close immediately
+// The bot acts on the decision directly.
+// ─────────────────────────────────────────────
+
+const AI_ADVISOR_KEY   = process.env.ANTHROPIC_API_KEY || '';
+const aiAdvisorLastRun = {}; // sym → timestamp
+
+async function runAIAdvisor(sym, price, bars, pos) {
+  if (!AI_ADVISOR_KEY) return null;
+  if (isSimMode()) return null; // sim runs too fast, would burn tokens
+
+  // Only run every 2 minutes per position
+  const now = Date.now();
+  if (aiAdvisorLastRun[sym] && now - aiAdvisorLastRun[sym] < 120000) return null;
+  aiAdvisorLastRun[sym] = now;
+
+  try {
+    const fetch = await getFetch();
+
+    const closes    = bars.map(b => b.c);
+    const atrVal    = atr(bars, 14);
+    const rsiVal    = rsi(closes, 14);
+    const macdData  = (() => {
+      if (closes.length < 26) return { macd: 0, signal: 0 };
+      const ema12 = closes.slice(-12).reduce((a,b)=>a+b,0)/12;
+      const ema26 = closes.slice(-26).reduce((a,b)=>a+b,0)/26;
+      return { macd: +(ema12-ema26).toFixed(4), signal: 0 };
+    })();
+    const vwapVal   = vwap(bars.slice(-20));
+    const holdMins  = Math.round((now - new Date(pos.entryTime).getTime()) / 60000);
+    const chg       = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(3);
+    const mfe       = ((pos.highWater - pos.entryPrice) / pos.entryPrice * 100).toFixed(3);
+    const mae       = ((pos.entryPrice - pos.lowWater)  / pos.entryPrice * 100).toFixed(3);
+    const last5bars = bars.slice(-5).map(b =>
+      `  ${new Date(b.t||Date.now()).toISOString().slice(11,16)} O:${b.o?.toFixed(2)} H:${b.h?.toFixed(2)} L:${b.l?.toFixed(2)} C:${b.c?.toFixed(2)} V:${b.v||0}`
+    ).join('\n');
+
+    const prompt = `You are an expert intraday trader analyzing an open position. Make a fast, decisive call.
+
+POSITION:
+  Symbol:      ${sym}
+  Direction:   ${pos.direction || 'LONG'}
+  Entry:       $${pos.entryPrice.toFixed(2)}
+  Current:     $${price.toFixed(2)}
+  P&L:         ${chg >= 0 ? '+' : ''}${chg}%
+  Hold time:   ${holdMins} minutes
+  Stop loss:   $${pos.stopPrice.toFixed(2)}
+  TP1 hit:     ${pos.tp1Hit ? 'YES' : 'NO'}
+  TP2 hit:     ${pos.tp2Hit ? 'YES' : 'NO'}
+
+TRADE STATS:
+  MFE (best):  +${mfe}% (highest price reached)
+  MAE (worst): -${mae}% (lowest price reached)
+  ATR (14):    $${atrVal.toFixed(3)} (${(atrVal/price*100).toFixed(3)}%)
+
+INDICATORS:
+  RSI(14):     ${rsiVal.toFixed(1)}
+  MACD:        ${macdData.macd}
+  VWAP:        $${vwapVal.toFixed(2)} (price is ${price > vwapVal ? 'ABOVE' : 'BELOW'} VWAP)
+
+LAST 5 BARS (5-min):
+${last5bars}
+
+Based on this data, what is the single best action right now?
+
+Respond with ONLY a JSON object, nothing else:
+{
+  "action": "HOLD" | "TIGHTEN" | "PARTIAL" | "EXIT",
+  "reason": "one sentence max",
+  "newStopPrice": <number or null>,
+  "confidence": <0-100>
+}
+
+Rules:
+- EXIT if RSI > 75 and price pulling back from MFE, or momentum clearly dead
+- PARTIAL if up significantly and showing signs of topping
+- TIGHTEN if profitable but risky, move stop to lock more profit
+- HOLD if trade is developing normally
+- newStopPrice only needed for TIGHTEN action`;
+
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         AI_ADVISOR_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-haiku-4-5-20251001',
+        max_tokens: 150,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    const data = await resp.json();
+    const text = data?.content?.[0]?.text || '';
+
+    // Parse JSON response
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    const decision = JSON.parse(match[0]);
+
+    log('ai', `🤖 ${sym} AI → ${decision.action} (${decision.confidence}% conf): ${decision.reason}`);
+    await syncLog('ai', `🤖 AI Advisor: ${sym} → ${decision.action} | ${decision.reason}`);
+
+    return decision;
+  } catch(e) {
+    log('warn', `AI advisor error for ${sym}: ${e.message}`);
+    return null;
+  }
+}
+
+// Act on the AI decision — called from managePosition
+async function applyAIDecision(sym, price, pos, decision) {
+  if (!decision || decision.confidence < 60) return; // ignore low confidence
+
+  switch(decision.action) {
+    case 'EXIT':
+      log('ai', `🤖 AI EXIT: ${sym} @ $${price.toFixed(2)} — ${decision.reason}`);
+      await exitPosition(sym, price, 'AI_EXIT');
+      break;
+
+    case 'PARTIAL':
+      if (!pos.tp1Hit) {
+        const qty = Math.max(1, Math.floor((pos.qtyRemaining || pos.qty) * 0.5));
+        log('ai', `🤖 AI PARTIAL: selling ${qty}x ${sym} — ${decision.reason}`);
+        positions[sym].tp1Hit = true;
+        await partialExit(sym, price, qty, 'AI_PARTIAL');
+      }
+      break;
+
+    case 'TIGHTEN':
+      if (decision.newStopPrice && decision.newStopPrice > pos.stopPrice && decision.newStopPrice < price) {
+        positions[sym].stopPrice = decision.newStopPrice;
+        log('ai', `🤖 AI TIGHTEN: ${sym} stop → $${decision.newStopPrice.toFixed(2)} — ${decision.reason}`);
+      }
+      break;
+
+    case 'HOLD':
+    default:
+      break;
+  }
+}
+
+// ─────────────────────────────────────────────
+// END AI TRADE ADVISOR
+// ─────────────────────────────────────────────
 
 async function managePosition(sym, price, bars) {
   const pos = positions[sym];
@@ -3933,6 +4434,16 @@ async function managePosition(sym, price, bars) {
     }
   }
 
+  // ── AI TRADE ADVISOR ─────────────────────────────────────────
+  // Runs every 2 min per position — Claude Haiku analyzes full context
+  // and makes HOLD/TIGHTEN/PARTIAL/EXIT decision
+  if (AI_ADVISOR_KEY && !isSimMode()) {
+    const aiDecision = await runAIAdvisor(sym, price, bars, pos);
+    if (aiDecision) await applyAIDecision(sym, price, pos, aiDecision);
+    // If AI exited the position, stop processing
+    if (!positions[sym]) return;
+  }
+
   // Log status with actual effective TP values so they're visible in bot log
   const tpNext    = !pos.tp1Hit ? `TP1@+${(effectiveTP1*100).toFixed(2)}%` : !pos.tp2Hit ? `TP2@+${(effectiveTP2*100).toFixed(2)}%` : `TP3@+${(effectiveTP3*100).toFixed(2)}%`;
   const stopDist  = ((price - pos.stopPrice) / price * 100).toFixed(2);
@@ -4019,12 +4530,13 @@ async function runScan() {
       priceHistory15m[sym] = bars15m?.map(b => b.c) || [];
 
       // Manage open long position
-      // Use real-time price from syncPricesOnly (Alpaca live price), NOT bar close
-      // Bar close can be minutes old — causes false stop losses immediately after entry
+      // Use real-time price from WebSocket stream — sub-ms latency
       if (positions[sym]) {
-        const rtPrice = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+        const rtPrice  = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
         const managedPrice = rtPrice && rtPrice > 0 ? rtPrice : price;
-        await managePosition(sym, managedPrice, bars5m);
+        // Merge live tick bars so ATR/RSI use tick-accurate current candle
+        const liveBars = getLiveBars(sym, bars5m);
+        await managePosition(sym, managedPrice, liveBars);
         if (positions[sym]) {
           const pct = ((managedPrice - positions[sym].entryPrice) / positions[sym].entryPrice * 100).toFixed(2);
           log('pos', `LONG ${positions[sym].qtyRemaining||positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${managedPrice.toFixed(2)} (${pct}%) ${sessionLabel}`);
@@ -4117,6 +4629,12 @@ async function runScan() {
   const dayPnl = total - dailyStartPortfolio;
   log('info', `${session} | Total=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
   await syncLog('sys', `Scan complete | Portfolio=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
+
+  // Recovery scan — runs every scan when recovery mode is active
+  if (isInRecovery() && lastSnapshot) {
+    await runRecoveryScan(lastSnapshot);
+  }
+
   await syncAll();
 }
 
@@ -4419,7 +4937,7 @@ async function sendDailySummary() {
 async function fetchScalpBars(symbol, limit = 30) {
   try {
     const start = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // last 2 hours
-    const url   = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=1Min&start=${start}&limit=${limit}&feed=iex`;
+    const url   = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=1Min&start=${start}&limit=${limit}&feed=${getDataFeed()}`;
     const data  = await alpacaFetch(url);
     if (data.bars && data.bars.length >= 10) return data.bars;
   } catch(e) {}
@@ -4450,7 +4968,7 @@ async function fetchScalpBars(symbol, limit = 30) {
  */
 async function fetchLatestTrade(symbol) {
   try {
-    const data = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/trades/latest?feed=iex`);
+    const data = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/trades/latest?feed=${getDataFeed()}`);
     return data?.trade?.p || null;
   } catch(e) { return null; }
 }
@@ -4970,7 +5488,7 @@ async function fetchLatestPrice(symbol) {
   if (cached && Date.now() - cached.ts < 3000) return cached.price; // 3s cache
 
   try {
-    const data = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/trades/latest?feed=iex`);
+    const data = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/trades/latest?feed=${getDataFeed()}`);
     const price = data?.trade?.p;
     if (price) {
       latestPriceCache.set(symbol, { price: +price, ts: Date.now() });
@@ -4985,7 +5503,7 @@ async function fetchLatestPrice(symbol) {
 // before the order even fills. Skip these.
 async function spreadIsAcceptable(symbol, price) {
   try {
-    const data  = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/quotes/latest?feed=iex`);
+    const data  = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/quotes/latest?feed=${getDataFeed()}`);
     const quote = data?.quote;
     if (!quote?.ap || !quote?.bp) return true; // can't check — allow
     const spreadPct = (quote.ap - quote.bp) / price;
@@ -5114,7 +5632,7 @@ async function placeSmartOrder(symbol, qty, side, isScalp = false) {
   try {
     const fetch = await getFetch();
     // Get current quote
-    const qd    = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/quotes/latest?feed=iex`);
+    const qd    = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${symbol}/quotes/latest?feed=${getDataFeed()}`);
     const quote = qd?.quote;
 
     if (!quote?.ap || !quote?.bp) return placeOrder(symbol, qty, side);
@@ -5315,8 +5833,9 @@ loadRemoteConfig().then(async () => {
   await runScan();
   lastFullScan = Date.now();
 
-  // Start real-time price stream after initial scan
-  connectPriceStream();
+  // Start real-time price streams — both run simultaneously
+  connectPriceStream();   // Alpaca WebSocket (IEX paper / SIP live)
+  connectPolygon();       // Polygon.io free real-time (if POLYGON_API_KEY set)
 });
 setTimeout(syncPricesOnly, 5000);
 
