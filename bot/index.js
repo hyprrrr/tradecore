@@ -82,7 +82,7 @@ const CONFIG = {
   peakRsiExit:       80,     // RSI level for immediate exit
   fadeMinProfit:     0.020,  // 2% min profit before fade exit
   fadePullback:      0.020,  // 2% pullback from high triggers fade exit
-  hardMaxLoss:       0.030,  // 3% max loss per trade (hard ceiling)
+  hardMaxLoss:       0.015,  // 1.5% max loss per trade (hard ceiling — tightened)
   initialStopPct:    0.020,  // 2% initial stop before break-even // move SL to entry once up X%
   tp1Pct:            +(process.env.TP1_PCT           || 1.5) / 100, // sell 33% at +1.5%
   tp2Pct:            +(process.env.TP2_PCT           || 3.0) / 100, // sell 33% at +3%
@@ -1084,9 +1084,20 @@ async function syncPortfolio() {
     return a + (pos.direction === 'long' ? cur * pos.qty : 0);
   }, 0);
 
-  if (cashValue + posMarketVal > equityValue + 100) {
-    equityValue = +(cashValue + posMarketVal).toFixed(2);
+  // Step 2: Override check — ONLY use computed if Alpaca is clearly wrong (>5% off)
+  // The old ">$100" threshold caused spikes: any new position added $15k+ to posMarketVal
+  // immediately while Alpaca still showed pre-entry equity → false spike
+  const computedEquity = cashValue + posMarketVal;
+  if (computedEquity > equityValue * 1.05) {
+    // Alpaca is more than 5% below our computed — likely lag, but don't spike the chart
+    // Just log it; Alpaca will catch up in the next scan
+    log('port', `Alpaca equity lag: alpaca=$${equityValue.toFixed(2)} computed=$${computedEquity.toFixed(2)} — keeping Alpaca value`);
+  } else if (computedEquity < equityValue * 0.95) {
+    // Alpaca shows significantly more than computed — trust Alpaca
+    log('port', `Alpaca shows higher equity: alpaca=$${equityValue.toFixed(2)} computed=$${computedEquity.toFixed(2)}`);
   }
+  // Always use Alpaca's equity as the source of truth for total_value
+  // It accounts for both cash and positions correctly without double-counting
 
   // Step 3: Day P&L
   const dayPnl = lastEquity > 0
@@ -1117,6 +1128,7 @@ async function syncPortfolio() {
   }
 
   log('port', `Portfolio: equity=$${equityValue.toFixed(2)} cash=$${cashValue.toFixed(2)} dayPnl=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
+  logEquityEvent(equityValue, cashValue, 'syncPortfolio', { dayPnl, alpacaRaw: realEquity });
 }
 
 async function syncPositions() {
@@ -1648,6 +1660,29 @@ function getCurrentSession() {
 // STATE
 // ─────────────────────────────────────────────
 let portfolio           = CONFIG.startingCapital;
+
+// ── EQUITY EVENT LOG — ring buffer of last 500 equity changes with causes ──
+// Helps diagnose spikes: every time equity is written to Supabase, log what caused it
+const eqLog = [];
+function logEquityEvent(equity, cash, cause, extra = {}) {
+  const longMV  = Object.entries(positions).reduce((a,[s,p])=>a+(priceHistory5m[s]?.[priceHistory5m[s].length-1]||p.entryPrice)*(p.qtyRemaining||p.qty),0);
+  const shortPnl = Object.entries(shortPositions).reduce((a,[s,p])=>a+(p.entryPrice-(priceHistory5m[s]?.[priceHistory5m[s].length-1]||p.entryPrice))*(p.qtyRemaining||p.qty),0);
+  const scalpMV = Object.entries(scalpPositions).reduce((a,[s,p])=>a+(p.direction==='long'?(priceHistory5m[s]?.[priceHistory5m[s].length-1]||p.entryPrice)*p.qty:0),0);
+  eqLog.push({
+    ts: new Date().toISOString(),
+    equity: +equity.toFixed(2),
+    cash: +cash.toFixed(2),
+    longMV: +longMV.toFixed(2),
+    shortPnl: +shortPnl.toFixed(2),
+    scalpMV: +scalpMV.toFixed(2),
+    openPositions: Object.keys(positions).length,
+    openShorts: Object.keys(shortPositions).length,
+    openScalps: Object.keys(scalpPositions).length,
+    cause,
+    ...extra,
+  });
+  if (eqLog.length > 500) eqLog.shift();
+}
 let positions           = {};
 let priceHistory5m      = {};
 let priceHistory15m     = {};
@@ -3349,11 +3384,23 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   const cost = qty * price;
   if (qty < 1) { log('warn', `Cannot enter ${sym}: qty too small`); return; }
 
+  // Sanity check: max dollar loss at hardMaxLoss must be < 2% of portfolio
+  // If position size would create a loss > this, reduce qty
+  const maxDollarLoss = portfolio * 0.02; // never lose more than 2% of portfolio on one trade
+  const impliedLoss   = qty * price * CONFIG.hardMaxLoss;
+  if (impliedLoss > maxDollarLoss) {
+    const safeQty = Math.floor(maxDollarLoss / (price * CONFIG.hardMaxLoss));
+    if (safeQty < 1) { log('warn', `${sym}: position too risky even at 1 share — skipping`); return; }
+    log('risk', `${sym}: reducing qty ${qty}→${safeQty} (implied loss $${impliedLoss.toFixed(0)} > max $${maxDollarLoss.toFixed(0)})`);
+  }
+  const finalQty = Math.min(qty, Math.max(1, Math.floor(maxDollarLoss / (price * CONFIG.hardMaxLoss))));
+
   const atrVal    = bars && bars.length >= 14 ? atr(bars, 14) : price * CONFIG.stopLossPct;
   const srLevels  = calcSRLevels(bars || []);
 
   if (direction === 'long') {
-    if (cost > portfolio) { log('warn', `Not enough cash for ${sym}`); return; }
+    const finalCost = finalQty * price;
+    if (finalCost > portfolio) { log('warn', `Not enough cash for ${sym}`); return; }
 
     // With immediate trailing stops, we use a tighter initial stop
     // The trade only needs to go +0.3% before break-even locks in
@@ -3378,10 +3425,10 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
           }
         } catch(e) { /* 404 = no position, that's fine */ }
       }
-      try { await placeSmartOrder(sym, qty, 'buy', false); }
+      try { await placeSmartOrder(sym, finalQty, 'buy', false); }
       catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
     }
-    portfolio -= cost;
+    portfolio -= finalCost;
 
     // Use trapped buyer clusters above as TP targets — they'll panic-sell when price hits them
     // This gives us precise TP levels based on where the real supply/resistance is
@@ -3406,7 +3453,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     }
 
     positions[sym] = {
-      entryPrice: price, qty, qtyRemaining: qty, cost,
+      entryPrice: price, qty: finalQty, qtyRemaining: finalQty, cost: finalCost,
       entryTime: new Date(), highWater: price, lowWater: price,
       atrAtEntry: atrVal14, stopPrice,
       breakEvenSet: false, tp1Hit: false, tp2Hit: false,
@@ -4269,17 +4316,32 @@ async function managePosition(sym, price, bars) {
     positions[sym].entryAnalytics.mae = +mae.toFixed(3);
   }
 
-  // ── 1. Hard stop loss — 2× ATR below entry ──
-  const hardStop = pos.entryPrice - (posAtr * 2);
-  if (price <= Math.max(pos.stopPrice, hardStop) && !pos.breakEvenSet) {
-    log('risk', `🛑 ${sym} stop @ $${price.toFixed(2)} | stop=$${pos.stopPrice.toFixed(2)} hardStop=$${hardStop.toFixed(2)}`);
+  // ── 1. HARD STOP LOSS — fires unconditionally, no exceptions ──
+  // CRITICAL: this must ALWAYS run regardless of breakEvenSet, tp1Hit, etc.
+  // Never allow a position to lose more than hardMaxLoss under any circumstance.
+  const hardStop = pos.entryPrice - (posAtr * CONFIG.atrStopMult);
+
+  // Case A: Price below the hard ATR stop (initial stop before break-even)
+  if (!pos.breakEvenSet && price <= Math.max(pos.stopPrice, hardStop)) {
+    log('risk', `🛑 ${sym} ATR stop @ $${price.toFixed(2)} | initial stop=$${pos.stopPrice.toFixed(2)} hardStop=$${hardStop.toFixed(2)}`);
     return exitPosition(sym, price, 'STOP_LOSS');
   }
 
-  // Hard max loss safety net — never lose more than 3% on any trade under any circumstance
+  // Case B: Hard max loss — ALWAYS fires regardless of break-even or trailing state
+  // This is the last line of defense. If a position somehow bypasses all other stops,
+  // this guarantees we never lose more than hardMaxLoss% on any single trade.
   if (chg <= -CONFIG.hardMaxLoss) {
-    log('risk', `🛑 ${sym} hard max loss -3% triggered @ $${price.toFixed(2)}`);
+    log('risk', `🛑 ${sym} HARD MAX LOSS -${(CONFIG.hardMaxLoss*100).toFixed(1)}% triggered @ $${price.toFixed(2)} | entry=$${pos.entryPrice.toFixed(2)} | lost=${(chg*100).toFixed(2)}%`);
     return exitPosition(sym, price, 'STOP_LOSS');
+  }
+
+  // Case C: After break-even set — trailing stop below stopPrice
+  // stopPrice was moved to entry on break-even, so this protects from giving back all gains
+  if (pos.breakEvenSet && price <= pos.stopPrice) {
+    const pct = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
+    const reason = pos.stopPrice <= pos.entryPrice * 1.002 ? 'BREAK_EVEN_STOP' : 'TRAILING_STOP';
+    log('risk', `🔒 ${sym} ${reason} @ $${price.toFixed(2)} (${pct}%) stop=$${pos.stopPrice.toFixed(2)}`);
+    return exitPosition(sym, price, reason);
   }
 
   // ── 3. IMMEDIATE PROFIT LOCK + TRAILING STOP ──────────────────────
@@ -4314,13 +4376,7 @@ async function managePosition(sym, price, bars) {
     if (trail > positions[sym].stopPrice) positions[sym].stopPrice = trail;
   }
 
-  // Stop hit check
-  if (pos.breakEvenSet && price <= positions[sym].stopPrice) {
-    const pct    = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
-    const reason = price <= pos.entryPrice * 1.002 ? 'BREAK_EVEN_STOP' : 'TRAILING_STOP';
-    log('risk', `🔒 ${sym} ${reason} @ $${price.toFixed(2)} (${pct}%)`);
-    return exitPosition(sym, price, reason);
-  }
+  // Stop checks consolidated above (Case A/B/C)
 
   // Momentum fade removed -- trailing stop after TP1 handles this cleanly
 
@@ -5862,12 +5918,55 @@ loadRemoteConfig().then(async () => {
 setTimeout(syncPricesOnly, 5000);
 
 // Sync prices every 10 seconds regardless of market hours
-// This ensures P&L is always up to date even before/after market open
 setInterval(async () => {
   if (!isSimMode() && CONFIG.alpacaKey && Object.keys(positions).length + Object.keys(shortPositions).length > 0) {
     await syncPricesOnly();
   }
 }, 10000);
+
+// ── OVERNIGHT GUARDIAN — runs every 60 seconds, completely independent of scan loop ──
+// If market is closed and we still have open positions, close them immediately.
+// This is the final safety net for the "$2900 overnight loss" scenario.
+// Works even if the main scan loop is stuck, paused, or missed the 3:45 PM window.
+setInterval(async () => {
+  if (isSimMode()) return;
+  if (!isWeekday()) return;
+
+  const allOpen = Object.keys(positions).length + Object.keys(shortPositions).length + Object.keys(scalpPositions).length;
+  if (allOpen === 0) return;
+
+  // Market is closed (after 4:00 PM or before 9:30 AM ET) — no positions should be held
+  const now = new Date();
+  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const h = et.getHours(), m = et.getMinutes();
+  const minsSinceMidnight = h * 60 + m;
+
+  const marketClosed = minsSinceMidnight < 570 || minsSinceMidnight > 960; // before 9:30 AM or after 4:00 PM
+  if (!marketClosed) return;
+
+  log('risk', `🚨 OVERNIGHT GUARDIAN: market closed but ${allOpen} position(s) still open — force closing NOW`);
+  await syncLog('risk', `🚨 Overnight guardian fired: ${allOpen} positions still open after market close`);
+
+  for (const sym of [...Object.keys(positions)]) {
+    try {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || positions[sym].entryPrice;
+      await exitPosition(sym, cur, 'INTRADAY_CLOSE');
+      log('risk', `✅ Overnight close: ${sym}`);
+    } catch(e) { log('error', `Overnight close failed ${sym}: ${e.message}`); }
+  }
+  for (const sym of [...Object.keys(shortPositions)]) {
+    try {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || shortPositions[sym].entryPrice;
+      await coverShort(sym, cur, 'INTRADAY_CLOSE');
+    } catch(e) { log('error', `Overnight short close failed ${sym}: ${e.message}`); }
+  }
+  for (const sym of [...Object.keys(scalpPositions)]) {
+    try {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || scalpPositions[sym].entryPrice;
+      await exitScalp(sym, cur, 'SCALP_TIME');
+    } catch(e) { log('error', `Overnight scalp close failed ${sym}: ${e.message}`); }
+  }
+}, 60000); // check every 60 seconds
 
 // Re-subscribe to any new positions every 30 seconds
 // (catches positions opened after initial subscription)
@@ -6171,6 +6270,115 @@ http.createServer(async (req, res) => {
     log('risk', '🟢 Circuit breaker reset via /reset-cb');
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, message: 'Circuit breaker reset' }));
+    return;
+  }
+
+  // ── GET /diagnostic — full state dump for debugging equity spikes ──
+  if (req.method === 'GET' && url === '/diagnostic') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+
+    // Snapshot every position with full detail
+    const posSnapshot = Object.entries(positions).map(([sym, pos]) => {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      return {
+        sym, direction: 'LONG',
+        entryPrice: pos.entryPrice, currentPrice: cur,
+        qty: pos.qtyRemaining || pos.qty,
+        mktValue: cur * (pos.qtyRemaining || pos.qty),
+        pnl: (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty),
+        cost: pos.cost, entryTime: pos.entryTime,
+        stopPrice: pos.stopPrice, tpPrice: pos.tpPrice,
+        tp1Hit: pos.tp1Hit, tp2Hit: pos.tp2Hit,
+        highWater: pos.highWater,
+        ageMin: Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 60000),
+      };
+    });
+    const shortSnapshot = Object.entries(shortPositions).map(([sym, pos]) => {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      return {
+        sym, direction: 'SHORT',
+        entryPrice: pos.entryPrice, currentPrice: cur,
+        qty: pos.qtyRemaining || pos.qty,
+        pnl: (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty),
+        entryTime: pos.entryTime,
+      };
+    });
+    const scalpSnapshot = Object.entries(scalpPositions).map(([sym, pos]) => {
+      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      return {
+        sym, direction: pos.direction,
+        entryPrice: pos.entryPrice, currentPrice: cur,
+        qty: pos.qty, stopPrice: pos.stopPrice, tpPrice: pos.tpPrice,
+        pnl: pos.direction === 'long' ? (cur - pos.entryPrice) * pos.qty : (pos.entryPrice - cur) * pos.qty,
+        ageMin: Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 60000),
+      };
+    });
+
+    const longMktVal = posSnapshot.reduce((a, p) => a + p.mktValue, 0);
+    const shortPnl   = shortSnapshot.reduce((a, p) => a + p.pnl, 0);
+    const scalpMktVal = scalpSnapshot.filter(p => p.direction === 'long').reduce((a, p) => a + p.currentPrice * p.qty, 0);
+    const computedEquity = portfolio + longMktVal + shortPnl + scalpMktVal;
+
+    res.end(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      mode: CONFIG.mode,
+      session: getCurrentSession(),
+      market_open: isMarketOpen(),
+
+      // ── Equity breakdown ──
+      equity: {
+        portfolio_cash: +portfolio.toFixed(2),
+        real_equity_alpaca: +realEquity.toFixed(2),
+        long_market_value: +longMktVal.toFixed(2),
+        short_pnl: +shortPnl.toFixed(2),
+        scalp_market_value: +scalpMktVal.toFixed(2),
+        computed_total: +computedEquity.toFixed(2),
+        daily_start: +realDailyStartEquity.toFixed(2),
+        day_pnl: +(computedEquity - realDailyStartEquity).toFixed(2),
+        starting_capital: CONFIG.startingCapital,
+      },
+
+      // ── Position details ──
+      positions: posSnapshot,
+      short_positions: shortSnapshot,
+      scalp_positions: scalpSnapshot,
+
+      // ── Price cache ──
+      price_cache: Object.fromEntries(
+        Object.keys({ ...positions, ...shortPositions, ...scalpPositions })
+          .map(sym => [sym, priceHistory5m[sym]?.slice(-5) || []])
+      ),
+
+      // ── Stats ──
+      stats: {
+        total_wins: totalWins, total_losses: totalLosses,
+        scalp_wins: scalpWins, scalp_losses: scalpLosses,
+        circuit_breaker: circuitBreakerOn,
+        recovery_active: !!recoveryState,
+      },
+
+      // ── Recent trades (last 20) ──
+      recent_trades: trades.slice(-20).map(t => ({
+        time: t.time, sym: t.sym, side: t.side,
+        qty: t.qty, price: t.price, pnl: t.pnl, reason: t.reason,
+      })),
+
+      // ── Equity event log — every equity write with breakdown ──
+      // This is the key diagnostic tool: shows exactly what caused each equity change
+      equity_log: eqLog.slice(-200),
+
+      // ── Config snapshot ──
+      config: {
+        symbols: CONFIG.symbols,
+        strategy: CONFIG.strategy,
+        maxOpenPositions: CONFIG.maxOpenPositions,
+        maxPositionPct: CONFIG.maxPositionPct,
+        tp1Pct: CONFIG.tp1Pct, tp2Pct: CONFIG.tp2Pct, tp3Pct: CONFIG.tp3Pct,
+        atrStopMult: CONFIG.atrStopMult,
+        scalpMode: CONFIG.scalpMode, shortsEnabled: CONFIG.shortsEnabled,
+        recoveryMode: CONFIG.recoveryMode, startingCapital: CONFIG.startingCapital,
+      },
+    }, null, 2));
     return;
   }
 
