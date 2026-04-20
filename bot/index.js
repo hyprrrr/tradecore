@@ -156,7 +156,14 @@ async function loadRemoteConfig() {
     if (s.trailing_stop_pct) CONFIG.trailingStopPct = +s.trailing_stop_pct / 100;
     if (s.max_daily_loss)   CONFIG.maxDailyLossPct  = +s.max_daily_loss / 100;
     if (s.max_positions)    CONFIG.maxOpenPositions = +s.max_positions;
-    if (s.max_position_pct) CONFIG.maxPositionPct   = +s.max_position_pct / 100;
+    if (s.max_position_pct) {
+      const raw = +s.max_position_pct;
+      // If value > 1 it's a percentage (e.g. 15 means 15%) — divide by 100
+      // If value <= 1 it's already a decimal (e.g. 0.15) — use as-is
+      CONFIG.maxPositionPct = raw > 1 ? raw / 100 : raw;
+      // Safety clamp: never less than 5% or more than 30% per position
+      CONFIG.maxPositionPct = Math.max(0.05, Math.min(0.30, CONFIG.maxPositionPct));
+    }
     if (s.tp1_pct)          CONFIG.tp1Pct           = +s.tp1_pct / 100;
     if (s.tp2_pct)          CONFIG.tp2Pct           = +s.tp2_pct / 100;
     if (s.tp3_pct)          CONFIG.tp3Pct           = +s.tp3_pct / 100;
@@ -175,7 +182,7 @@ async function loadRemoteConfig() {
     if (s.fade_pullback)    CONFIG.fadePullback      = +s.fade_pullback / 100;
     if (s.hard_max_loss)    CONFIG.hardMaxLoss       = +s.hard_max_loss / 100;
     if (s.initial_stop_pct) CONFIG.initialStopPct    = +s.initial_stop_pct / 100;
-    if (s.atr_stop_mult)    CONFIG.atrStopMult       = +s.atr_stop_mult;
+    if (s.atr_stop_mult)    CONFIG.atrStopMult       = Math.min(2.5, Math.max(1.5, +s.atr_stop_mult)); // clamp 1.5-2.5x
     if (s.discord_webhook)  CONFIG.discordWebhook   = s.discord_webhook;
     if (s.trend_filter      !== undefined) CONFIG.trendFilter       = !!s.trend_filter;
     if (s.volume_filter     !== undefined) CONFIG.volumeFilter      = !!s.volume_filter;
@@ -319,7 +326,7 @@ async function loadRemoteConfig() {
     const modes = [];
     if (CONFIG.swingEnabled !== false) modes.push('Swing');
     if (CONFIG.scalpMode)              modes.push('Scalp⚡');
-    log('sys', `Remote config loaded — Modes: ${modes.join('+')||'none'} | Symbols: ${CONFIG.symbols.length} | RSI: ${CONFIG.rsiOversold}/${CONFIG.rsiOverbought}`);
+    // Config loaded silently — only logged when changes detected (see poll interval above)
   } catch(e) {
     log('warn', `Could not load remote config: ${e.message} — using defaults`);
   }
@@ -370,7 +377,7 @@ const ADAPT_BOUNDS = {
   rsiOversold:    { min: 18, max: 45 },
   rsiOverbought:  { min: 55, max: 82 },
   minConfidence:  { min: 45, max: 90 },
-  atrStopMult:    { min: 1.2, max: 3.5 },
+  atrStopMult:    { min: 1.5, max: 2.5 }, // hard cap — 3.5x caused $2900 loss
   maxPositionPct: { min: 0.03, max: 0.25 },
   tp1Pct:         { min: 0.010, max: 0.030 },
   tp2Pct:         { min: 0.025, max: 0.060 },
@@ -495,6 +502,12 @@ async function runAdaptiveTuning() {
     // 2. Tighten RSI to only deepest extremes
     const newRSI = Math.max(ADAPT_BOUNDS.rsiOversold.min, CONFIG.rsiOversold - _step(CONFIG.rsiOversold, 25, 1.5));
     if (Math.abs(newRSI - CONFIG.rsiOversold) > 0.5) { CONFIG.rsiOversold = Math.round(newRSI); changes.rsiOversold = CONFIG.rsiOversold; reasons.push('Emergency: tighten RSI oversold'); }
+    // Emergency: disable shorts when WR is critically low — don't fight the trend both ways
+    if (CONFIG.shortsEnabled) {
+      CONFIG.shortsEnabled = false;
+      changes.shortsEnabled = false;
+      reasons.push('Emergency: shorts disabled — WR too low to trade both directions');
+    }
 
     // 3. Cut position size immediately
     const newPct = Math.max(ADAPT_BOUNDS.maxPositionPct.min, CONFIG.maxPositionPct * 0.6);
@@ -5829,17 +5842,21 @@ setInterval(async () => {
 let lastConfigCheck = 0;
 setInterval(async () => {
   const now = Date.now();
-  if (now - lastConfigCheck < 2800) return;
+  if (now - lastConfigCheck < 28000) return; // poll every 30s not every 3s
   lastConfigCheck = now;
   try {
-    const prev = CONFIG.mode;
+    const prevMode = CONFIG.mode;
+    const prevSyms = CONFIG.symbols.join(',');
+    const prevRsi  = CONFIG.rsiOversold;
     await loadRemoteConfig();
-    if (CONFIG.mode !== prev) {
-      log('sys', `Mode changed: ${prev} → ${CONFIG.mode}`);
-      lastFullScan = 0;
+    // Only log if something actually changed
+    const changed = CONFIG.mode !== prevMode || CONFIG.symbols.join(',') !== prevSyms || CONFIG.rsiOversold !== prevRsi;
+    if (changed) {
+      log('sys', `Config updated — Modes: ${CONFIG.mode} | Symbols: ${CONFIG.symbols.length} | RSI: ${CONFIG.rsiOversold}`);
+      if (CONFIG.mode !== prevMode) lastFullScan = 0;
     }
   } catch(e) {}
-}, 3000);
+}, 5000);
 
 // Dedicated scalp exit monitor — runs every 2 seconds independently
 // Much faster than the main tick so TP/SL exits happen near-instantly
