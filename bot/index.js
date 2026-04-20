@@ -1051,8 +1051,10 @@ async function syncPortfolio() {
   }
 
   // ── LIVE / PAPER MODE ──
-  // Step 1: Try to get real values from Alpaca
-  let cashValue   = realEquity > 0 ? realEquity : CONFIG.startingCapital; // safe fallback
+  // RULE: Never use in-memory `portfolio` variable for cash in live mode.
+  // It's unreliable because we stopped modifying it on trades.
+  // Always use Alpaca's account API. realEquity is our last known good value.
+  let cashValue   = realEquity > 0 ? realEquity : CONFIG.startingCapital;
   let equityValue = realEquity > 0 ? realEquity : CONFIG.startingCapital;
   let lastEquity  = realDailyStartEquity || 0;
 
@@ -1715,9 +1717,19 @@ const SCALP_SCAN_INTERVAL_MS = 5000; // scalp scans every 5 seconds
 // ─────────────────────────────────────────────
 // LOGGING
 // ─────────────────────────────────────────────
-function log(type, msg) {
-  const ts = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-  console.log(`[${ts} ET] [${type.toUpperCase().padEnd(6)}] ${msg}`);
+// ─────────────────────────────────────────────
+// COMPREHENSIVE LOGGER — captures everything
+// Ring buffer of last 2000 entries, exportable via /diagnostic
+// ─────────────────────────────────────────────
+const masterLog = [];  // [{ts, type, msg, data}]
+const MAX_LOG = 2000;
+
+function log(type, msg, data = null) {
+  const ts = new Date().toISOString();
+  const etTs = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  console.log(`[${etTs} ET] [${type.toUpperCase().padEnd(8)}] ${msg}`);
+  masterLog.push({ ts, type, msg, ...(data ? { data } : {}) });
+  if (masterLog.length > MAX_LOG) masterLog.shift();
 }
 
 // ─────────────────────────────────────────────
@@ -6314,9 +6326,12 @@ http.createServer(async (req, res) => {
         qty: t.qty, price: t.price, pnl: t.pnl, reason: t.reason,
       })),
 
-      // ── Equity event log — every equity write with breakdown ──
-      // This is the key diagnostic tool: shows exactly what caused each equity change
+      // ── Equity event log ──
       equity_log: eqLog.slice(-200),
+
+      // ── MASTER LOG — every single log line, last 2000 entries ──
+      // This is the complete diagnostic trail — submit this when reporting issues
+      master_log: masterLog,
 
       // ── Config snapshot ──
       config: {
