@@ -829,6 +829,7 @@ tbody tr:hover td { background: rgba(255,255,255,0.02); }
       <div class="status-dot"></div> LIVE
     </div>
     <button class="btn" onclick="exportDiagnostic()" title="Download diagnostic log">📥 Export Log</button>
+    <button class="btn" onclick="clearStalePositions()" title="Force-clear position display" style="color:#ff4757;border-color:rgba(255,71,87,0.3)">🗑 Clear Positions</button>
     <button class="btn" onclick="openModal()">Connect DB</button>
   </div>
 </div>
@@ -1386,13 +1387,18 @@ async function poll(){
   // Use total_value from bot directly — it's the authoritative source written every scan
   // Computed equity causes spikes when positions open/close mid-poll
   const raw = dbT > 0 ? dbT : cap;
-  if(eqHist.length===0&&raw>0){
+  // Always accept the value if eqHist is empty OR if it's reasonable
+  // Never show blank chart — seed immediately from whatever we have
+  if(eqHist.length===0 && raw>0) {
     eqHist.push(raw); stableEq=raw; chartTgt=raw; chartDsp=raw;
-    // Also reset chart display so it doesn't interpolate from 0
-    if(chartCtx) { const cv=$('equityChart'); if(cv) { cv.width=cv.offsetWidth; cv.height=cv.offsetHeight; } }
+  } else if(raw>0) {
+    procEq(raw, cap);
   }
-  else procEq(raw,cap);
-  const eq=stableEq||raw||cap;
+  // If still empty after procEq rejected it, force seed anyway
+  if(eqHist.length===0 && raw>0) {
+    eqHist.push(raw); stableEq=raw; chartTgt=raw; chartDsp=raw;
+  }
+  const eq = stableEq || raw || cap;
   const diff=eq-cap, dayPnl=+p.day_pnl||0;
   const tw=+p.total_wins||0, tl=+p.total_losses||0;
   const wr=tw+tl>0?Math.round(tw/(tw+tl)*100):0;
@@ -1487,6 +1493,8 @@ async function poll(){
 // ═══════════════════════════════════════
 function renderPositions(posData){
   const el=$('posList'), badge=$('posCountBadge');
+  // Filter out ghost rows — must have a real symbol and entry price
+  posData = posData.filter(p => p.symbol && +p.entry_price > 0);
   if(badge) badge.textContent=posData.length;
   if(!el) return;
   if(!posData.length){ el.innerHTML='<div class="pos-empty">No open positions</div>'; return; }
@@ -1712,6 +1720,32 @@ let toastTimer;
 function showToast(msg,type=''){
   const t=$('toast'); t.textContent=msg; t.className=`toast show${type?' '+type:''}`;
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.className='toast',2800);
+}
+
+// ═══════════════════════════════════════
+// CLEAR STALE POSITIONS
+// ═══════════════════════════════════════
+async function clearStalePositions() {
+  if (!confirm('This will clear the position display in the dashboard. The bot will repopulate on next scan. Continue?')) return;
+  const u=getSbUrl(), k=getSbKey();
+  if (!u||!k) { showToast('Not connected','error'); return; }
+
+  // Delete all rows from both position tables
+  const headers = {
+    'apikey': k, 'Authorization': `Bearer ${k}`,
+    'Content-Type': 'application/json', 'Prefer': 'return=minimal'
+  };
+  await Promise.all([
+    fetch(`${u}/rest/v1/tc_positions?symbol=neq.____NONE____`, { method:'DELETE', headers }),
+    fetch(`${u}/rest/v1/sim_tc_positions?symbol=neq.____NONE____`, { method:'DELETE', headers }),
+  ]);
+
+  // Reset local state
+  lastKnownPositions = [];
+  emptyPosCount = 0;
+  lastPosHash = '';
+  renderPositions([]);
+  showToast('Positions cleared — bot will repopulate shortly', 'success');
 }
 
 // ═══════════════════════════════════════
