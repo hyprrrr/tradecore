@@ -1154,8 +1154,12 @@ function fmtSign(v){ return (v>=0?'+':'-')+'$'+Math.abs(+v).toLocaleString('en-U
 function cc(v){ return +v>0?'up':+v<0?'dn':'neu'; }
 function rng(el,id,sfx){ $(id).textContent=(+el.value).toFixed(el.step&&+el.step<1?1:0)+sfx; }
 function tgMode(id){ const cb=$(id); cb.checked=!cb.checked; cb.dispatchEvent(new Event('change')); }
+const _valCache={};
 function setVal(id,txt,cls){
   const e=$(id); if(!e)return;
+  const key=id+'|'+txt+'|'+(cls||'');
+  if(_valCache[id]===key) return; // skip if nothing changed
+  _valCache[id]=key;
   e.textContent=txt;
   if(cls!==undefined) e.className=e.className.replace(/\bup\b|\bdn\b|\bneu\b|\byl\b/g,'').trim()+' '+cls;
 }
@@ -1358,7 +1362,7 @@ function renderChart(){
 // ═══════════════════════════════════════
 // POLL
 // ═══════════════════════════════════════
-let pollN=0, lastTradeN=0, lastLogTs='';
+let pollN=0, lastTradeN=0, lastLogTs='', _posRenderCache='';
 // lastKnownPositions removed — bot handles immediate DB cleanup on close
 
 async function poll(){
@@ -1467,18 +1471,26 @@ async function poll(){
   // Sync time
   if($('syncInfo')) $('syncInfo').textContent='Updated '+new Date().toLocaleTimeString();
 
-  // Trust the DB directly — bot now deletes rows immediately on close
-  // so we don't need flash prevention which caused ghost positions
-  // Always re-render positions — prevents stale display from hash caching
-  renderPositions(posData);
+  // Render positions only when data actually changes (prevents flicker)
+  const posHash=JSON.stringify(posData.map(x=>x.symbol+'|'+(+x.pnl||0).toFixed(2)+'|'+(+x.current_price||0).toFixed(2)+'|'+x.qty+'|'+x.side));
+  if(posHash!==_posRenderCache){ _posRenderCache=posHash; renderPositions(posData); }
   if($('posCountBadge')) $('posCountBadge').textContent=posData.length;
   if($('scPositions')) $('scPositions').textContent=posData.length;
 
-  // Trades
-  if(trades!==null&&trades.length!==lastTradeN){ lastTradeN=trades.length; renderTrades(trades); if($('tradesBadge')) $('tradesBadge').textContent=trades.length; if($('feedCount')) $('feedCount').textContent=trades.length; }
+  // Trades — only re-render when count changes
+  if(trades!==null && trades.length!==lastTradeN){
+    lastTradeN=trades.length;
+    renderTrades(trades);
+    if($('tradesBadge')) $('tradesBadge').textContent=trades.length;
+    if($('feedCount')) $('feedCount').textContent=trades.length;
+  }
 
-  // Logs
-  if(logs!==null){ const lt=logs[0]?.created_at||''; if(lt!==lastLogTs){ lastLogTs=lt; renderLogs(logs); } }
+  // Logs — only re-render if new entries arrived (prevents constant DOM reflow)
+  if(logs!==null){
+    const lt=logs[0]?.created_at||'';
+    const lcount=logs.length;
+    if(lt!==lastLogTs || lcount!==lastTradeN){ lastLogTs=lt; renderLogs(logs); }
+  }
 
   // Screener
   renderScreener(p);
@@ -1747,44 +1759,56 @@ async function clearStalePositions() {
 // DIAGNOSTIC EXPORT
 // ═══════════════════════════════════════
 async function exportDiagnostic() {
-  showToast('Fetching diagnostic...', '');
+  showToast('Fetching full log...', '');
 
-  // First get the bot diagnostic from Railway
-  const botUrl = localStorage.getItem('tc_bot_url') || prompt('Bot URL (e.g. https://tradecore.up.railway.app)', localStorage.getItem('tc_bot_url') || '');
-  if (!botUrl) return;
-  localStorage.setItem('tc_bot_url', botUrl.replace(/\/$/, ''));
+  // Try to get bot diagnostic (optional - works without it)
+  const savedBotUrl = localStorage.getItem('tc_bot_url');
+  const botUrl = savedBotUrl || prompt('Bot Railway URL (optional, press Cancel to skip)', 'https://tradecore.up.railway.app');
+  if (botUrl) localStorage.setItem('tc_bot_url', botUrl.replace(/\/$/, ''));
 
-  let botData = null;
-  try {
-    const r = await fetch(botUrl.replace(/\/$/, '') + '/diagnostic');
-    if (r.ok) botData = await r.json();
-    else botData = { error: `HTTP ${r.status}` };
-  } catch(e) {
-    botData = { error: e.message };
+  let botData = { note: 'Bot URL not provided or unreachable' };
+  if (botUrl) {
+    try {
+      const r = await fetch(botUrl.replace(/\/$/, '') + '/diagnostic', { signal: AbortSignal.timeout(8000) });
+      if (r.ok) botData = await r.json();
+      else botData = { error: `HTTP ${r.status} — check CORS settings` };
+    } catch(e) {
+      botData = { error: e.message, note: 'Bot unreachable — Supabase data still exported below' };
+    }
   }
 
-  // Also get Supabase positions + portfolio for comparison
-  const [port, positions, trades, logs] = await Promise.all([
+  showToast('Fetching Supabase data...', '');
+
+  // Fetch ALL data from Supabase — no limits on trades/logs
+  const simOn = $('simEnabled')?.checked;
+  const [port, posLive, posSim, trades, simTrades, logs, simLogs] = await Promise.all([
     sbGet('tc_portfolio', '?id=eq.1'),
     sbGet('tc_positions', '?order=updated_at.desc'),
-    sbGet('tc_trades', '?order=created_at.desc&limit=100'),
-    sbGet('tc_logs', '?order=created_at.desc&limit=200'),
+    sbGet('sim_tc_positions', '?order=updated_at.desc'),
+    sbGet('tc_trades', '?order=created_at.desc&limit=1000'),
+    sbGet('sim_tc_trades', '?order=created_at.desc&limit=1000'),
+    sbGet('tc_logs', '?order=created_at.desc&limit=1000'),
+    sbGet('sim_tc_logs', '?order=created_at.desc&limit=1000'),
   ]);
+  const positions = simOn ? posSim : posLive;
 
   const report = {
     generated_at: new Date().toISOString(),
     dashboard_url: window.location.href,
-    sim_mode: $('simEnabled')?.checked,
+    sim_mode: simOn,
+    account_value: port?.[0]?.total_value,
+    day_pnl: port?.[0]?.day_pnl,
 
-    // Bot real-time state
+    // Bot real-time state + master log
     bot_diagnostic: botData,
 
-    // Supabase state (what dashboard reads)
+    // Supabase — complete data
     supabase: {
       portfolio: port?.[0] || null,
-      positions: positions || [],
-      recent_trades: trades || [],
-      recent_logs: (logs || []).slice(0, 100),
+      positions_live: posLive || [],
+      positions_sim: posSim || [],
+      all_trades: (simOn ? simTrades : trades) || [],
+      all_logs: (simOn ? simLogs : logs) || [],
     },
 
     // Dashboard state
@@ -1792,10 +1816,9 @@ async function exportDiagnostic() {
       equity_history_length: eqHist.length,
       equity_history_last10: eqHist.slice(-10),
       stable_equity: stableEq,
-      last_pos_hash: lastPosHash,
-      last_known_positions_count: lastKnownPositions.length,
-      empty_pos_count: emptyPosCount,
       poll_count: pollN,
+      sim_mode: $('simEnabled')?.checked,
+      last_log_ts: lastLogTs,
     },
   };
 
