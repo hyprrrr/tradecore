@@ -1368,7 +1368,7 @@ async function poll(){
   const [port,rawPositions,trades,logs]=await Promise.all([
     sbGet(dtbl('tc_portfolio'),'?id=eq.1'),
     sbGet(dtbl('tc_positions'),'?order=updated_at.desc'),
-    fetchTrades?sbGet(dtbl('tc_trades'),'?order=created_at.desc&limit=200'):Promise.resolve(null),
+    fetchTrades?sbGet(dtbl('tc_trades'),'?order=created_at.desc&limit=500'):Promise.resolve(null),
     sbGet(dtbl('tc_logs'),'?order=created_at.desc&limit=100'),
   ]);
   // If sim mode active but main table empty, try sim table (handles race on page load)
@@ -1407,7 +1407,13 @@ async function poll(){
   setVal('kpiPortfolio', fmt$(eq), cc(diff));
   setVal('kpiDayPnl', fmtSign(dayPnl), cc(dayPnl));
   if($('kpiDayPct')) $('kpiDayPct').textContent=(dayPnl>=0?'+':'')+(cap>0?(dayPnl/cap*100).toFixed(2):'0.00')+'%';
-  const realPnl=trades?.filter(t=>['SELL','COVER','SCALP_EXIT'].includes(t.side)&&t.pnl!=null).reduce((a,t)=>a+(+t.pnl||0),0)||0;
+  // Realized P&L = today's closed trades only
+  const todayStr = new Date().toDateString();
+  const realPnl=trades?.filter(t=>
+    ['SELL','COVER','SCALP_EXIT'].includes(t.side) &&
+    t.pnl!=null &&
+    new Date(t.created_at||t.time).toDateString()===todayStr
+  ).reduce((a,t)=>a+(+t.pnl||0),0)||0;
   const unrealPnl=posData.reduce((a,x)=>{
     const entry=+x.entry_price||0,cur=+x.current_price||0,qty=Math.abs(+x.qty||0);
     const sh=x.side?.includes('SHORT');
