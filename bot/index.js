@@ -3498,16 +3498,8 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     await sendDiscordAlert('buy', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal: atrVal14 });
     await syncTrade({ sym, side: 'BUY', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
 
-    // Write correct total_value immediately after entry
-    // Use realEquity if available (Alpaca's ground truth), otherwise estimate
-    // NEVER use cash + position value — that double-counts when cash hasn't settled
-    const correctEquity = realEquity > 0 ? realEquity : (portfolio + price * qty);
-    await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
-      cash:        +portfolio.toFixed(2),
-      total_value: +correctEquity.toFixed(2),
-      updated_at:  new Date().toISOString(),
-    });
-    if (!isSimMode()) syncPortfolio().catch(()=>{}); // background refresh from Alpaca
+    // Refresh portfolio from Alpaca in background — don't write stale in-memory cash
+    if (!isSimMode()) syncPortfolio().catch(()=>{});
 
   } else {
     // SHORT — borrow shares to sell, profit if price falls
@@ -3538,16 +3530,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     log('short', `🔴 SHORT ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (+${stopPct}%) | conf=${sigInfo.confidence}%`);
     await sendDiscordAlert('short', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal });
     await syncTrade({ sym, side: 'SHORT', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
-    // Write correct total_value immediately after short entry too
-    const allPosValS = Object.entries(positions).reduce((a, [s, pos]) => {
-      const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
-      return a + cur * (pos.qtyRemaining || pos.qty);
-    }, 0);
-    await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
-      cash:        +portfolio.toFixed(2),
-      total_value: +(portfolio + allPosValS).toFixed(2),
-      updated_at:  new Date().toISOString(),
-    });
+    // syncAll below handles portfolio refresh from Alpaca
   }
 
   await syncAll();
@@ -4813,74 +4796,6 @@ async function storePrevClose() {
       const bars = await fetchBars(sym, '1Day', 2);
       if (bars?.length >= 1) prevDayClose[sym] = bars[bars.length - 1].c;
     } catch (e) {}
-  }
-}
-
-async function syncPricesOnly() {
-  // In sim mode — update prices from bar cache
-  if (isSimMode()) {
-    for (const [sym, pos] of Object.entries(positions)) {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
-      if (!cur) continue;
-      if (cur > pos.highWater) positions[sym].highWater = cur;
-    }
-    await syncPositions();
-    return;
-  }
-
-  if (!CONFIG.alpacaKey) return;
-
-  try {
-    // Fetch account AND positions in parallel for maximum speed
-    const [alpacaPos, acct] = await Promise.all([
-      alpacaFetch(`${ALPACA_BASE()}/v2/positions`),
-      getAccount(),
-    ]);
-
-    // Update price history from live Alpaca positions
-    if (Array.isArray(alpacaPos)) {
-      for (const ap of alpacaPos) {
-        const sym = ap.symbol;
-        const cur = +ap.current_price;
-        if (!cur || cur <= 0) continue;
-
-        if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
-        priceHistory5m[sym].push(cur);
-        if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
-
-        if (positions[sym]     && cur > positions[sym].highWater)     positions[sym].highWater     = cur;
-        if (shortPositions[sym] && cur < shortPositions[sym].lowWater) shortPositions[sym].lowWater = cur;
-      }
-    }
-
-    // Sync all position data (prices + P&L) to Supabase
-    await syncPositions();
-
-    // Update portfolio with REAL Alpaca values every price sync
-    if (acct) {
-      const cash       = acct.cash       ? +parseFloat(acct.cash).toFixed(2)       : null;
-      const equity     = acct.equity     ? +parseFloat(acct.equity).toFixed(2)     : null;
-      const lastEquity = acct.last_equity? +parseFloat(acct.last_equity).toFixed(2): null;
-
-      if (equity && equity > 0) {
-        realEquity = equity;
-        if (!realDailyStartEquity && lastEquity > 0) {
-          realDailyStartEquity = lastEquity;
-        }
-
-        const dayPnl = lastEquity > 0 ? +(equity - lastEquity).toFixed(2) : 0;
-
-        // Only write total_value and day_pnl — not equity snapshot (that's in syncPortfolio)
-        await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
-          cash:        cash ? +cash.toFixed(2) : undefined,
-          total_value: +equity.toFixed(2),
-          day_pnl:     +dayPnl.toFixed(2),
-          updated_at:  new Date().toISOString(),
-        });
-      }
-    }
-  } catch (e) {
-    log('error', `syncPricesOnly: ${e.message}`);
   }
 }
 
