@@ -828,6 +828,7 @@ tbody tr:hover td { background: rgba(255,255,255,0.02); }
     <div class="status-pill" id="statusBadge">
       <div class="status-dot"></div> LIVE
     </div>
+    <button class="btn" onclick="exportDiagnostic()" title="Download diagnostic log">📥 Export Log</button>
     <button class="btn" onclick="openModal()">Connect DB</button>
   </div>
 </div>
@@ -1186,9 +1187,13 @@ async function sbGet(table,q=''){
   const u=getSbUrl(),k=getSbKey(); if(!u||!k) return null;
   try{
     const r=await fetch(`${u}/rest/v1/${table}${q}`,{headers:{'apikey':k,'Authorization':`Bearer ${k}`,'Content-Type':'application/json'}});
-    if(!r.ok) return null;
+    if(!r.ok){
+      const body=await r.text().catch(()=>'');
+      console.warn(`Supabase ${r.status} on ${table}:`,body);
+      return null;
+    }
     const t=await r.text(); return t?JSON.parse(t):[];
-  }catch{ return null; }
+  }catch(e){ console.warn('sbGet error:',e.message); return null; }
 }
 async function sbPatch(table,q,body){
   const u=getSbUrl(),k=getSbKey(); if(!u||!k) return;
@@ -1198,15 +1203,30 @@ async function sbPatch(table,q,body){
 }
 function dtbl(n){ return $('simEnabled')?.checked?`sim_${n}`:n; }
 async function testConnection(){
-  const d=await sbGet('tc_portfolio','?id=eq.1');
-  if(d&&d.length>0){
-    setStatus('live');
-    await loadSettings(); // wait for settings (esp sim mode) before polling
-    poll();               // first poll immediately
-    setInterval(poll,2000);
-  } else {
+  const u=getSbUrl(), k=getSbKey();
+  if(!u||!k){ setStatus('offline'); openModal(); return; }
+
+  try {
+    const d=await sbGet('tc_portfolio','?id=eq.1');
+    if(d&&d.length>0){
+      setStatus('live');
+      await loadSettings();
+      poll();
+      setInterval(poll,2000);
+    } else if(d===null) {
+      // null = fetch failed (network error, bad creds, CORS, etc.)
+      setStatus('offline');
+      showToast('Cannot reach Supabase — check URL and key','error');
+    } else {
+      // d is [] — connected but portfolio row missing, still connected
+      setStatus('live');
+      await loadSettings();
+      poll();
+      setInterval(poll,2000);
+    }
+  } catch(e) {
     setStatus('offline');
-    if(!getSbUrl()) openModal();
+    showToast('Connection error: '+e.message,'error');
   }
 }
 function setStatus(s){
@@ -1692,6 +1712,72 @@ let toastTimer;
 function showToast(msg,type=''){
   const t=$('toast'); t.textContent=msg; t.className=`toast show${type?' '+type:''}`;
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.className='toast',2800);
+}
+
+// ═══════════════════════════════════════
+// DIAGNOSTIC EXPORT
+// ═══════════════════════════════════════
+async function exportDiagnostic() {
+  showToast('Fetching diagnostic...', '');
+
+  // First get the bot diagnostic from Railway
+  const botUrl = localStorage.getItem('tc_bot_url') || prompt('Bot URL (e.g. https://tradecore.up.railway.app)', localStorage.getItem('tc_bot_url') || '');
+  if (!botUrl) return;
+  localStorage.setItem('tc_bot_url', botUrl.replace(/\/$/, ''));
+
+  let botData = null;
+  try {
+    const r = await fetch(botUrl.replace(/\/$/, '') + '/diagnostic');
+    if (r.ok) botData = await r.json();
+    else botData = { error: `HTTP ${r.status}` };
+  } catch(e) {
+    botData = { error: e.message };
+  }
+
+  // Also get Supabase positions + portfolio for comparison
+  const [port, positions, trades, logs] = await Promise.all([
+    sbGet('tc_portfolio', '?id=eq.1'),
+    sbGet('tc_positions', '?order=updated_at.desc'),
+    sbGet('tc_trades', '?order=created_at.desc&limit=100'),
+    sbGet('tc_logs', '?order=created_at.desc&limit=200'),
+  ]);
+
+  const report = {
+    generated_at: new Date().toISOString(),
+    dashboard_url: window.location.href,
+    sim_mode: $('simEnabled')?.checked,
+
+    // Bot real-time state
+    bot_diagnostic: botData,
+
+    // Supabase state (what dashboard reads)
+    supabase: {
+      portfolio: port?.[0] || null,
+      positions: positions || [],
+      recent_trades: trades || [],
+      recent_logs: (logs || []).slice(0, 100),
+    },
+
+    // Dashboard state
+    dashboard: {
+      equity_history_length: eqHist.length,
+      equity_history_last10: eqHist.slice(-10),
+      stable_equity: stableEq,
+      last_pos_hash: lastPosHash,
+      last_known_positions_count: lastKnownPositions.length,
+      empty_pos_count: emptyPosCount,
+      poll_count: pollN,
+    },
+  };
+
+  // Download as JSON
+  const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `tradecore-diagnostic-${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast('Diagnostic exported', 'success');
 }
 
 // ═══════════════════════════════════════
