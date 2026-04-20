@@ -1214,9 +1214,18 @@ async function syncPositions() {
       tbl('tc_positions') + `?symbol=not.in.(${openSyms.join(',')})`,
       'DELETE'
     );
-    // Wipe and reinsert — most reliable approach, avoids PATCH detection issues
+    // Wipe all then reinsert — clean slate approach
     await sbFetch(tbl('tc_positions') + '?symbol=neq.____NONE____', 'DELETE');
-    await sbFetch(tbl('tc_positions'), 'POST', allPositions);
+    if (allPositions.length > 0) {
+      // Use upsert with the unique constraint on symbol
+      const res = await sbFetch(tbl('tc_positions'), 'POST', allPositions);
+      if (!res) {
+        // If batch insert failed (e.g. constraint violation), try one by one
+        for (const pos of allPositions) {
+          await sbFetch(tbl('tc_positions'), 'POST', pos).catch(() => {});
+        }
+      }
+    }
   } else {
     await sbFetch(tbl('tc_positions') + '?symbol=neq.____NONE____', 'DELETE');
   }
@@ -3575,6 +3584,8 @@ async function coverShort(sym, price, reason) {
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete shortPositions[sym];
   alpacaShorts.delete(sym);
+  // Immediately delete from Supabase so dashboard reflects closure instantly
+  sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE').catch(() => {});
 
   const icon = { STOP_LOSS:'🛑', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰' }[reason] || '📤';
   log('short', `${icon} COVER ${qty}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
@@ -3583,6 +3594,11 @@ async function coverShort(sym, price, reason) {
   await syncTrade({ sym, side: 'COVER', qty, price, pnl, reason });
   await syncAll();
   await syncLog('sell', `${icon} COVER ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
+
+  // Trigger recovery on short losses too
+  if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
+    triggerRecovery(sym, Math.abs(pnl), price, pos);
+  }
 }
 
 // Manage short positions — mirror of managePosition but inverted
@@ -3757,6 +3773,9 @@ async function exitPosition(sym, price, reason) {
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete positions[sym];
   alpacaPositions.delete(sym);
+  // Immediately delete this position row from Supabase — don't wait for syncAll
+  // This ensures the dashboard sees it gone within the next poll cycle
+  sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE').catch(() => {});
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
   const icon = { STOP_LOSS:'🛑', BREAK_EVEN_STOP:'🔒', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰', VOL_SQUEEZE:'📊', RESISTANCE_EXIT:'🧱', PEAK_EXIT:'🔔', INTRADAY_CLOSE:'🔔', MICRO_MOVE_EXIT:'💤', AI_EXIT:'🤖', AI_PARTIAL:'🤖' }[reason] || '📤';
@@ -3841,7 +3860,7 @@ function clearRecovery(reason) {
   recoveryState = null;
 }
 
-async function runRecoveryScan(bars5m) {
+async function runRecoveryScan() {
   if (!recoveryState || !recoveryState.active) return;
   if (!CONFIG.recoveryMode) { clearRecovery('mode disabled'); return; }
 
@@ -3854,66 +3873,72 @@ async function runRecoveryScan(bars5m) {
   }
 
   // Don't try if already in a position on this sym
-  if (positions[sym] || shortPositions[sym]) return;
+  if (positions[sym] || shortPositions[sym]) {
+    log('recovery', `⏳ Recovery waiting — already in position on ${sym}`);
+    return;
+  }
 
-  const bars = bars5m[sym] || getLiveBars(sym, bars5m[sym]);
-  if (!bars || bars.length < 30) return;
+  // Fetch fresh bars — don't rely on snapshot (which only exists in sim)
+  let bars;
+  try {
+    const feed = getDataFeed();
+    const url = `${ALPACA_BASE()}/v2/stocks/${sym}/bars?timeframe=5Min&limit=60&feed=${feed}`;
+    const data = await alpacaFetch(url);
+    bars = (data?.bars || []).map(b => ({ t:b.t, o:+b.o, h:+b.h, l:+b.l, c:+b.c, v:+b.v }));
+  } catch(e) {
+    log('recovery', `⚠ Recovery: failed to fetch bars for ${sym}: ${e.message}`);
+    return;
+  }
 
-  const price   = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || bars[bars.length-1].c;
-  const atrVal  = atr(bars, 14);
-  const atrPct  = atrVal / price;
-  const closes  = bars.map(b => b.c);
-  const rsiVal  = rsi(closes, 14);
-  const vwapVal = vwap(bars.slice(-20));
+  if (!bars || bars.length < 20) {
+    log('recovery', `⏳ Recovery: not enough bars for ${sym} (${bars?.length||0})`);
+    return;
+  }
 
-  // Generate signal using current strategy
+  const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || bars[bars.length-1].c;
+  const atrVal = atr(bars, 14);
+
+  // Build 15m bars from 5m
   const bars15m = [];
   for (let i = 0; i + 2 < bars.length; i += 3) {
     const chunk = bars.slice(i, i + 3);
     bars15m.push({ t:chunk[0].t, o:chunk[0].o, h:Math.max(...chunk.map(b=>b.h)), l:Math.min(...chunk.map(b=>b.l)), c:chunk[chunk.length-1].c, v:chunk.reduce((a,b)=>a+b.v,0) });
   }
-  const sig = generateSignalByStrategy(sym, bars, bars15m) || generateSignal(sym, bars, bars15m);
+
+  const sig = generateSignalByStrategy(sym, bars, bars15m.length >= 10 ? bars15m : null)
+           || generateSignal(sym, bars, bars15m.length >= 10 ? bars15m : null);
 
   recoveryState.attempts++;
+  log('recovery', `🔄 Recovery scan #${recoveryState.attempts}: ${sym} → ${sig.signal} conf=${sig.confidence}% score=${sig.score}`);
 
-  // Recovery requires high confidence — we can't afford another loss
-  const MIN_RECOVERY_CONF = 80;
+  // Lower threshold than normal — we're being opportunistic, not perfect
+  // 65% is still selective but actually achievable
+  const MIN_RECOVERY_CONF = 65;
   if (sig.signal === 'HOLD' || sig.confidence < MIN_RECOVERY_CONF) {
-    log('recovery', `⏳ Recovery scan ${attempts+1}: ${sym} sig=${sig.signal} conf=${sig.confidence}% (need ${MIN_RECOVERY_CONF}%) — waiting`);
+    log('recovery', `⏳ ${sym} not ready (need ${MIN_RECOVERY_CONF}% conf, got ${sig.confidence}%) — will retry next scan`);
     return;
   }
 
-  // Calculate qty to exactly recover the loss
-  // Recovery target = lossAmt / (atr * 2) shares, capped at normal position size
-  const atrTarget  = atrVal * 2; // expect to capture 2× ATR
-  const recoveryQty = Math.max(1, Math.min(
-    Math.ceil(targetPnl / atrTarget),          // qty needed to recover at 2×ATR
-    Math.floor(portfolio * CONFIG.maxPositionPct / price) // normal max position
+  // Size to recover the exact loss — capped at normal max position
+  const atrTarget   = atrVal * 2;
+  const recoverQty  = Math.max(1, Math.min(
+    Math.ceil(targetPnl / atrTarget),
+    Math.floor(portfolio * CONFIG.maxPositionPct / price)
   ));
 
-  log('recovery', `🎯 RECOVERY ENTRY: ${sym} ${sig.signal} conf=${sig.confidence}% qty=${recoveryQty} target=$${targetPnl.toFixed(2)}`);
-  await syncLog('recovery', `🎯 Recovery trade: ${sym} ${sig.signal} conf=${sig.confidence}% qty=${recoveryQty}`);
+  log('recovery', `🎯 RECOVERY ENTRY: ${sym} ${sig.signal} conf=${sig.confidence}% qty=${recoverQty} target=$${targetPnl.toFixed(2)}`);
+  await syncLog('recovery', `🎯 Recovery: ${sym} ${sig.signal} qty=${recoverQty} target=$${targetPnl.toFixed(2)}`);
 
-  // Enter with recovery-specific settings (tighter stop, exact profit target)
-  const recoveryTP = targetPnl / (recoveryQty * price); // pct needed to recover
-  if (sig.signal === 'BUY') {
-    await enterPosition(sym, price, {
-      ...sig,
-      confidence: sig.confidence,
-      recoveryMode: true,
-      recoveryTarget: recoveryTP,
-    }, bars, 'long');
-  } else if (sig.signal === 'SELL' && CONFIG.shortsEnabled) {
-    await enterPosition(sym, price, {
-      ...sig,
-      confidence: sig.confidence,
-      recoveryMode: true,
-      recoveryTarget: recoveryTP,
-    }, bars, 'short');
+  const direction = sig.signal === 'BUY' ? 'long' : 'short';
+  if (direction === 'short' && !CONFIG.shortsEnabled) {
+    log('recovery', `Recovery: ${sym} needs SHORT but shorts disabled — waiting for BUY setup`);
+    return;
   }
 
-  // Clear recovery state — win or lose, one shot
-  clearRecovery(`recovery trade entered (${sig.signal})`);
+  await enterPosition(sym, price, { ...sig, recoveryMode: true, recoveryTarget: targetPnl / (recoverQty * price) }, bars, direction);
+
+  // One shot — clear regardless of outcome
+  clearRecovery(`recovery trade entered ${sym} ${sig.signal}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -4668,9 +4693,9 @@ async function runScan() {
   log('info', `${session} | Total=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
   await syncLog('sys', `Scan complete | Portfolio=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
 
-  // Recovery scan — runs every scan when recovery mode is active
-  if (isInRecovery() && lastSnapshot) {
-    await runRecoveryScan(lastSnapshot);
+  // Recovery scan — runs every live scan when recovery mode is active
+  if (isInRecovery()) {
+    await runRecoveryScan();
   }
 
   await syncAll();
@@ -5968,7 +5993,16 @@ setInterval(async () => {
   }
 }, 60000); // check every 60 seconds
 
-// Re-subscribe to any new positions every 30 seconds
+// ── DEDICATED RECOVERY SCANNER — every 30s, independent of main scan loop ──
+// Recovery needs to act fast after a loss — can't wait for the 15s scan cycle
+// which might be busy with position management or rate-limited
+setInterval(async () => {
+  if (!isInRecovery()) return;
+  if (isSimMode()) return;
+  if (!isMarketOpen()) { clearRecovery('market closed'); return; }
+  log('recovery', `🔄 Recovery interval: active for ${recoveryState?.sym} (attempt ${recoveryState?.attempts||0})`);
+  await runRecoveryScan();
+}, 30000);
 // (catches positions opened after initial subscription)
 setInterval(() => {
   if (!isSimMode()) subscribeOpenPositions();
