@@ -1358,8 +1358,8 @@ function renderChart(){
 // ═══════════════════════════════════════
 // POLL
 // ═══════════════════════════════════════
-let pollN=0, lastPosHash='', lastTradeN=0, lastLogTs='';
-let lastKnownPositions=[], emptyPosCount=0; // prevent flash-to-empty
+let pollN=0, lastTradeN=0, lastLogTs='';
+// lastKnownPositions removed — bot handles immediate DB cleanup on close
 
 async function poll(){
   pollN++;
@@ -1461,19 +1461,10 @@ async function poll(){
   // Sync time
   if($('syncInfo')) $('syncInfo').textContent='Updated '+new Date().toLocaleTimeString();
 
-  // Position flash prevention:
-  // If we suddenly get 0 positions but had some before, wait 3 polls to confirm they're gone
-  // This prevents the DELETE→INSERT gap from clearing the display momentarily
-  if(posData.length > 0) {
-    lastKnownPositions = posData;
-    emptyPosCount = 0;
-  } else if(lastKnownPositions.length > 0) {
-    emptyPosCount++;
-    if(emptyPosCount < 3) posData.splice(0, 0, ...lastKnownPositions); // restore temporarily
-    else lastKnownPositions = [];
-  }
-  const ph=JSON.stringify(posData.map(x=>x.symbol+(x.pnl||0).toFixed(2)+(x.current_price||0)+(x.updated_at||'')));
-  if(ph!==lastPosHash){ lastPosHash=ph; renderPositions(posData); }
+  // Trust the DB directly — bot now deletes rows immediately on close
+  // so we don't need flash prevention which caused ghost positions
+  // Always re-render positions — prevents stale display from hash caching
+  renderPositions(posData);
   if($('posCountBadge')) $('posCountBadge').textContent=posData.length;
   if($('scPositions')) $('scPositions').textContent=posData.length;
 
@@ -1740,9 +1731,7 @@ async function clearStalePositions() {
     fetch(`${u}/rest/v1/sim_tc_positions?symbol=neq.____NONE____`, { method:'DELETE', headers }),
   ]);
 
-  // Reset local state
-  lastKnownPositions = [];
-  emptyPosCount = 0;
+  // Reset local state so dashboard re-renders from DB
   lastPosHash = '';
   renderPositions([]);
   showToast('Positions cleared — bot will repopulate shortly', 'success');
