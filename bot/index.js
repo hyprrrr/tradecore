@@ -1065,6 +1065,8 @@ async function syncPortfolio() {
         if (acct.last_equity && +acct.last_equity > 0) lastEquity = +parseFloat(acct.last_equity).toFixed(2);
         // Update in-memory state
         realEquity = equityValue;
+        // Keep portfolio in sync with real cash so calcQty etc work correctly
+        if (!isSimMode() && cashValue > 0) portfolio = cashValue;
         if (!realDailyStartEquity && lastEquity > 0) {
           realDailyStartEquity = lastEquity;
           log('risk', `Day baseline set: $${lastEquity.toFixed(2)}`);
@@ -3437,7 +3439,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
       try { await placeSmartOrder(sym, finalQty, 'buy', false); }
       catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
     }
-    portfolio -= finalCost;
+    if (isSimMode()) portfolio -= finalCost; // live mode: Alpaca tracks cash
 
     // Use trapped buyer clusters above as TP targets — they'll panic-sell when price hits them
     // This gives us precise TP levels based on where the real supply/resistance is
@@ -3579,7 +3581,7 @@ async function coverShort(sym, price, reason) {
 
   // Short P&L = (entry - exit) × qty (profit when price drops)
   const pnl = (pos.entryPrice - price) * qty;
-  portfolio += pnl; // add profit (or subtract loss)
+  if (isSimMode()) portfolio += pnl; // only track in sim — live uses Alpaca
   pnl > 0 ? totalWins++ : totalLosses++;
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete shortPositions[sym];
@@ -3735,7 +3737,7 @@ async function partialExit(sym, price, qtyToSell, reason) {
   }
   const avgCost = pos.cost / (pos.qtyRemaining || pos.qty);
   const pnl = qtyToSell * price - qtyToSell * avgCost;
-  portfolio += qtyToSell * price;
+  if (isSimMode()) portfolio += qtyToSell * price;
   positions[sym].qtyRemaining -= qtyToSell;
   positions[sym].cost = positions[sym].qtyRemaining * avgCost;
   pnl > 0 ? totalWins++ : totalLosses++;
@@ -3768,13 +3770,13 @@ async function exitPosition(sym, price, reason) {
   }
   const avgCost = pos.cost / qtyToSell;
   const pnl = qtyToSell * price - qtyToSell * avgCost;
-  portfolio += qtyToSell * price;
+  // Only update in-memory cash in sim mode — in live mode Alpaca is the source of truth
+  // Adding proceeds in live mode causes cash to inflate and diverge from reality
+  if (isSimMode()) portfolio += qtyToSell * price;
   pnl > 0 ? totalWins++ : totalLosses++;
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete positions[sym];
   alpacaPositions.delete(sym);
-  // Immediately delete this position row from Supabase — don't wait for syncAll
-  // This ensures the dashboard sees it gone within the next poll cycle
   sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE').catch(() => {});
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
