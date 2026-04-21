@@ -5299,7 +5299,7 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
     catch(e) { log('error', `Scalp order failed ${sym}: ${e.message}`); return; }
   }
 
-  portfolio -= direction === 'long' ? cost : 0;
+  if (isSimMode()) portfolio -= direction === 'long' ? cost : 0;
 
   scalpPositions[sym] = {
     entryPrice: price, qty, cost,
@@ -5364,7 +5364,7 @@ async function exitScalp(sym, price, reason) {
     ? (price - entryPrice) * qty
     : (entryPrice - price) * qty;
 
-  portfolio += direction === 'long' ? qty * price : pnl;
+  if (isSimMode()) portfolio += direction === 'long' ? qty * price : pnl;
   pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++);
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: 50, session: getCurrentSession(), side: pos?.direction||'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*pos.qty) : 0 });
 
@@ -5459,8 +5459,12 @@ async function scalpPositionMonitor() {
         const trail = direction === 'long'
           ? scalpPositions[sym].highWater * (1 - CONFIG.scalpTrailingPct)
           : scalpPositions[sym].lowWater  * (1 + CONFIG.scalpTrailingPct);
-        if (direction === 'long'  && trail > scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trail;
-        if (direction === 'short' && trail < scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trail;
+        // Floor: trailing stop must never go below entry for longs (guarantees scratch at worst)
+        // or above entry for shorts
+        const trailFloorLong  = Math.max(trail, pos.entryPrice * 0.9995); // min = entry - 0.05%
+        const trailFloorShort = Math.min(trail, pos.entryPrice * 1.0005); // max = entry + 0.05%
+        if (direction === 'long'  && trailFloorLong  > scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trailFloorLong;
+        if (direction === 'short' && trailFloorShort < scalpPositions[sym].stopPrice) scalpPositions[sym].stopPrice = trailFloorShort;
 
         // If trailing stop now hit
         const trailHit = direction === 'long' ? price <= scalpPositions[sym].stopPrice : price >= scalpPositions[sym].stopPrice;
@@ -5501,8 +5505,12 @@ async function scalpPositionMonitor() {
           continue;
         }
       }
-      // Still holding — log status
-      log('scalp', `⚡ ${sym} ${direction.toUpperCase()} $${entryPrice.toFixed(2)}→$${price.toFixed(2)} P&L:${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)} SL=$${pos.stopPrice.toFixed(2)} TP=$${tpPrice.toFixed(2)} ${holdMins.toFixed(1)}m`);
+      // Still holding — throttled status log (once per 30s per symbol)
+      const _sk = sym+'_scalpLog';
+      if (!posLogThrottle[_sk] || Date.now()-posLogThrottle[_sk] > 30000) {
+        posLogThrottle[_sk] = Date.now();
+        log('scalp', `⚡ ${sym} ${direction.toUpperCase()} $${entryPrice.toFixed(2)}→$${price.toFixed(2)} P&L:${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)} SL=$${pos.stopPrice.toFixed(2)} TP=$${tpPrice.toFixed(2)} ${holdMins.toFixed(1)}m`);
+      }
     }
   } catch(e) {
     log('error', `scalpMonitor: ${e.message}`);
@@ -5543,6 +5551,13 @@ async function runScalpScan() {
   if (!CONFIG.scalpMode) return;
   if (!isMarketOpen()) return;
   if (checkCircuitBreaker()) return;
+
+  // Don't scalp during off-hours — 1m bars have no liquidity for US stocks
+  // Scalping needs real price discovery, not pre/after-market noise
+  const sess = getCurrentSession();
+  if (sess.includes('Off') || sess.includes('Pre') || sess.includes('Asia')) {
+    return; // no scalping outside US market hours
+  }
 
   // First manage existing positions (most important)
   await manageScalpPositions();
