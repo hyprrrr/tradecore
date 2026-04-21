@@ -3802,10 +3802,10 @@ async function exitPosition(sym, price, reason) {
   await syncLog('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
 
   // ── RECOVERY MODE ─────────────────────────────────────────────
-  // Triggered when a trade closes at a loss
-  // Activates a focused hunt for a recovery trade on the same symbol
   if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
-    triggerRecovery(sym, Math.abs(pnl), price, pos);
+    // If this was itself a recovery trade that lost, add losses together
+    const combinedLoss = Math.abs(pnl) + (pos.sigInfo?.recoveryMode ? (recoveryState?.targetPnl || 0) : 0);
+    triggerRecovery(sym, combinedLoss, price, pos);
   }
 }
 
@@ -3883,79 +3883,113 @@ async function runRecoveryScan() {
 
   const { sym, targetPnl, startTime, attempts } = recoveryState;
 
-  // Expire after 30 minutes
-  if (Date.now() - startTime > 30 * 60 * 1000) {
-    clearRecovery('expired (30min)');
+  // Expire after 60 minutes (extended from 30 — markets can be choppy)
+  if (Date.now() - startTime > 60 * 60 * 1000) {
+    clearRecovery('expired (60min)');
     return;
   }
 
-  // Don't try if already in a position on this sym
-  if (positions[sym] || shortPositions[sym]) {
-    log('recovery', `⏳ Recovery waiting — already in position on ${sym}`);
-    return;
-  }
-
-  // Fetch fresh bars — don't rely on snapshot (which only exists in sim)
-  let bars;
-  try {
-    const feed = getDataFeed();
-    const url = `${ALPACA_BASE()}/v2/stocks/${sym}/bars?timeframe=5Min&limit=60&feed=${feed}`;
-    const data = await alpacaFetch(url);
-    bars = (data?.bars || []).map(b => ({ t:b.t, o:+b.o, h:+b.h, l:+b.l, c:+b.c, v:+b.v }));
-  } catch(e) {
-    log('recovery', `⚠ Recovery: failed to fetch bars for ${sym}: ${e.message}`);
-    return;
-  }
-
-  if (!bars || bars.length < 20) {
-    log('recovery', `⏳ Recovery: not enough bars for ${sym} (${bars?.length||0})`);
-    return;
-  }
-
-  const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || bars[bars.length-1].c;
-  const atrVal = atr(bars, 14);
-
-  // Build 15m bars from 5m
-  const bars15m = [];
-  for (let i = 0; i + 2 < bars.length; i += 3) {
-    const chunk = bars.slice(i, i + 3);
-    bars15m.push({ t:chunk[0].t, o:chunk[0].o, h:Math.max(...chunk.map(b=>b.h)), l:Math.min(...chunk.map(b=>b.l)), c:chunk[chunk.length-1].c, v:chunk.reduce((a,b)=>a+b.v,0) });
-  }
-
-  const sig = generateSignalByStrategy(sym, bars, bars15m.length >= 10 ? bars15m : null)
-           || generateSignal(sym, bars, bars15m.length >= 10 ? bars15m : null);
+  // Scan the original symbol first, then all other symbols if no signal found
+  // This way recovery isn't stuck waiting for one symbol that may not move
+  const openSyms = new Set([...Object.keys(positions), ...Object.keys(shortPositions)]);
+  const scanList = [sym, ...CONFIG.symbols.filter(s => s !== sym && !openSyms.has(s))];
 
   recoveryState.attempts++;
-  log('recovery', `🔄 Recovery scan #${recoveryState.attempts}: ${sym} → ${sig.signal} conf=${sig.confidence}% score=${sig.score}`);
+  log('recovery', `🔄 Recovery scan #${recoveryState.attempts}: scanning ${scanList.length} symbols for opportunity`);
 
-  // Lower threshold than normal — we're being opportunistic, not perfect
-  // 65% is still selective but actually achievable
   const MIN_RECOVERY_CONF = 65;
-  if (sig.signal === 'HOLD' || sig.confidence < MIN_RECOVERY_CONF) {
-    log('recovery', `⏳ ${sym} not ready (need ${MIN_RECOVERY_CONF}% conf, got ${sig.confidence}%) — will retry next scan`);
+  let bestSig = null, bestSym = null, bestBars = null;
+
+  for (const candidate of scanList.slice(0, 8)) { // check up to 8 symbols
+    if (openSyms.has(candidate)) continue;
+
+    let bars;
+    try {
+      const feed = getDataFeed();
+      const url = `${ALPACA_BASE()}/v2/stocks/${candidate}/bars?timeframe=5Min&limit=60&feed=${feed}`;
+      const data = await alpacaFetch(url);
+      bars = (data?.bars || []).map(b => ({ t:b.t, o:+b.o, h:+b.h, l:+b.l, c:+b.c, v:+b.v }));
+    } catch(e) { continue; }
+
+    if (!bars || bars.length < 20) continue;
+
+    const bars15m = [];
+    for (let i = 0; i + 2 < bars.length; i += 3) {
+      const chunk = bars.slice(i, i + 3);
+      bars15m.push({ t:chunk[0].t, o:chunk[0].o, h:Math.max(...chunk.map(b=>b.h)), l:Math.min(...chunk.map(b=>b.l)), c:chunk[chunk.length-1].c, v:chunk.reduce((a,b)=>a+b.v,0) });
+    }
+
+    const sig = generateSignalByStrategy(candidate, bars, bars15m.length >= 10 ? bars15m : null)
+             || generateSignal(candidate, bars, bars15m.length >= 10 ? bars15m : null);
+
+    if (sig.signal !== 'HOLD' && sig.confidence >= MIN_RECOVERY_CONF) {
+      if (!bestSig || sig.confidence > bestSig.confidence) {
+        bestSig = sig; bestSym = candidate; bestBars = bars;
+        log('recovery', `  ✓ ${candidate}: ${sig.signal} conf=${sig.confidence}%`);
+      }
+    } else {
+      log('recovery', `  ✗ ${candidate}: ${sig.signal} conf=${sig.confidence}%`);
+    }
+  }
+
+  if (!bestSig) {
+    log('recovery', `⏳ No recovery opportunity found this scan — will retry`);
     return;
   }
 
-  // Size to recover the exact loss — capped at normal max position
-  const atrTarget   = atrVal * 2;
-  const recoverQty  = Math.max(1, Math.min(
+  const price = priceHistory5m[bestSym]?.[priceHistory5m[bestSym].length-1] || bestBars[bestBars.length-1].c;
+  const atrVal = atr(bestBars, 14);
+  const atrTarget = atrVal * 2;
+  const recoverQty = Math.max(1, Math.min(
     Math.ceil(targetPnl / atrTarget),
     Math.floor(portfolio * CONFIG.maxPositionPct / price)
   ));
 
-  log('recovery', `🎯 RECOVERY ENTRY: ${sym} ${sig.signal} conf=${sig.confidence}% qty=${recoverQty} target=$${targetPnl.toFixed(2)}`);
-  await syncLog('recovery', `🎯 Recovery: ${sym} ${sig.signal} qty=${recoverQty} target=$${targetPnl.toFixed(2)}`);
-
-  const direction = sig.signal === 'BUY' ? 'long' : 'short';
+  // If shorts disabled and best signal is SHORT, find best LONG signal instead
+  let direction = bestSig.signal === 'BUY' ? 'long' : 'short';
   if (direction === 'short' && !CONFIG.shortsEnabled) {
-    log('recovery', `Recovery: ${sym} needs SHORT but shorts disabled — waiting for BUY setup`);
-    return;
+    // Re-scan for a long-only opportunity
+    let longSig = null, longSym = null, longBars = null;
+    for (const candidate of scanList.slice(0, 8)) {
+      if (openSyms.has(candidate)) continue;
+      try {
+        const feed = getDataFeed();
+        const data = await alpacaFetch(`${ALPACA_BASE()}/v2/stocks/${candidate}/bars?timeframe=5Min&limit=60&feed=${feed}`);
+        const bars = (data?.bars||[]).map(b=>({t:b.t,o:+b.o,h:+b.h,l:+b.l,c:+b.c,v:+b.v}));
+        if (bars.length < 20) continue;
+        const b15 = [];
+        for (let i=0;i+2<bars.length;i+=3){const ch=bars.slice(i,i+3);b15.push({t:ch[0].t,o:ch[0].o,h:Math.max(...ch.map(b=>b.h)),l:Math.min(...ch.map(b=>b.l)),c:ch[ch.length-1].c,v:ch.reduce((a,b)=>a+b.v,0)});}
+        const sig = generateSignalByStrategy(candidate, bars, b15.length>=10?b15:null) || generateSignal(candidate, bars, b15.length>=10?b15:null);
+        if (sig.signal === 'BUY' && sig.confidence >= MIN_RECOVERY_CONF) {
+          if (!longSig || sig.confidence > longSig.confidence) { longSig=sig; longSym=candidate; longBars=bars; }
+        }
+      } catch(e) { continue; }
+    }
+    if (!longSig) {
+      log('recovery', `Recovery: shorts disabled and no long setup found — will retry`);
+      return;
+    }
+    bestSig = longSig; bestSym = longSym; bestBars = longBars;
+    direction = 'long';
+    log('recovery', `Recovery: switched to long-only — best: ${bestSym} conf=${bestSig.confidence}%`);
   }
 
-  await enterPosition(sym, price, { ...sig, recoveryMode: true, recoveryTarget: targetPnl / (recoverQty * price) }, bars, direction);
+  log('recovery', `🎯 RECOVERY ENTRY: ${bestSym} ${bestSig.signal} conf=${bestSig.confidence}% qty=${recoverQty} target=$${targetPnl.toFixed(2)}`);
+  await syncLog('recovery', `🎯 Recovery: ${bestSym} ${bestSig.signal} qty=${recoverQty} target=$${targetPnl.toFixed(2)}`);
 
-  // One shot — clear regardless of outcome
-  clearRecovery(`recovery trade entered ${sym} ${sig.signal}`);
+  // Use best candidate for entry
+  // (sym/sig/bars are local aliases — outer sym still refers to original lost symbol)
+
+  // Check we can actually enter before clearing state
+  const openBefore = Object.keys(positions).length + Object.keys(shortPositions).length;
+  await enterPosition(bestSym, price, { ...bestSig, recoveryMode: true, recoveryTarget: targetPnl / (recoverQty * price) }, bestBars, direction);
+  const openAfter = Object.keys(positions).length + Object.keys(shortPositions).length;
+
+  if (openAfter > openBefore) {
+    clearRecovery(`recovery trade entered ${bestSym} ${bestSig.signal}`);
+  } else {
+    log('recovery', `⚠ Recovery entry blocked for ${bestSym} — will retry on next scan`);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -5292,6 +5326,11 @@ async function exitScalp(sym, price, reason) {
     syncLog('sell', `${icons[reason]||'📤'} SCALP EXIT ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason}) ${holdSecs}s`),
     syncAll(),
   ]).catch(e => log('error', `Scalp exit sync failed: ${e.message}`));
+
+  // Trigger recovery on scalp losses too
+  if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
+    triggerRecovery(sym, Math.abs(pnl), price, pos);
+  }
 }
 
 /**
@@ -5959,8 +5998,11 @@ setInterval(async () => {
 // which might be busy with position management or rate-limited
 setInterval(async () => {
   if (!isInRecovery()) return;
-  if (isSimMode()) return;
-  if (!isMarketOpen()) { clearRecovery('market closed'); return; }
+  // Allow in sim for testing — recovery is important to validate
+  if (!isMarketOpen() && !isSimMode()) {
+    log('recovery', `⏸ Recovery paused — market closed, will resume at open`);
+    return; // pause, don't clear — recovery persists until next open
+  }
   log('recovery', `🔄 Recovery interval: active for ${recoveryState?.sym} (attempt ${recoveryState?.attempts||0})`);
   await runRecoveryScan();
 }, 30000);
