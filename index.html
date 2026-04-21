@@ -1243,49 +1243,107 @@ function setStatus(s){
 // ═══════════════════════════════════════
 // 60FPS EQUITY CHART
 // ═══════════════════════════════════════
-let chartCtx=null, chartRAF=null, chartDsp=0, chartTgt=0;
+let chartCtx=null, chartRAF=null;
 let eqHist=[], stableEq=0, eqResetAt=0;
+
+// ── ANIMATED CHART STATE ──────────────────────────────────────────
+// chartDsp   = currently displayed value (animates toward chartTgt)
+// chartTgt   = target value from latest data
+// breathAmp  = idle breathing amplitude in dollars
+// lastUpdate = timestamp of last real data update
+// gliding    = true while actively animating toward new target
+let chartDsp=0, chartTgt=0;
+let breathPhase=0;        // drives the idle sine wave
+let lastDataUpdate=0;     // when we last got real equity data
+let glideVelocity=0;      // momentum for smooth glide
+let chartLineGlow=0;      // glow intensity — spikes on update then fades
 
 function procEq(raw,cap){
   if(!raw||raw<=0||raw>cap*3) return false;
   const last=eqHist[eqHist.length-1];
   if(!last){ eqHist.push(raw); stableEq=raw; return true; }
-
-  // Spike filter: reject any single-poll jump > 2% unless we're in a relaxed window
-  // This prevents position open/close events from creating visual spikes
   const relaxed=(Date.now()-eqResetAt)<20000;
   const pctChange=Math.abs((raw-last)/last);
-  if(!relaxed && pctChange>0.02) {
-    // Big jump — could be legitimate profit or a stale-data spike
-    // Accept it if multiple consecutive polls confirm it (use stableEq as anchor)
+  if(!relaxed && pctChange>0.02){
     const pctFromStable=Math.abs((raw-stableEq)/stableEq);
-    if(pctFromStable>0.05) return false; // >5% from stable = reject as spike
+    if(pctFromStable>0.05) return false;
   }
-  if(Math.abs(raw-last)<0.50) return true; // micro-change, stable
+  if(Math.abs(raw-last)<0.50) return true;
   eqHist.push(raw); if(eqHist.length>400) eqHist.shift(); stableEq=raw; return true;
 }
+
 function startChart(){
   const cv=$('equityChart'); if(!cv||chartRAF) return;
   chartCtx=cv.getContext('2d');
   (function loop(){ renderChart(); chartRAF=requestAnimationFrame(loop); })();
 }
+
 function drawChart(){
   if(!chartRAF) startChart();
-  if(eqHist.length>0){ chartTgt=eqHist[eqHist.length-1]; if(!chartDsp) chartDsp=chartTgt; }
+  if(eqHist.length>0){
+    const newTgt=eqHist[eqHist.length-1];
+    if(newTgt!==chartTgt && chartTgt!==0){
+      // New data arrived — trigger glow flash
+      chartLineGlow=1.0;
+      lastDataUpdate=Date.now();
+    }
+    chartTgt=newTgt;
+    if(!chartDsp) chartDsp=chartTgt;
+  }
 }
+
 function renderChart(){
   const cv=$('equityChart'); if(!cv) return;
   const W=cv.parentElement.offsetWidth, H=cv.parentElement.offsetHeight;
   if(W<=0||H<=0) return;
   if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; }
-  chartDsp+=(chartTgt-chartDsp)*0.07;
-  const ctx=chartCtx; ctx.clearRect(0,0,W,H);
+
+  const now=Date.now();
   const cap=getStartingCapital();
-  const empty=$('chartEmpty'); if(empty) empty.style.display=eqHist.length<2?'flex':'none';
+  const hasData=eqHist.length>=2;
+  const ctx=chartCtx;
+  ctx.clearRect(0,0,W,H);
+
+  // ── ANIMATE DISPLAY VALUE ──────────────────────────────────────
+  if(chartTgt && chartDsp){
+    const diff=chartTgt-chartDsp;
+    // Spring physics: fast approach + overshoot dampening
+    glideVelocity+= diff * 0.08;
+    glideVelocity *= 0.82;  // damping
+    chartDsp+=glideVelocity;
+    // Snap when close enough
+    if(Math.abs(diff)<0.01 && Math.abs(glideVelocity)<0.01){
+      chartDsp=chartTgt;
+      glideVelocity=0;
+    }
+  }
+
+  // ── IDLE BREATHING ────────────────────────────────────────────
+  // When display value has caught up to target, add a subtle sine oscillation
+  // Makes the line feel alive even when no new data is arriving
+  breathPhase+= 0.008; // ~0.5 cycles per second at 60fps
+  const isIdle=Math.abs(chartDsp-chartTgt)<0.5 && Math.abs(glideVelocity)<0.05;
+  // Amplitude: 0.02% of equity for subtle movement, stronger when no data for a while
+  const timeSinceUpdate=(now-lastDataUpdate)/1000;
+  const breathAmp= hasData
+    ? Math.min(0.0003, 0.0001 + timeSinceUpdate*0.00002) * (chartDsp||cap)
+    : 0;
+  const breathOffset= isIdle ? Math.sin(breathPhase) * breathAmp : 0;
+  const displayVal=(chartDsp||cap) + breathOffset;
+
+  // ── GLOW DECAY ────────────────────────────────────────────────
+  chartLineGlow=Math.max(0, chartLineGlow-0.025);
+
+  const empty=$('chartEmpty');
+  if(empty) empty.style.display=hasData?'none':'flex';
+
   const P={t:62,b:24,l:52,r:20};
   const cH=H-P.t-P.b, cW=W-P.l-P.r;
-  const data=eqHist.length>=2?[...eqHist]:null;
-  if(data&&chartDsp>0) data[data.length-1]=chartDsp;
+
+  // Build display data — replace last point with animated display value
+  const data=hasData?[...eqHist]:null;
+  if(data) data[data.length-1]=displayVal;
+
   const minV=data?Math.min(...data,cap)*0.997:cap*0.99;
   const maxV=data?Math.max(...data,cap)*1.003:cap*1.01;
   const range=maxV-minV||1;
@@ -1293,33 +1351,41 @@ function renderChart(){
   const ty=v=>P.t+cH-((v-minV)/range)*cH;
   const baseY=ty(cap);
 
-  // Grid lines with labels
-  ctx.font='9px JetBrains Mono, monospace';
+  // ── GRID ──────────────────────────────────────────────────────
+  ctx.font='9px JetBrains Mono,monospace';
   for(let i=0;i<=4;i++){
     const v=minV+(range/4)*i;
     const y=P.t+cH-(cH/4)*i;
-    ctx.setLineDash([2,6]); ctx.strokeStyle='rgba(255,255,255,0.04)'; ctx.lineWidth=1;
+    ctx.setLineDash([2,6]);
+    ctx.strokeStyle='rgba(255,255,255,0.04)';
+    ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(P.l,y); ctx.lineTo(W-P.r,y); ctx.stroke();
-    ctx.fillStyle='rgba(255,255,255,0.2)'; ctx.textAlign='right';
+    ctx.fillStyle='rgba(255,255,255,0.18)'; ctx.textAlign='right';
     ctx.fillText('$'+Math.round(v/1000)+'k', P.l-6, y+3);
   }
   ctx.setLineDash([]);
 
-  // Baseline (starting capital)
-  ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=1; ctx.setLineDash([4,8]);
-  ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke(); ctx.setLineDash([]);
+  // Baseline
+  ctx.strokeStyle='rgba(255,255,255,0.07)'; ctx.lineWidth=1; ctx.setLineDash([4,8]);
+  ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke();
+  ctx.setLineDash([]);
 
   if(!data) return;
 
-  const last=chartDsp||data[data.length-1], isUp=last>=cap;
-  const lineColor=isUp?'#00d4aa':'#ff4757';
+  const last=displayVal, isUp=last>=cap;
+  const colorUp='#00d4aa', colorDn='#ff4757';
+  const lineColor=isUp?colorUp:colorDn;
+  // Glow color brightens on update
+  const glowAlpha=0.4+chartLineGlow*0.6;
+  const glowBlur=6+chartLineGlow*18;
+
   const pts=data.map((v,i)=>[tx(i),ty(v)]);
 
   function catmull(pts){
     if(pts.length<2) return;
     ctx.moveTo(pts[0][0],pts[0][1]);
     for(let i=0;i<pts.length-1;i++){
-      const p0=pts[Math.max(i-1,0)], p1=pts[i], p2=pts[i+1], p3=pts[Math.min(i+2,pts.length-1)];
+      const p0=pts[Math.max(i-1,0)],p1=pts[i],p2=pts[i+1],p3=pts[Math.min(i+2,pts.length-1)];
       ctx.bezierCurveTo(
         p1[0]+(p2[0]-p0[0])/6, p1[1]+(p2[1]-p0[1])/6,
         p2[0]-(p3[0]-p1[0])/6, p2[1]-(p3[1]-p1[1])/6,
@@ -1328,33 +1394,57 @@ function renderChart(){
     }
   }
 
-  // Area fill
+  // Area fill — slightly breathes opacity
+  const fillAlpha=isUp?(0.12+breathOffset/breathAmp*0.02||0.12):(0.10+breathOffset/breathAmp*0.015||0.10);
   const grad=ctx.createLinearGradient(0,P.t,0,H-P.b);
-  grad.addColorStop(0, isUp?'rgba(0,212,170,0.18)':'rgba(255,71,87,0.14)');
-  grad.addColorStop(0.6, isUp?'rgba(0,212,170,0.04)':'rgba(255,71,87,0.04)');
-  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  grad.addColorStop(0, isUp?`rgba(0,212,170,${Math.max(0.08,fillAlpha)})`:`rgba(255,71,87,${Math.max(0.07,fillAlpha)})`);
+  grad.addColorStop(0.65, isUp?'rgba(0,212,170,0.03)':'rgba(255,71,87,0.03)');
+  grad.addColorStop(1,'rgba(0,0,0,0)');
   ctx.beginPath();
-  ctx.moveTo(pts[0][0],H-P.b); ctx.lineTo(pts[0][0],pts[0][1]);
+  ctx.moveTo(pts[0][0],H-P.b);
+  ctx.lineTo(pts[0][0],pts[0][1]);
   catmull(pts);
-  ctx.lineTo(pts[pts.length-1][0],H-P.b); ctx.closePath();
+  ctx.lineTo(pts[pts.length-1][0],H-P.b);
+  ctx.closePath();
   ctx.fillStyle=grad; ctx.fill();
 
-  // Line
+  // Line — glows on update
   ctx.beginPath(); catmull(pts);
-  ctx.strokeStyle=lineColor; ctx.lineWidth=2;
+  ctx.strokeStyle=lineColor;
+  ctx.lineWidth=1.5+chartLineGlow*0.5;
   ctx.lineJoin='round'; ctx.lineCap='round';
-  ctx.shadowColor=lineColor; ctx.shadowBlur=8;
-  ctx.stroke(); ctx.shadowBlur=0;
+  ctx.shadowColor=lineColor;
+  ctx.shadowBlur=glowBlur;
+  ctx.globalAlpha=glowAlpha;
+  ctx.stroke();
+  ctx.globalAlpha=1; ctx.shadowBlur=0;
 
-  // End dot
+  // End dot — pulses continuously + extra pulse on update
   const ex=pts[pts.length-1][0], ey=pts[pts.length-1][1];
-  const pulse=0.4+0.6*Math.abs(Math.sin(Date.now()/800));
-  ctx.beginPath(); ctx.arc(ex,ey,4,0,Math.PI*2); ctx.fillStyle=lineColor; ctx.shadowColor=lineColor; ctx.shadowBlur=12; ctx.fill(); ctx.shadowBlur=0;
-  ctx.beginPath(); ctx.arc(ex,ey,8,0,Math.PI*2); ctx.strokeStyle=lineColor; ctx.lineWidth=1; ctx.globalAlpha=pulse*0.4; ctx.stroke(); ctx.globalAlpha=1;
+  const idlePulse=0.35+0.35*Math.sin(breathPhase*2.5);
+  const updateFlash=chartLineGlow*0.65;
+  const dotGlow=Math.max(idlePulse,updateFlash);
+  const dotR=3+chartLineGlow*2;
 
-  // Price label at end
+  // Outer ring — idle breathe
+  ctx.beginPath(); ctx.arc(ex,ey,dotR+5,0,Math.PI*2);
+  ctx.strokeStyle=lineColor; ctx.lineWidth=1;
+  ctx.shadowColor=lineColor; ctx.shadowBlur=10;
+  ctx.globalAlpha=dotGlow*0.3; ctx.stroke();
+  ctx.globalAlpha=1; ctx.shadowBlur=0;
+
+  // Inner dot
+  ctx.beginPath(); ctx.arc(ex,ey,dotR,0,Math.PI*2);
+  ctx.fillStyle=lineColor;
+  ctx.shadowColor=lineColor; ctx.shadowBlur=12+chartLineGlow*10;
+  ctx.fill(); ctx.shadowBlur=0;
+
+  // Price label
   const diff=last-cap, pct=(diff/cap*100).toFixed(2);
-  ctx.font='bold 10px JetBrains Mono, monospace'; ctx.fillStyle=lineColor; ctx.textAlign='right'; ctx.shadowColor=lineColor; ctx.shadowBlur=4;
+  ctx.font=`${600+Math.round(chartLineGlow*100)} 10px JetBrains Mono,monospace`;
+  ctx.fillStyle=lineColor;
+  ctx.textAlign='right';
+  ctx.shadowColor=lineColor; ctx.shadowBlur=3+chartLineGlow*6;
   ctx.fillText(`$${Math.round(last).toLocaleString()} (${diff>=0?'+':''}${pct}%)`, Math.min(ex+2,W-P.r), ey-12);
   ctx.shadowBlur=0;
 }
