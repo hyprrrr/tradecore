@@ -855,14 +855,14 @@ tbody tr:hover td { background: rgba(255,255,255,0.02); }
         <div class="kpi-sub" id="kpiDayPct">0.00%</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Realized</div>
+        <div class="kpi-label">Alpaca Day P&L</div>
         <div class="kpi-value neu" id="kpiRealized">+$0.00</div>
-        <div class="kpi-sub">closed trades</div>
+        <div class="kpi-sub" id="kpiRealizedSub">from Alpaca</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Unrealized</div>
         <div class="kpi-value neu" id="kpiUnrealized">+$0.00</div>
-        <div class="kpi-sub">open P&L</div>
+        <div class="kpi-sub">open positions</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Win Rate</div>
@@ -1605,7 +1605,7 @@ async function poll(){
   const [port,rawPositions,trades,logs]=await Promise.all([
     sbGet(dtbl('tc_portfolio'),'?id=eq.1'),
     sbGet(dtbl('tc_positions'),'?order=updated_at.desc'),
-    fetchTrades?sbGet(dtbl('tc_trades'),'?order=created_at.desc&limit=500'):Promise.resolve(null),
+    fetchTrades?sbGet(dtbl('tc_trades'),'?order=created_at.desc&limit=50'):Promise.resolve(null),
     sbGet(dtbl('tc_logs'),'?order=created_at.desc&limit=100'),
   ]);
   // If sim mode active but main table empty, try sim table (handles race on page load)
@@ -1647,14 +1647,11 @@ async function poll(){
   setVal('kpiPortfolio', fmt$(eq), cc(diff));
   setVal('kpiDayPnl', fmtSign(dayPnl), cc(dayPnl));
   if($('kpiDayPct')) $('kpiDayPct').textContent=(dayPnl>=0?'+':'')+(cap>0?(dayPnl/cap*100).toFixed(2):'0.00')+'%';
-  // Realized P&L = today's closed trades only, valid amounts only
-  const todayStr = new Date().toDateString();
-  const realPnl=trades?.filter(t=>
-    ['SELL','COVER','SCALP_EXIT','PARTIAL'].includes(t.side) &&
-    t.pnl!=null &&
-    Math.abs(+t.pnl) < 50000 &&  // sanity cap — ignore phantom huge values
-    new Date(t.created_at||t.time).toDateString()===todayStr
-  ).reduce((a,t)=>a+(+t.pnl||0),0)||0;
+  // Use Alpaca's day_pnl directly — it's the only reliable source
+  // day_pnl = (current equity - start of day equity) from Alpaca account API
+  // Never sum tc_trades — that table has old/bad data from previous sessions
+  const realPnl = dayPnl; // dayPnl already comes from p.day_pnl (Alpaca-sourced)
+  if($('kpiRealizedSub')) $('kpiRealizedSub').textContent = 'vs day start $'+fmt$(eq-dayPnl).replace('$','');
   const unrealPnl=posData.reduce((a,x)=>{
     const entry=+x.entry_price||0,cur=+x.current_price||0,qty=Math.abs(+x.qty||0);
     if(!entry||!cur||!qty) return a; // skip invalid rows
