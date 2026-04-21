@@ -3877,7 +3877,8 @@ async function exitPosition(sym, price, reason) {
 //   - Circuit break: if recovery trade also loses, mode deactivates
 // ═══════════════════════════════════════════════════════════════════
 
-let recoveryState = null; // { sym, targetPnl, lossPrice, startTime, attempts }
+let recoveryState = null;
+const dupWarnThrottle = {}; // throttle warnings + scalp cooldowns // { sym, targetPnl, lossPrice, startTime, attempts }
 const posLogThrottle = {}; // sym -> last log timestamp, prevents log spam
 
 function isInRecovery() { return !!recoveryState && CONFIG.recoveryMode; }
