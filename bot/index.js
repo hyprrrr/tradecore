@@ -3229,6 +3229,17 @@ function generateSignal(sym, bars5m, bars15m) {
   const finalConf = Math.min(99, confidence + bonus * 5);
   // Note low confidence but don't hard-block — let position sizing handle risk
 
+  // ── SESSION QUALITY FILTER ────────────────────────────────────────
+  // US stocks have low liquidity during Asia/pre-market sessions
+  // Require higher confidence outside US hours to reduce false signals
+  const session = getCurrentSession();
+  const isOffHours = session.includes('Off') || session.includes('Asia') || session.includes('Pre');
+  const sessionMinConf = isOffHours ? 80 : 65; // stricter off-hours
+  if (finalConf < sessionMinConf) {
+    reasons.push(`Conf ${finalConf}% below session minimum ${sessionMinConf}% (${session})`);
+    return { signal: 'HOLD', confidence: finalConf, score, reasons, rsi: r };
+  }
+
   return {
     signal:     direction === 'buy' ? 'BUY' : 'SELL',
     confidence: finalConf,
@@ -3363,7 +3374,12 @@ function calcQty(symbol, price, bars, confidence = 70) {
   // Hard dollar cap — never put more than maxPositionPct of STARTING capital in one trade
   // Use startingCapital not current portfolio — prevents oversizing on winning streaks
   const baseCap    = Math.max(portfolio, CONFIG.startingCapital);
-  const confScale  = Math.max(0.4, Math.min(1.0, (confidence - CONFIG.minConfidence) / 30 + 0.5));
+  // WR-weighted confidence scaling — bet smaller during losing streaks
+  const recentWR = totalWins + totalLosses > 10
+    ? totalWins / (totalWins + totalLosses)
+    : 0.5;
+  const wrMult = recentWR >= 0.60 ? 1.0 : recentWR >= 0.50 ? 0.85 : recentWR >= 0.40 ? 0.65 : 0.45;
+  const confScale  = Math.max(0.4, Math.min(1.0, (confidence - CONFIG.minConfidence) / 30 + 0.5)) * wrMult;
   const scaledPct  = CONFIG.maxPositionPct * confScale;
   const maxCost    = baseCap * scaledPct;              // hard dollar cap
   const maxShares  = Math.floor(maxCost / price);
@@ -4397,9 +4413,14 @@ async function managePosition(sym, price, bars) {
   const posAtr    = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
   const posAtrPct = posAtr / price;
   // TP tiers: 1.5×, 3×, 5× ATR — naturally scales to stock's real movement
-  const effectiveTP1 = Math.max(posAtrPct * 1.5, 0.003); // min 0.3%
-  const effectiveTP2 = Math.max(posAtrPct * 3.0, 0.006); // min 0.6%
-  const effectiveTP3 = Math.max(posAtrPct * 5.0, 0.010); // min 1.0%
+  // Dynamic refresh: use current ATR if it expanded (momentum picking up)
+  // but never shrink TPs below original levels (don't punish compression)
+  const atrAtEntry = pos.atrAtEntry || posAtr;
+  const dynamicAtr = Math.max(posAtr, atrAtEntry); // only expand, never shrink
+  const dynamicAtrPct = dynamicAtr / price;
+  const effectiveTP1 = Math.max(dynamicAtrPct * 1.5, 0.003); // min 0.3%
+  const effectiveTP2 = Math.max(dynamicAtrPct * 3.0, 0.006); // min 0.6%
+  const effectiveTP3 = Math.max(dynamicAtrPct * 5.0, 0.010); // min 1.0%
 
   // Track MFE (max favorable) and MAE (max adverse) for post-trade analysis
   if (pos.entryAnalytics) {
@@ -4457,6 +4478,24 @@ async function managePosition(sym, price, bars) {
     positions[sym].breakEvenSet = true;
     log('risk', `🔒 ${sym} BE @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
     await syncLog('sys', `🔒 Break-even: ${sym}`);
+    // Lock 15% of position at break-even — guarantees we never fully scratch
+    // Even if stop hits, we've already taken some off the table
+    const lockQty = Math.max(0, Math.floor((pos.qtyRemaining || pos.qty) * 0.15));
+    if (lockQty >= 1 && !pos.tp1Hit) {
+      log('risk', `🔒 ${sym} locking ${lockQty} shares at BE ($${price.toFixed(2)}) — guaranteed profit`);
+      await partialExit(sym, price, lockQty, 'BE_LOCK');
+    }
+  }
+
+  // ── PRE-TP1 TRAILING: protect gains between BE and TP1 ──────────
+  // Once up 0.8%+ and break-even set, trail 1.2× ATR below high water
+  // This locks partial profits before TP1 fires
+  if (pos.breakEvenSet && !pos.tp1Hit && chg >= 0.008) {
+    const preTrail = pos.highWater * (1 - Math.max(posAtrPct * 1.2, 0.004));
+    if (preTrail > positions[sym].stopPrice) {
+      positions[sym].stopPrice = preTrail;
+      // Don't log every update — only when stop actually moves up
+    }
   }
 
   // Trailing stop only after TP1 — trail 1× ATR below high water
