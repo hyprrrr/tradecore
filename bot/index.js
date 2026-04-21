@@ -1833,12 +1833,17 @@ async function alpacaFetch(url, opts = {}, retries = 2) {
 }
 
 async function fetchBars(symbol, timeframe, limit) {
-  // Try Alpaca first
+  // Try Alpaca first — extend to 10 days to ensure enough bars for RSI(14)
   try {
-    const start = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
-    const url = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${start}&limit=${limit}&feed=${getDataFeed()}`;
+    const start = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const url = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${start}&limit=${Math.max(limit, 100)}&feed=${getDataFeed()}`;
     const data = await alpacaFetch(url);
-    if (data.bars && data.bars.length >= 5) return data.bars;
+    // Need at least 30 bars for RSI+MACD+ADX to be meaningful
+    // If Alpaca returns too few, fall through to Yahoo
+    if (data.bars && data.bars.length >= 30) return data.bars;
+    if (data.bars && data.bars.length > 0) {
+      log('data', `${symbol} Alpaca only returned ${data.bars.length} bars — trying Yahoo`);
+    }
   } catch (e) {}
 
   // Fallback: Yahoo Finance (free, no key)
@@ -3035,9 +3040,17 @@ function generateSignal(sym, bars5m, bars15m) {
   const r = rsi(c5, CONFIG.rsiPeriod);
   let rsiScore = 0;
   if      (r < CONFIG.rsiOversold)   { rsiScore = 2; direction = 'buy';  reasons.push(`RSI oversold ${r.toFixed(1)} ✅`); }
-  else if (r > CONFIG.rsiOverbought) { rsiScore = 2; direction = 'sell'; reasons.push(`RSI overbought ${r.toFixed(1)} ✅`); }
+  else if (r > CONFIG.rsiOverbought) {
+    // Shorts disabled — overbought RSI can't generate a trade, skip immediately
+    if (!CONFIG.shortsEnabled) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI overbought (${r.toFixed(1)}) but shorts disabled`], rsi: r };
+    rsiScore = 2; direction = 'sell'; reasons.push(`RSI overbought ${r.toFixed(1)} ✅`);
+  }
   else if (r < 38)                   { rsiScore = 1; direction = 'buy';  reasons.push(`RSI leaning oversold ${r.toFixed(1)}`); }
-  else if (r > 62)                   { rsiScore = 1; direction = 'sell'; reasons.push(`RSI leaning overbought ${r.toFixed(1)}`); }
+  else if (r > 62)                   {
+    // Leaning overbought — skip if shorts disabled
+    if (!CONFIG.shortsEnabled) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI leaning overbought (${r.toFixed(1)}) but shorts disabled`], rsi: r };
+    rsiScore = 1; direction = 'sell'; reasons.push(`RSI leaning overbought ${r.toFixed(1)}`);
+  }
   else {
     return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no edge`], rsi: r };
   }
@@ -3236,8 +3249,9 @@ function generateSignal(sym, bars5m, bars15m) {
   const isOffHours = session.includes('Off') || session.includes('Asia') || session.includes('Pre');
   const sessionMinConf = isOffHours ? 80 : 65; // stricter off-hours
   if (finalConf < sessionMinConf) {
+    // Log first time per symbol to help diagnose — don't spam
     reasons.push(`Conf ${finalConf}% below session minimum ${sessionMinConf}% (${session})`);
-    return { signal: 'HOLD', confidence: finalConf, score, reasons, rsi: r };
+    return { signal: 'HOLD', confidence: finalConf, score, reasons, rsi: r, blockedBy: 'session_conf' };
   }
 
   return {
