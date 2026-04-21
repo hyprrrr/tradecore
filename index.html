@@ -1297,8 +1297,37 @@ function procEq(raw, cap){
 function startChart(){
   const cv=$('equityChart'); if(!cv||chartRAF) return;
   chartCtx = cv.getContext('2d');
-  (function loop(){ renderChart(); chartRAF=requestAnimationFrame(loop); })();
+  (function loop(){
+    // Skip rendering when tab is hidden — prevents stale stream buildup
+    if(!document.hidden) renderChart();
+    chartRAF=requestAnimationFrame(loop);
+  })();
 }
+
+// When tab becomes visible again, flush the stale stream
+// and reseed from current value so the chart starts fresh
+document.addEventListener('visibilitychange', () => {
+  if(!document.hidden){
+    // Tab is visible again — clean up the stream
+    const now = Date.now();
+    if(chartCurrent > 0){
+      // Keep only the last 3 seconds of real points
+      // so the chart starts fresh without a cliff
+      chartStream = chartStream.filter(p => p.t >= now - 3000);
+      // If stream is basically empty, seed one point at current value
+      // so the chart has something to draw from
+      if(chartStream.length < 3 && chartCurrent > 0){
+        chartStream.push({ t: now - 2000, v: chartCurrent });
+        chartStream.push({ t: now - 1000, v: chartCurrent });
+        chartStream.push({ t: now,        v: chartCurrent });
+      }
+    }
+    // Reset all animation state
+    _n1=0; _n2=0; _v1=0; _v2=0;
+    chartLineGlow = 0;
+    chartVelocity = 0;
+  }
+});
 
 // Called by poll() when new equity data arrives from Supabase
 function drawChart(){
@@ -1383,8 +1412,11 @@ function renderChart(){
   // into the historical shape — only the live end animates.
   if(displayVal > 0){
     const lastPt = chartStream[chartStream.length-1];
-    // Only push if value changed meaningfully or enough time passed
-    if(!lastPt || Math.abs(displayVal - lastPt.v) > 0.5 || (now - lastPt.t) > 500){
+    // Reject if: tab was hidden and last point is very old (avoids cliff on resume)
+    const staleCutoff = document.hidden ? true : (lastPt && (now - lastPt.t) > 10000);
+    if(staleCutoff && lastPt) {
+      // Gap detected — don't push, let visibilitychange handler clean up
+    } else if(!lastPt || Math.abs(displayVal - lastPt.v) > 0.5 || (now - lastPt.t) > 500){
       chartStream.push({ t: now, v: displayVal });
       if(chartStream.length > STREAM_CAP) chartStream.shift();
     }
