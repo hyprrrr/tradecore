@@ -5275,6 +5275,11 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   if (checkCircuitBreaker()) return;
   if (!isMarketOpen()) { log('scalp', `Scalp blocked — market closed`); return; }
   if (scalpPositions[sym]) { log('scalp', `Already in scalp position for ${sym}`); return; }
+  // Also check Alpaca — in-memory state can diverge from actual positions
+  if (alpacaPositions.has(sym) || positions[sym] || shortPositions[sym]) {
+    log('scalp', `🚫 ${sym}: Alpaca already has position — blocking scalp entry to prevent duplicate`);
+    return;
+  }
   if (Object.keys(scalpPositions).length >= CONFIG.scalpMaxPositions) {
     log('scalp', `Max scalp positions (${CONFIG.scalpMaxPositions}) reached`);
     return;
@@ -5397,6 +5402,13 @@ async function exitScalp(sym, price, reason) {
     syncAll(),
   ]).catch(e => log('error', `Scalp exit sync failed: ${e.message}`));
 
+  // Cooldown: block re-entry on this symbol for 60 seconds after a loss
+  if (pnl < 0) {
+    if (!dupWarnThrottle) {} // ensure exists
+    dupWarnThrottle[sym + '_scalpCooldown'] = Date.now();
+    log('scalp', `⏸ ${sym} scalp cooldown: no re-entry for 60s after loss`);
+  }
+
   // Trigger recovery on scalp losses too
   if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
     triggerRecovery(sym, Math.abs(pnl), price, pos);
@@ -5429,13 +5441,28 @@ async function scalpPositionMonitor() {
       const ageSecs = (Date.now() - new Date(pos.entryTime).getTime()) / 1000;
       if (ageSecs < 3) continue;
 
-      // Always fetch a fresh price for stop/TP decisions
-      // Never use a price that might predate the entry
-      let price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+      // CRITICAL: Always use LIVE price for scalp decisions
+      // NEVER use priceHistory5m — it's the 5m bar close which can be 5 minutes stale
+      // A $393 entry with a $363 cached price triggers stop loss immediately (proven bug)
+      let price = await fetchLatestTrade(sym);
       if (!price || price <= 0) {
-        price = await fetchLatestTrade(sym);
-        if (!price) continue;
-        priceHistory5m[sym] = [price];
+        // fetchLatestTrade failed — skip this cycle rather than use stale price
+        log('scalp', `⚠ ${sym}: could not get live price — skipping check to avoid false exit`);
+        continue;
+      }
+      // Sanity check: price must be within 5% of entry price
+      // If not, it's likely a stale/bad quote — skip rather than false-exit
+      const priceDeviation = Math.abs(price - pos.entryPrice) / pos.entryPrice;
+      if (priceDeviation > 0.05) {
+        log('scalp', `⚠ ${sym}: live price $${price.toFixed(2)} deviates ${(priceDeviation*100).toFixed(1)}% from entry $${pos.entryPrice.toFixed(2)} — verifying`);
+        // Double-check with a second fetch before acting
+        const price2 = await fetchLatestTrade(sym);
+        if (!price2 || Math.abs(price2 - pos.entryPrice) / pos.entryPrice > 0.05) {
+          log('scalp', `⚠ ${sym}: confirmed large move — proceeding with exit check`);
+          price = price2 || price;
+        } else {
+          price = price2; // use the better quote
+        }
       }
 
       const { direction, entryPrice, stopPrice, tpPrice } = pos;
@@ -5584,6 +5611,9 @@ async function runScalpScan() {
   for (const sym of CONFIG.scalpSymbols) {
     if (scalpPositions[sym]) continue; // already in position
     if (positions[sym] || shortPositions[sym]) continue; // don't scalp what we're swinging
+    // Check 60s cooldown after a loss on this symbol
+    const cooldownKey = sym + '_scalpCooldown';
+    if (dupWarnThrottle[cooldownKey] && Date.now() - dupWarnThrottle[cooldownKey] < 60000) continue;
 
     try {
       const bars1m = await fetchScalpBars(sym, 30);
