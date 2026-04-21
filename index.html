@@ -1260,7 +1260,7 @@ let eqHist=[], stableEq=0, eqResetAt=0;
 //   - The chart window is the last WINDOW_SECS of stream data,
 //     mapped left→right so newer data is always on the right.
 // ═══════════════════════════════════════════════════════════
-const WINDOW_SECS  = 120;   // seconds of history visible
+const WINDOW_SECS  = 600;   // 10 minutes of history — spikes look less dramatic at wider scale
 const STREAM_CAP   = 8000;  // max points in ring buffer
 
 let chartTarget   = 0;      // real equity from server
@@ -1271,16 +1271,25 @@ let breathPhase   = 0;
 let lastDataUpdate= 0;
 let chartLineGlow = 0;      // 0-1, spikes on update, decays each frame
 
+// Organic micro-drift — Perlin-like random walk, feels human not mechanical
+// Two independent noise oscillators at different primes so they never sync up
+let _n1=0, _n2=0,       // current noise values
+    _v1=0, _v2=0;       // noise velocities (random walk momentum)
+
 function procEq(raw, cap){
   if(!raw || raw<=0 || raw>cap*3) return false;
   const last = eqHist[eqHist.length-1];
   if(!last){ eqHist.push(raw); stableEq=raw; return true; }
   const relaxed = (Date.now()-eqResetAt) < 20000;
   const pctChange = Math.abs((raw-last)/last);
-  if(!relaxed && pctChange > 0.02){
-    if(Math.abs((raw-stableEq)/stableEq) > 0.05) return false;
+  // Reject any single-update jump > 1% unless we're in relaxed window
+  if(!relaxed && pctChange > 0.01){
+    // Could be legitimate (big trade) or stale data spike
+    // Accept only if it's a gradual move — within 3% of the rolling stable value
+    const pctFromStable = Math.abs((raw-stableEq)/stableEq);
+    if(pctFromStable > 0.03) return false;
   }
-  if(Math.abs(raw-last) < 0.50) return true;
+  if(Math.abs(raw-last) < 0.10) return true; // micro-change, skip
   eqHist.push(raw); if(eqHist.length>400) eqHist.shift();
   stableEq = raw; return true;
 }
@@ -1321,8 +1330,8 @@ function renderChart(){
   // ── 1. SPRING PHYSICS: glide chartCurrent → chartTarget ──────
   if(chartTarget > 0 && chartCurrent > 0){
     const diff = chartTarget - chartCurrent;
-    chartVelocity += diff * 0.06;   // spring force
-    chartVelocity *= 0.80;          // damping — reduce overshoot
+    chartVelocity += diff * 0.04;   // spring force — slower = smoother
+    chartVelocity *= 0.85;          // damping — less overshoot
     chartCurrent  += chartVelocity;
     if(Math.abs(diff)<0.005 && Math.abs(chartVelocity)<0.005){
       chartCurrent  = chartTarget;
@@ -1330,21 +1339,55 @@ function renderChart(){
     }
   }
 
-  // ── 2. IDLE DRIFT: tiny sine wave when settled ────────────────
-  // Amplitude grows slowly the longer since last update (max 0.04%)
-  breathPhase += 0.006;  // ~0.35 Hz at 60fps — slow, calm breathing
+  // ── 2. ORGANIC MICRO-DRIFT ────────────────────────────────────
+  // Two random-walk noise oscillators at coprime update rates.
+  // Each frame: nudge velocity by tiny random amount, apply to value,
+  // then softly pull back toward zero so it never wanders far.
+  // Result: looks like real market microstructure, not a sine wave.
   const settled = Math.abs(chartVelocity) < 0.02;
-  const secsSince = (now - lastDataUpdate) / 1000;
-  const amp = chartCurrent > 0
-    ? Math.min(0.0004, 0.00005 + secsSince * 0.00002) * chartCurrent
-    : 0;
-  const drift = settled && chartCurrent > 0 ? Math.sin(breathPhase) * amp : 0;
+  let drift = 0;
+  if(settled && chartCurrent > 0){
+    // Max amplitude: 0.008% of equity — barely visible, just alive
+    const maxAmp = chartCurrent * 0.00008;
+
+    // Noise 1: faster jitter (updates every frame)
+    _v1 += (Math.random() - 0.5) * 0.18;   // random kick
+    _v1 *= 0.88;                             // friction
+    _n1 += _v1;
+    _n1 *= 0.97;                             // mean-reversion — pull toward 0
+
+    // Noise 2: slower drift (lower frequency component)
+    _v2 += (Math.random() - 0.5) * 0.06;
+    _v2 *= 0.94;
+    _n2 += _v2;
+    _n2 *= 0.992;
+
+    // Clamp both to [-1, 1] and combine
+    _n1 = Math.max(-1, Math.min(1, _n1));
+    _n2 = Math.max(-1, Math.min(1, _n2));
+    drift = (_n1 * 0.65 + _n2 * 0.35) * maxAmp;
+
+    // Suppress drift while actively gliding to new target
+    const glideFactor = Math.max(0, 1 - chartLineGlow * 3);
+    drift *= glideFactor;
+  } else {
+    // Reset noise state when not settled so it starts fresh each time
+    _n1 *= 0.9; _n2 *= 0.9; _v1 *= 0.5; _v2 *= 0.5;
+  }
   const displayVal = (chartCurrent || cap) + drift;
 
-  // ── 3. PUSH TO STREAM ─────────────────────────────────────────
+  // ── 3. STREAM: only track the live animated tip ──────────────
+  // We store ONE timed sample per 2-second poll interval.
+  // The rest of the line comes from eqHist (real server data).
+  // This prevents the chart from building fake micro-oscillations
+  // into the historical shape — only the live end animates.
   if(displayVal > 0){
-    chartStream.push({ t: now, v: displayVal });
-    if(chartStream.length > STREAM_CAP) chartStream.shift();
+    const lastPt = chartStream[chartStream.length-1];
+    // Only push if value changed meaningfully or enough time passed
+    if(!lastPt || Math.abs(displayVal - lastPt.v) > 0.5 || (now - lastPt.t) > 500){
+      chartStream.push({ t: now, v: displayVal });
+      if(chartStream.length > STREAM_CAP) chartStream.shift();
+    }
   }
 
   // ── 4. GLOW DECAY ─────────────────────────────────────────────
@@ -1374,7 +1417,10 @@ function renderChart(){
   const vals = visible.map(p=>p.v);
   const rawMin = Math.min(...vals, cap);
   const rawMax = Math.max(...vals, cap);
-  const padding = Math.max((rawMax-rawMin)*0.15, cap*0.002); // at least 0.2% of cap
+  // Generous padding: 30% of range or at least 0.5% of cap
+  // Prevents small moves from filling the whole chart height
+  const rangeRaw = rawMax - rawMin;
+  const padding = Math.max(rangeRaw * 0.30, cap * 0.005);
   const minV = rawMin - padding;
   const maxV = rawMax + padding;
   const range = maxV - minV || 1;
@@ -1473,7 +1519,8 @@ function renderChart(){
   const ey = pts[pts.length-1][1];
 
   // Outer pulse ring — slow idle breathe
-  const pulse = 0.3 + 0.3*Math.sin(breathPhase * 2.2);
+  // Dot pulse uses its own simple timer so it doesn't depend on breathPhase
+  const pulse = 0.3 + 0.3*Math.sin(now * 0.002);
   ctx.beginPath(); ctx.arc(ex, ey, 9, 0, Math.PI*2);
   ctx.strokeStyle = lineColor;
   ctx.lineWidth   = 1;
