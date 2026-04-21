@@ -254,12 +254,10 @@ async function loadRemoteConfig() {
             });
             log('sys', `✅ Live account restored: equity=$${liveEquity.toFixed(2)} dayPnl=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)}`);
           } else {
-            // Alpaca fetch failed — write safe defaults so sim values don't persist
+            // Alpaca fetch failed — do NOT write startingCapital as total_value
+            // Writing $100k when real equity is $94k causes the equity spike bug
+            // Just update non-financial fields so dashboard knows we're alive
             await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
-              total_value:     CONFIG.startingCapital,
-              day_pnl:         0,
-              total_wins:      0,
-              total_losses:    0,
               circuit_breaker: false,
               session:         getCurrentSession(),
               updated_at:      new Date().toISOString(),
@@ -1132,7 +1130,16 @@ async function syncPortfolio() {
         && new Date(t.time).toDateString() === new Date().toDateString())
         .reduce((a, t) => a + t.pnl, 0);
 
-  // Step 4: Always write — never skip
+  // Step 4: Validate before writing — reject spiky values
+  // If equity jumps >5% from last known good in one scan, it's a bad Alpaca read
+  if (realEquity > 0 && Math.abs(equityValue - realEquity) / realEquity > 0.05) {
+    log('warn', `syncPortfolio: equity spike rejected ($${equityValue.toFixed(2)} vs last $${realEquity.toFixed(2)}) — using last known`);
+    equityValue = realEquity; // use last known good value
+  }
+  // Never write starting capital as equity — that's always wrong in live mode
+  if (equityValue === CONFIG.startingCapital && realEquity > 0) {
+    equityValue = realEquity;
+  }
   await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
     cash:            +cashValue.toFixed(2),
     total_value:     +equityValue.toFixed(2),
@@ -1619,14 +1626,19 @@ async function syncPricesOnly() {
       realEquity = equity;
       if (!realDailyStartEquity && lastEquity > 0) realDailyStartEquity = lastEquity;
 
-      await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
-        cash:        +cash.toFixed(2),
-        total_value: +equity.toFixed(2),
-        day_pnl:     +dayPnl.toFixed(2),
-        updated_at:  new Date().toISOString(),
-      });
-
-      log('price', `Equity=$${equity.toFixed(2)} DayP&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)} Positions:${Object.keys(positions).length}`);
+      // Validate: reject if equity spikes >5% from last known (bad Alpaca read)
+      const _lastKnown = realEquity > 0 ? realEquity : CONFIG.startingCapital;
+      if (Math.abs(equity - _lastKnown) / _lastKnown > 0.05) {
+        log('warn', `syncPricesOnly: spike rejected ($${equity.toFixed(2)} vs $${_lastKnown.toFixed(2)}) — skipping write`);
+      } else {
+        await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+          cash:        +cash.toFixed(2),
+          total_value: +equity.toFixed(2),
+          day_pnl:     +dayPnl.toFixed(2),
+          updated_at:  new Date().toISOString(),
+        });
+        log('price', `Equity=$${equity.toFixed(2)} DayP&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)} Positions:${Object.keys(positions).length}`);
+      }
     }
 
   } catch (e) {
