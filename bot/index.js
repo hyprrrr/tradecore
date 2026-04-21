@@ -493,6 +493,13 @@ async function runAdaptiveTuning() {
 
   // ─── EMERGENCY MODE: win rate < 40% ───────────────────────────
   if (isEmergency) {
+    // Cooldown: only apply emergency corrections every 5 trades to prevent oscillation
+    const tradesSinceLastEmergency = (totalWins + totalLosses) - (runAdaptiveEngine._lastEmergencyAt || 0);
+    if (tradesSinceLastEmergency < 3) {
+      log(log_prefix, `⏸ Emergency skipped — cooldown (${tradesSinceLastEmergency}/3 trades since last)`);
+      return;
+    }
+    runAdaptiveEngine._lastEmergencyAt = totalWins + totalLosses;
     log(log_prefix, `🚨 EMERGENCY: EWMA win rate ${(effectiveWR*100).toFixed(0)}% — aggressive correction`);
 
     // 1. Drastically raise minimum confidence
@@ -752,7 +759,7 @@ async function runAdaptiveTuning() {
       max_position_pct:   +(CONFIG.maxPositionPct * 100).toFixed(2), // stored as percentage e.g. 15.0 = 15%
       atr_stop_mult:      CONFIG.atrStopMult,
       min_confidence:     CONFIG.minConfidence,
-      tp1_pct:            +(CONFIG.tp1Pct * 100).toFixed(1),
+      tp1_pct:            +(Math.max(0.008, Math.min(0.025, CONFIG.tp1Pct)) * 100).toFixed(1),
       tp2_pct:            +(CONFIG.tp2Pct * 100).toFixed(1),
       tp3_pct:            +(CONFIG.tp3Pct * 100).toFixed(1),
       break_even_at:      +(CONFIG.breakEvenAt * 100).toFixed(2),
@@ -3367,7 +3374,7 @@ function calcQty(symbol, price, bars, confidence = 70) {
     let atrVal = atr(bars, 14);
     // Minimum ATR floor: 0.1% of price — prevents insane qty on near-zero ATR stocks
     // e.g. NIO at $6.91 with ATR=0.01 → floor to $0.0069, capping qty to reasonable size
-    const atrFloor = price * 0.001;
+    const atrFloor = price * 0.0025; // min 0.25% — prevents insane qty on low-ATR bars
     atrVal = Math.max(atrVal, atrFloor);
     if (atrVal > 0) {
       // Risk at most 1% of starting capital per trade
@@ -3407,8 +3414,16 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   }
 
   // Don't enter if already in position in same direction
-  if (direction === 'long'  && (positions[sym]     || alpacaPositions.has(sym))) { log('warn', `${sym} already long`); return; }
-  if (direction === 'short' && (shortPositions[sym] || alpacaShorts.has(sym)))   { log('warn', `${sym} already short`); return; }
+  if (direction === 'long'  && (positions[sym] || alpacaPositions.has(sym))) {
+    const _k=sym+'L', _n=Date.now();
+    if(!dupWarnThrottle[_k]||_n-dupWarnThrottle[_k]>300000){dupWarnThrottle[_k]=_n;log('warn',`${sym} already long`);}
+    return;
+  }
+  if (direction === 'short' && (shortPositions[sym] || alpacaShorts.has(sym))) {
+    const _k=sym+'S', _n=Date.now();
+    if(!dupWarnThrottle[_k]||_n-dupWarnThrottle[_k]>300000){dupWarnThrottle[_k]=_n;log('warn',`${sym} already short`);}
+    return;
+  }
   if (direction === 'long'  && isCorrelated(sym)) return;
 
   // ── DOLLAR EXPOSURE LIMIT — never deploy more than 90% of starting capital ──
@@ -3647,9 +3662,11 @@ async function manageShort(sym, price, bars) {
   const shortAtrPct = bars && bars.length >= 14 ? atr(bars, 14) / price : 0.008;
   const shortScaledBE = Math.max(0.002, Math.min(0.010, shortAtrPct * 0.4));
   if (!pos.breakEvenSet && chg >= shortScaledBE) {
-    shortPositions[sym].stopPrice   = pos.entryPrice * 0.9999;
+    // For shorts: stopPrice must be ABOVE entry so it fires when price rises back up
+    // entryPrice * 1.0001 = just above entry = exit at scratch if price reverses
+    shortPositions[sym].stopPrice   = pos.entryPrice * 1.0001;
     shortPositions[sym].breakEvenSet = true;
-    log('risk', `🔒 ${sym} short BE @ $${pos.entryPrice.toFixed(2)} (BE=${(shortScaledBE*100).toFixed(2)}%)`);
+    log('risk', `🔒 ${sym} short BE @ $${pos.entryPrice.toFixed(2)} → SL now $${(pos.entryPrice*1.0001).toFixed(2)} (BE=${(shortScaledBE*100).toFixed(2)}%)`);
     await syncLog('sys', `🔒 Short BE: ${sym} @ $${pos.entryPrice.toFixed(2)}`);
   }
 
