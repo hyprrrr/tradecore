@@ -164,9 +164,9 @@ async function loadRemoteConfig() {
       // Safety clamp: 5-25% per position
       CONFIG.maxPositionPct = Math.max(0.05, Math.min(0.25, CONFIG.maxPositionPct));
     }
-    if (s.tp1_pct)          CONFIG.tp1Pct           = +s.tp1_pct / 100;
-    if (s.tp2_pct)          CONFIG.tp2Pct           = +s.tp2_pct / 100;
-    if (s.tp3_pct)          CONFIG.tp3Pct           = +s.tp3_pct / 100;
+    if (s.tp1_pct)          CONFIG.tp1Pct           = Math.max(0.012, Math.min(0.025, +s.tp1_pct / 100)); // min 1.2%
+    if (s.tp2_pct)          CONFIG.tp2Pct           = Math.max(0.025, Math.min(0.060, +s.tp2_pct / 100)); // min 2.5%
+    if (s.tp3_pct)          CONFIG.tp3Pct           = Math.max(0.040, Math.min(0.100, +s.tp3_pct / 100)); // min 4.0%
     if (s.break_even_at)    CONFIG.breakEvenAt      = +s.break_even_at / 100;
     if (s.trail_t2_at)      CONFIG.trailT2At        = +s.trail_t2_at / 100;
     if (s.trail_t3_at)      CONFIG.trailT3At        = +s.trail_t3_at / 100;
@@ -182,7 +182,7 @@ async function loadRemoteConfig() {
     if (s.fade_pullback)    CONFIG.fadePullback      = +s.fade_pullback / 100;
     if (s.hard_max_loss)    CONFIG.hardMaxLoss       = +s.hard_max_loss / 100;
     if (s.initial_stop_pct) CONFIG.initialStopPct    = +s.initial_stop_pct / 100;
-    if (s.atr_stop_mult)    CONFIG.atrStopMult       = Math.min(2.5, Math.max(1.5, +s.atr_stop_mult)); // clamp 1.5-2.5x
+    if (s.atr_stop_mult)    CONFIG.atrStopMult       = Math.min(2.0, Math.max(1.5, +s.atr_stop_mult)); // clamp 1.5-2.0x
     if (s.discord_webhook)  CONFIG.discordWebhook   = s.discord_webhook;
     if (s.trend_filter      !== undefined) CONFIG.trendFilter       = !!s.trend_filter;
     if (s.volume_filter     !== undefined) CONFIG.volumeFilter      = !!s.volume_filter;
@@ -757,9 +757,10 @@ async function runAdaptiveTuning() {
       max_position_pct:   +(CONFIG.maxPositionPct * 100).toFixed(2), // stored as percentage e.g. 15.0 = 15%
       atr_stop_mult:      CONFIG.atrStopMult,
       min_confidence:     CONFIG.minConfidence,
-      tp1_pct:            +(Math.max(0.008, Math.min(0.025, CONFIG.tp1Pct)) * 100).toFixed(1),
-      tp2_pct:            +(CONFIG.tp2Pct * 100).toFixed(1),
-      tp3_pct:            +(CONFIG.tp3Pct * 100).toFixed(1),
+      tp1_pct:            +(Math.max(0.012, Math.min(0.025, CONFIG.tp1Pct)) * 100).toFixed(1), // min 1.2%
+      tp2_pct:            +(Math.max(0.025, Math.min(0.060, CONFIG.tp2Pct)) * 100).toFixed(1), // min 2.5%
+      tp3_pct:            +(Math.max(0.040, Math.min(0.100, CONFIG.tp3Pct)) * 100).toFixed(1), // min 4.0%
+
       break_even_at:      +(CONFIG.breakEvenAt * 100).toFixed(2),
       trail_t2_at:        +(CONFIG.trailT2At * 100).toFixed(2),
       trail_t3_at:        +(CONFIG.trailT3At * 100).toFixed(2),
@@ -5692,15 +5693,28 @@ async function fetchBarsCached(symbol, timeframe, limit) {
 // Old: fetched symbols one-by-one (symbol 15 waited for symbols 1-14)
 // New: fetch all symbols simultaneously → scan time drops ~10x
 async function fetchAllBarsParallel(symbols) {
-  const results = await Promise.allSettled(
-    symbols.map(async sym => {
-      const [bars5m, bars15m] = await Promise.all([
-        fetchBarsCached(sym, '5Min',  60),
-        fetchBarsCached(sym, '15Min', 40),
-      ]);
-      return { sym, bars5m, bars15m };
-    })
-  );
+  // Stagger requests in batches of 3 to avoid rate limiting
+  // Alpaca free tier: 200 requests/min — 15 symbols × 2 timeframes = 30 requests
+  // Batching with 150ms delays keeps us well under the limit
+  const BATCH_SIZE = 3;
+  const results = [];
+  for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+    const batch = symbols.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.allSettled(
+      batch.map(async sym => {
+        const [bars5m, bars15m] = await Promise.all([
+          fetchBarsCached(sym, '5Min',  100),
+          fetchBarsCached(sym, '15Min', 40),
+        ]);
+        return { sym, bars5m, bars15m };
+      })
+    );
+    results.push(...batchResults);
+    // Small delay between batches to stay under rate limit
+    if (i + BATCH_SIZE < symbols.length) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
   return results
     .filter(r => r.status === 'fulfilled' && r.value.bars5m)
     .map(r => r.value);
@@ -6075,7 +6089,7 @@ setInterval(async () => {
   if (!isSimMode() && CONFIG.alpacaKey && Object.keys(positions).length + Object.keys(shortPositions).length > 0) {
     await syncPricesOnly();
   }
-}, 10000);
+}, 20000); // Every 20s (was 10s) — reduces Alpaca rate limit hits
 
 // ── OVERNIGHT GUARDIAN — runs every 60 seconds, completely independent of scan loop ──
 // If market is closed and we still have open positions, close them immediately.
