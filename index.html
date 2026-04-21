@@ -1246,146 +1246,182 @@ function setStatus(s){
 let chartCtx=null, chartRAF=null;
 let eqHist=[], stableEq=0, eqResetAt=0;
 
-// ── ANIMATED CHART STATE ──────────────────────────────────────────
-// chartDsp   = currently displayed value (animates toward chartTgt)
-// chartTgt   = target value from latest data
-// breathAmp  = idle breathing amplitude in dollars
-// lastUpdate = timestamp of last real data update
-// gliding    = true while actively animating toward new target
-let chartDsp=0, chartTgt=0;
-let breathPhase=0;        // drives the idle sine wave
-let lastDataUpdate=0;     // when we last got real equity data
-let glideVelocity=0;      // momentum for smooth glide
-let chartLineGlow=0;      // glow intensity — spikes on update then fades
+// ═══════════════════════════════════════════════════════════
+// EQUITY CHART — continuous scrolling time-series
+//
+// How it works:
+//   - chartStream[] is a dense ring buffer of {t, v} points
+//     built 60× per second. The line is always moving forward.
+//   - chartTarget = latest real equity from the server.
+//     chartCurrent glides toward it with spring physics.
+//   - Between real updates, chartCurrent drifts with a tiny
+//     sine wave so the line never looks frozen.
+//   - On a new data point, chartLineGlow spikes → glow flash.
+//   - The chart window is the last WINDOW_SECS of stream data,
+//     mapped left→right so newer data is always on the right.
+// ═══════════════════════════════════════════════════════════
+const WINDOW_SECS  = 120;   // seconds of history visible
+const STREAM_CAP   = 8000;  // max points in ring buffer
 
-function procEq(raw,cap){
-  if(!raw||raw<=0||raw>cap*3) return false;
-  const last=eqHist[eqHist.length-1];
+let chartTarget   = 0;      // real equity from server
+let chartCurrent  = 0;      // displayed value, glides toward target
+let chartVelocity = 0;      // spring momentum
+let chartStream   = [];     // [{t, v}] — continuous display stream
+let breathPhase   = 0;
+let lastDataUpdate= 0;
+let chartLineGlow = 0;      // 0-1, spikes on update, decays each frame
+
+function procEq(raw, cap){
+  if(!raw || raw<=0 || raw>cap*3) return false;
+  const last = eqHist[eqHist.length-1];
   if(!last){ eqHist.push(raw); stableEq=raw; return true; }
-  const relaxed=(Date.now()-eqResetAt)<20000;
-  const pctChange=Math.abs((raw-last)/last);
-  if(!relaxed && pctChange>0.02){
-    const pctFromStable=Math.abs((raw-stableEq)/stableEq);
-    if(pctFromStable>0.05) return false;
+  const relaxed = (Date.now()-eqResetAt) < 20000;
+  const pctChange = Math.abs((raw-last)/last);
+  if(!relaxed && pctChange > 0.02){
+    if(Math.abs((raw-stableEq)/stableEq) > 0.05) return false;
   }
-  if(Math.abs(raw-last)<0.50) return true;
-  eqHist.push(raw); if(eqHist.length>400) eqHist.shift(); stableEq=raw; return true;
+  if(Math.abs(raw-last) < 0.50) return true;
+  eqHist.push(raw); if(eqHist.length>400) eqHist.shift();
+  stableEq = raw; return true;
 }
 
 function startChart(){
   const cv=$('equityChart'); if(!cv||chartRAF) return;
-  chartCtx=cv.getContext('2d');
+  chartCtx = cv.getContext('2d');
   (function loop(){ renderChart(); chartRAF=requestAnimationFrame(loop); })();
 }
 
+// Called by poll() when new equity data arrives from Supabase
 function drawChart(){
   if(!chartRAF) startChart();
-  if(eqHist.length>0){
-    const newTgt=eqHist[eqHist.length-1];
-    if(newTgt!==chartTgt && chartTgt!==0){
-      // New data arrived — trigger glow flash
-      chartLineGlow=1.0;
-      lastDataUpdate=Date.now();
+  if(eqHist.length === 0) return;
+  const newTarget = eqHist[eqHist.length-1];
+  if(newTarget > 0 && newTarget !== chartTarget){
+    if(chartTarget !== 0){
+      chartLineGlow = 1.0;   // flash on new data
+      lastDataUpdate = Date.now();
     }
-    chartTgt=newTgt;
-    if(!chartDsp) chartDsp=chartTgt;
+    chartTarget = newTarget;
+    if(chartCurrent === 0) chartCurrent = chartTarget;
   }
 }
 
 function renderChart(){
-  const cv=$('equityChart'); if(!cv) return;
-  const W=cv.parentElement.offsetWidth, H=cv.parentElement.offsetHeight;
+  const cv=$('equityChart'); if(!cv||!chartCtx) return;
+  const W = cv.parentElement.offsetWidth;
+  const H = cv.parentElement.offsetHeight;
   if(W<=0||H<=0) return;
   if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; }
 
-  const now=Date.now();
-  const cap=getStartingCapital();
-  const hasData=eqHist.length>=2;
-  const ctx=chartCtx;
+  const now = Date.now();
+  const cap = getStartingCapital();
+  const ctx = chartCtx;
   ctx.clearRect(0,0,W,H);
 
-  // ── ANIMATE DISPLAY VALUE ──────────────────────────────────────
-  if(chartTgt && chartDsp){
-    const diff=chartTgt-chartDsp;
-    // Spring physics: fast approach + overshoot dampening
-    glideVelocity+= diff * 0.08;
-    glideVelocity *= 0.82;  // damping
-    chartDsp+=glideVelocity;
-    // Snap when close enough
-    if(Math.abs(diff)<0.01 && Math.abs(glideVelocity)<0.01){
-      chartDsp=chartTgt;
-      glideVelocity=0;
+  // ── 1. SPRING PHYSICS: glide chartCurrent → chartTarget ──────
+  if(chartTarget > 0 && chartCurrent > 0){
+    const diff = chartTarget - chartCurrent;
+    chartVelocity += diff * 0.06;   // spring force
+    chartVelocity *= 0.80;          // damping — reduce overshoot
+    chartCurrent  += chartVelocity;
+    if(Math.abs(diff)<0.005 && Math.abs(chartVelocity)<0.005){
+      chartCurrent  = chartTarget;
+      chartVelocity = 0;
     }
   }
 
-  // ── IDLE BREATHING ────────────────────────────────────────────
-  // When display value has caught up to target, add a subtle sine oscillation
-  // Makes the line feel alive even when no new data is arriving
-  breathPhase+= 0.008; // ~0.5 cycles per second at 60fps
-  const isIdle=Math.abs(chartDsp-chartTgt)<0.5 && Math.abs(glideVelocity)<0.05;
-  // Amplitude: 0.02% of equity for subtle movement, stronger when no data for a while
-  const timeSinceUpdate=(now-lastDataUpdate)/1000;
-  const breathAmp= hasData
-    ? Math.min(0.0003, 0.0001 + timeSinceUpdate*0.00002) * (chartDsp||cap)
+  // ── 2. IDLE DRIFT: tiny sine wave when settled ────────────────
+  // Amplitude grows slowly the longer since last update (max 0.04%)
+  breathPhase += 0.006;  // ~0.35 Hz at 60fps — slow, calm breathing
+  const settled = Math.abs(chartVelocity) < 0.02;
+  const secsSince = (now - lastDataUpdate) / 1000;
+  const amp = chartCurrent > 0
+    ? Math.min(0.0004, 0.00005 + secsSince * 0.00002) * chartCurrent
     : 0;
-  const breathOffset= isIdle ? Math.sin(breathPhase) * breathAmp : 0;
-  const displayVal=(chartDsp||cap) + breathOffset;
+  const drift = settled && chartCurrent > 0 ? Math.sin(breathPhase) * amp : 0;
+  const displayVal = (chartCurrent || cap) + drift;
 
-  // ── GLOW DECAY ────────────────────────────────────────────────
-  chartLineGlow=Math.max(0, chartLineGlow-0.025);
+  // ── 3. PUSH TO STREAM ─────────────────────────────────────────
+  if(displayVal > 0){
+    chartStream.push({ t: now, v: displayVal });
+    if(chartStream.length > STREAM_CAP) chartStream.shift();
+  }
 
-  const empty=$('chartEmpty');
-  if(empty) empty.style.display=hasData?'none':'flex';
+  // ── 4. GLOW DECAY ─────────────────────────────────────────────
+  chartLineGlow = Math.max(0, chartLineGlow - 0.018); // ~55 frame fade
 
-  const P={t:62,b:24,l:52,r:20};
-  const cH=H-P.t-P.b, cW=W-P.l-P.r;
+  // ── 5. EMPTY STATE ────────────────────────────────────────────
+  const empty = $('chartEmpty');
+  if(chartStream.length < 10){
+    if(empty) empty.style.display='flex';
+    return;
+  }
+  if(empty) empty.style.display='none';
 
-  // Build display data — replace last point with animated display value
-  const data=hasData?[...eqHist]:null;
-  if(data) data[data.length-1]=displayVal;
+  // ── 6. SLICE VISIBLE WINDOW ───────────────────────────────────
+  const windowMs = WINDOW_SECS * 1000;
+  const tEnd   = now;
+  const tStart = tEnd - windowMs;
+  const visible = chartStream.filter(p => p.t >= tStart);
+  if(visible.length < 2) return;
 
-  const minV=data?Math.min(...data,cap)*0.997:cap*0.99;
-  const maxV=data?Math.max(...data,cap)*1.003:cap*1.01;
-  const range=maxV-minV||1;
-  const tx=i=>P.l+(i/Math.max((data?.length||1)-1,1))*cW;
-  const ty=v=>P.t+cH-((v-minV)/range)*cH;
-  const baseY=ty(cap);
+  // ── 7. LAYOUT ─────────────────────────────────────────────────
+  const P = { t:56, b:22, l:50, r:16 };
+  const cW = W - P.l - P.r;
+  const cH = H - P.t - P.b;
 
-  // ── GRID ──────────────────────────────────────────────────────
-  ctx.font='9px JetBrains Mono,monospace';
-  for(let i=0;i<=4;i++){
-    const v=minV+(range/4)*i;
-    const y=P.t+cH-(cH/4)*i;
+  // Value range — padding so line isn't clipped to edges
+  const vals = visible.map(p=>p.v);
+  const rawMin = Math.min(...vals, cap);
+  const rawMax = Math.max(...vals, cap);
+  const padding = Math.max((rawMax-rawMin)*0.15, cap*0.002); // at least 0.2% of cap
+  const minV = rawMin - padding;
+  const maxV = rawMax + padding;
+  const range = maxV - minV || 1;
+
+  // Map time→x, value→y
+  const tx = t  => P.l + ((t  - tStart) / windowMs) * cW;
+  const ty = v  => P.t + cH - ((v - minV) / range) * cH;
+  const baseY = ty(cap);
+
+  // ── 8. GRID ───────────────────────────────────────────────────
+  ctx.font = '9px JetBrains Mono,monospace';
+  ctx.textAlign = 'right';
+  const steps = 4;
+  for(let i=0; i<=steps; i++){
+    const v = minV + (range/steps)*i;
+    const y = ty(v);
     ctx.setLineDash([2,6]);
-    ctx.strokeStyle='rgba(255,255,255,0.04)';
-    ctx.lineWidth=1;
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(P.l,y); ctx.lineTo(W-P.r,y); ctx.stroke();
-    ctx.fillStyle='rgba(255,255,255,0.18)'; ctx.textAlign='right';
-    ctx.fillText('$'+Math.round(v/1000)+'k', P.l-6, y+3);
+    ctx.fillStyle = 'rgba(255,255,255,0.20)';
+    ctx.fillText('$'+Math.round(v/1000)+'k', P.l-5, y+3);
   }
   ctx.setLineDash([]);
 
-  // Baseline
-  ctx.strokeStyle='rgba(255,255,255,0.07)'; ctx.lineWidth=1; ctx.setLineDash([4,8]);
-  ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke();
-  ctx.setLineDash([]);
+  // Baseline (starting capital)
+  if(baseY >= P.t && baseY <= P.t+cH){
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4,8]);
+    ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke();
+    ctx.setLineDash([]);
+  }
 
-  if(!data) return;
+  // ── 9. BUILD PIXEL PATH ───────────────────────────────────────
+  // Map stream points → pixel coords
+  const pts = visible.map(p => [tx(p.t), ty(p.v)]);
 
-  const last=displayVal, isUp=last>=cap;
-  const colorUp='#00d4aa', colorDn='#ff4757';
-  const lineColor=isUp?colorUp:colorDn;
-  // Glow color brightens on update
-  const glowAlpha=0.4+chartLineGlow*0.6;
-  const glowBlur=6+chartLineGlow*18;
-
-  const pts=data.map((v,i)=>[tx(i),ty(v)]);
-
-  function catmull(pts){
-    if(pts.length<2) return;
-    ctx.moveTo(pts[0][0],pts[0][1]);
-    for(let i=0;i<pts.length-1;i++){
-      const p0=pts[Math.max(i-1,0)],p1=pts[i],p2=pts[i+1],p3=pts[Math.min(i+2,pts.length-1)];
+  // Catmull-Rom spline for smooth curves through all points
+  function drawSpline(pts){
+    if(pts.length < 2) return;
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for(let i=0; i<pts.length-1; i++){
+      const p0 = pts[Math.max(i-1,0)];
+      const p1 = pts[i];
+      const p2 = pts[i+1];
+      const p3 = pts[Math.min(i+2, pts.length-1)];
       ctx.bezierCurveTo(
         p1[0]+(p2[0]-p0[0])/6, p1[1]+(p2[1]-p0[1])/6,
         p2[0]-(p3[0]-p1[0])/6, p2[1]-(p3[1]-p1[1])/6,
@@ -1394,59 +1430,82 @@ function renderChart(){
     }
   }
 
-  // Area fill — slightly breathes opacity
-  const fillAlpha=isUp?(0.12+breathOffset/breathAmp*0.02||0.12):(0.10+breathOffset/breathAmp*0.015||0.10);
-  const grad=ctx.createLinearGradient(0,P.t,0,H-P.b);
-  grad.addColorStop(0, isUp?`rgba(0,212,170,${Math.max(0.08,fillAlpha)})`:`rgba(255,71,87,${Math.max(0.07,fillAlpha)})`);
-  grad.addColorStop(0.65, isUp?'rgba(0,212,170,0.03)':'rgba(255,71,87,0.03)');
-  grad.addColorStop(1,'rgba(0,0,0,0)');
+  // ── 10. COLORS ────────────────────────────────────────────────
+  const isUp = displayVal >= cap;
+  const cGreen = '#00d4aa', cRed = '#ff4757';
+  const lineColor = isUp ? cGreen : cRed;
+  const glowBlur  = 5 + chartLineGlow * 20;
+
+  // ── 11. AREA FILL ─────────────────────────────────────────────
+  const grad = ctx.createLinearGradient(0, P.t, 0, H-P.b);
+  if(isUp){
+    grad.addColorStop(0,   'rgba(0,212,170,0.16)');
+    grad.addColorStop(0.6, 'rgba(0,212,170,0.04)');
+    grad.addColorStop(1,   'rgba(0,212,170,0)');
+  } else {
+    grad.addColorStop(0,   'rgba(255,71,87,0.13)');
+    grad.addColorStop(0.6, 'rgba(255,71,87,0.03)');
+    grad.addColorStop(1,   'rgba(255,71,87,0)');
+  }
   ctx.beginPath();
-  ctx.moveTo(pts[0][0],H-P.b);
-  ctx.lineTo(pts[0][0],pts[0][1]);
-  catmull(pts);
-  ctx.lineTo(pts[pts.length-1][0],H-P.b);
+  ctx.moveTo(pts[0][0], H-P.b);
+  ctx.lineTo(pts[0][0], pts[0][1]);
+  drawSpline(pts);
+  ctx.lineTo(pts[pts.length-1][0], H-P.b);
   ctx.closePath();
-  ctx.fillStyle=grad; ctx.fill();
+  ctx.fillStyle = grad;
+  ctx.fill();
 
-  // Line — glows on update
-  ctx.beginPath(); catmull(pts);
-  ctx.strokeStyle=lineColor;
-  ctx.lineWidth=1.5+chartLineGlow*0.5;
-  ctx.lineJoin='round'; ctx.lineCap='round';
-  ctx.shadowColor=lineColor;
-  ctx.shadowBlur=glowBlur;
-  ctx.globalAlpha=glowAlpha;
+  // ── 12. LINE ──────────────────────────────────────────────────
+  ctx.beginPath();
+  drawSpline(pts);
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth   = 1.5;
+  ctx.lineJoin    = 'round';
+  ctx.lineCap     = 'round';
+  ctx.shadowColor = lineColor;
+  ctx.shadowBlur  = glowBlur;
   ctx.stroke();
-  ctx.globalAlpha=1; ctx.shadowBlur=0;
+  ctx.shadowBlur  = 0;
 
-  // End dot — pulses continuously + extra pulse on update
-  const ex=pts[pts.length-1][0], ey=pts[pts.length-1][1];
-  const idlePulse=0.35+0.35*Math.sin(breathPhase*2.5);
-  const updateFlash=chartLineGlow*0.65;
-  const dotGlow=Math.max(idlePulse,updateFlash);
-  const dotR=3+chartLineGlow*2;
+  // ── 13. LIVE END DOT ──────────────────────────────────────────
+  const ex = pts[pts.length-1][0];
+  const ey = pts[pts.length-1][1];
 
-  // Outer ring — idle breathe
-  ctx.beginPath(); ctx.arc(ex,ey,dotR+5,0,Math.PI*2);
-  ctx.strokeStyle=lineColor; ctx.lineWidth=1;
-  ctx.shadowColor=lineColor; ctx.shadowBlur=10;
-  ctx.globalAlpha=dotGlow*0.3; ctx.stroke();
-  ctx.globalAlpha=1; ctx.shadowBlur=0;
+  // Outer pulse ring — slow idle breathe
+  const pulse = 0.3 + 0.3*Math.sin(breathPhase * 2.2);
+  ctx.beginPath(); ctx.arc(ex, ey, 9, 0, Math.PI*2);
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth   = 1;
+  ctx.shadowColor = lineColor;
+  ctx.shadowBlur  = 8;
+  ctx.globalAlpha = pulse * 0.25 + chartLineGlow * 0.4;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur  = 0;
 
-  // Inner dot
-  ctx.beginPath(); ctx.arc(ex,ey,dotR,0,Math.PI*2);
-  ctx.fillStyle=lineColor;
-  ctx.shadowColor=lineColor; ctx.shadowBlur=12+chartLineGlow*10;
-  ctx.fill(); ctx.shadowBlur=0;
+  // Inner dot — solid, expands slightly on update
+  const dotR = 3.5 + chartLineGlow * 2;
+  ctx.beginPath(); ctx.arc(ex, ey, dotR, 0, Math.PI*2);
+  ctx.fillStyle   = lineColor;
+  ctx.shadowColor = lineColor;
+  ctx.shadowBlur  = 10 + chartLineGlow*12;
+  ctx.fill();
+  ctx.shadowBlur  = 0;
 
-  // Price label
-  const diff=last-cap, pct=(diff/cap*100).toFixed(2);
-  ctx.font=`${600+Math.round(chartLineGlow*100)} 10px JetBrains Mono,monospace`;
-  ctx.fillStyle=lineColor;
-  ctx.textAlign='right';
-  ctx.shadowColor=lineColor; ctx.shadowBlur=3+chartLineGlow*6;
-  ctx.fillText(`$${Math.round(last).toLocaleString()} (${diff>=0?'+':''}${pct}%)`, Math.min(ex+2,W-P.r), ey-12);
-  ctx.shadowBlur=0;
+  // ── 14. PRICE LABEL ───────────────────────────────────────────
+  const diff = displayVal - cap;
+  const pct  = (diff/cap*100).toFixed(2);
+  const label = `$${Math.round(displayVal).toLocaleString()} (${diff>=0?'+':''}${pct}%)`;
+  ctx.font        = 'bold 10px JetBrains Mono,monospace';
+  ctx.fillStyle   = lineColor;
+  ctx.textAlign   = 'right';
+  ctx.shadowColor = lineColor;
+  ctx.shadowBlur  = 3 + chartLineGlow*5;
+  const labelX = Math.min(ex+2, W-P.r-2);
+  const labelY = Math.max(ey-14, P.t+12);
+  ctx.fillText(label, labelX, labelY);
+  ctx.shadowBlur = 0;
 }
 
 // ═══════════════════════════════════════
@@ -1484,13 +1543,14 @@ async function poll(){
   // Always accept the value if eqHist is empty OR if it's reasonable
   // Never show blank chart — seed immediately from whatever we have
   if(eqHist.length===0 && raw>0) {
-    eqHist.push(raw); stableEq=raw; chartTgt=raw; chartDsp=raw;
+    eqHist.push(raw); stableEq=raw;
+    chartTarget=raw; chartCurrent=raw; chartVelocity=0; chartStream=[];
   } else if(raw>0) {
     procEq(raw, cap);
   }
   // If still empty after procEq rejected it, force seed anyway
   if(eqHist.length===0 && raw>0) {
-    eqHist.push(raw); stableEq=raw; chartTgt=raw; chartDsp=raw;
+    eqHist.push(raw); stableEq=raw; chartTarget=raw; chartCurrent=raw; chartVelocity=0; chartStream=[];
   }
   const eq = stableEq || raw || cap;
   const diff=eq-cap, dayPnl=+p.day_pnl||0;
@@ -1797,7 +1857,7 @@ function onModeChange(){
   const upd=(id,on,cls)=>{ const e=$(id); if(!e) return; e.className='mode-chip'+(on?' '+cls:''); };
   upd('swingChip',sw,'on'); upd('scalpChip',sc,'on'); upd('shortsChip',sh,'on-red'); upd('recovChip',rc,'on'); upd('simChip',sim,'on-blue');
   if(!sim){ eqHist=[]; stableEq=0; eqResetAt=Date.now(); let fp=0; const fi=setInterval(async()=>{ await poll(); if(++fp>=15) clearInterval(fi); },1000); }
-  else{ eqHist=[]; stableEq=0; eqResetAt=Date.now(); }
+  else{ eqHist=[]; stableEq=0; eqResetAt=Date.now(); chartTarget=0; chartCurrent=0; chartVelocity=0; chartStream=[]; }
   saveSettings().catch(()=>{});
 }
 
@@ -1906,6 +1966,9 @@ async function exportDiagnostic() {
       equity_history_length: eqHist.length,
       equity_history_last10: eqHist.slice(-10),
       stable_equity: stableEq,
+      chart_current: chartCurrent,
+      chart_target: chartTarget,
+      chart_stream_len: chartStream.length,
       poll_count: pollN,
       sim_mode: $('simEnabled')?.checked,
       last_log_ts: lastLogTs,
