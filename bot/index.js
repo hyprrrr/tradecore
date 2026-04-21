@@ -158,11 +158,11 @@ async function loadRemoteConfig() {
     if (s.max_positions)    CONFIG.maxOpenPositions = +s.max_positions;
     if (s.max_position_pct) {
       const raw = +s.max_position_pct;
-      // If value > 1 it's a percentage (e.g. 15 means 15%) — divide by 100
-      // If value <= 1 it's already a decimal (e.g. 0.15) — use as-is
-      CONFIG.maxPositionPct = raw > 1 ? raw / 100 : raw;
-      // Safety clamp: never less than 5% or more than 30% per position
-      CONFIG.maxPositionPct = Math.max(0.05, Math.min(0.30, CONFIG.maxPositionPct));
+      // DB always stores as percentage integer (e.g. 15 = 15%, 3 = 3%)
+      // Always divide by 100 to get decimal for CONFIG
+      CONFIG.maxPositionPct = raw / 100;
+      // Safety clamp: 5-25% per position
+      CONFIG.maxPositionPct = Math.max(0.05, Math.min(0.25, CONFIG.maxPositionPct));
     }
     if (s.tp1_pct)          CONFIG.tp1Pct           = +s.tp1_pct / 100;
     if (s.tp2_pct)          CONFIG.tp2Pct           = +s.tp2_pct / 100;
@@ -749,7 +749,7 @@ async function runAdaptiveTuning() {
     await sbFetch('tc_settings?id=eq.1', 'PATCH', {
       rsi_oversold:       CONFIG.rsiOversold,
       rsi_overbought:     CONFIG.rsiOverbought,
-      max_position_pct:   +(CONFIG.maxPositionPct * 100).toFixed(1),
+      max_position_pct:   +(CONFIG.maxPositionPct * 100).toFixed(2), // stored as percentage e.g. 15.0 = 15%
       atr_stop_mult:      CONFIG.atrStopMult,
       min_confidence:     CONFIG.minConfidence,
       tp1_pct:            +(CONFIG.tp1Pct * 100).toFixed(1),
@@ -1059,6 +1059,8 @@ async function syncPortfolio() {
       total_wins: totalWins, total_losses: totalLosses, circuit_breaker: circuitBreakerOn,
       last_scan: new Date().toISOString(), session: getCurrentSession(), updated_at: new Date().toISOString(),
     });
+    // Log equity event in sim too for diagnostics
+    logEquityEvent(equity, portfolio, 'sim_syncPortfolio', { dayPnl, barPnl: dayPnl });
     // Sim never writes to tc_equity — equity chart only shows real account history
     return;
   }
@@ -3362,7 +3364,11 @@ function calcQty(symbol, price, bars, confidence = 70) {
   if (maxShares < 1) return 0;
 
   if (bars && bars.length >= 14) {
-    const atrVal = atr(bars, 14);
+    let atrVal = atr(bars, 14);
+    // Minimum ATR floor: 0.1% of price — prevents insane qty on near-zero ATR stocks
+    // e.g. NIO at $6.91 with ATR=0.01 → floor to $0.0069, capping qty to reasonable size
+    const atrFloor = price * 0.001;
+    atrVal = Math.max(atrVal, atrFloor);
     if (atrVal > 0) {
       // Risk at most 1% of starting capital per trade
       const riskShares = Math.floor((baseCap * 0.01) / atrVal);
@@ -3825,6 +3831,7 @@ async function exitPosition(sym, price, reason) {
 // ═══════════════════════════════════════════════════════════════════
 
 let recoveryState = null; // { sym, targetPnl, lossPrice, startTime, attempts }
+const posLogThrottle = {}; // sym -> last log timestamp, prevents log spam
 
 function isInRecovery() { return !!recoveryState && CONFIG.recoveryMode; }
 
@@ -4309,7 +4316,7 @@ async function managePosition(sym, price, bars) {
   // This prevents false stop-loss triggers from stale bar prices immediately after entry
   const ageSecs = (Date.now() - new Date(pos.entryTime).getTime()) / 1000;
   if (ageSecs < 30) {
-    log('pos', `${sym} entry ${ageSecs.toFixed(0)}s ago — waiting for first real price tick`);
+    if (ageSecs < 5 || ageSecs % 15 < 3) log('pos', `${sym} entry ${ageSecs.toFixed(0)}s — waiting for price tick`);
     return;
   }
 
@@ -4520,7 +4527,12 @@ async function managePosition(sym, price, bars) {
   // Log status with actual effective TP values so they're visible in bot log
   const tpNext    = !pos.tp1Hit ? `TP1@+${(effectiveTP1*100).toFixed(2)}%` : !pos.tp2Hit ? `TP2@+${(effectiveTP2*100).toFixed(2)}%` : `TP3@+${(effectiveTP3*100).toFixed(2)}%`;
   const stopDist  = ((price - pos.stopPrice) / price * 100).toFixed(2);
-  log('pos', `${sym} ${chg>=0?'+':''}${(chg*100).toFixed(2)}% | SL=$${pos.stopPrice.toFixed(2)}(${stopDist}% away) | ${tpNext} | BE:${pos.breakEvenSet?'✅':'❌'} TP1:${pos.tp1Hit?'✅':'❌'} TP2:${pos.tp2Hit?'✅':'❌'}`);
+  // Log position status max once per 60s to prevent log spam
+  const _now = Date.now();
+  if (!posLogThrottle[sym] || _now - posLogThrottle[sym] > 60000) {
+    posLogThrottle[sym] = _now;
+    log('pos', `${sym} ${chg>=0?'+':''}${(chg*100).toFixed(2)}% | SL=$${pos.stopPrice.toFixed(2)}(${stopDist}% away) | ${tpNext} | BE:${pos.breakEvenSet?'✅':'❌'} TP1:${pos.tp1Hit?'✅':'❌'} TP2:${pos.tp2Hit?'✅':'❌'}`);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -4612,7 +4624,10 @@ async function runScan() {
         await managePosition(sym, managedPrice, liveBars);
         if (positions[sym]) {
           const pct = ((managedPrice - positions[sym].entryPrice) / positions[sym].entryPrice * 100).toFixed(2);
-          log('pos', `LONG ${positions[sym].qtyRemaining||positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${managedPrice.toFixed(2)} (${pct}%) ${sessionLabel}`);
+          if (!posLogThrottle[sym+'_scan'] || Date.now()-posLogThrottle[sym+'_scan']>120000) {
+            posLogThrottle[sym+'_scan']=Date.now();
+            log('pos', `LONG ${positions[sym].qtyRemaining||positions[sym].qty}x ${sym} @ $${positions[sym].entryPrice.toFixed(2)} → $${managedPrice.toFixed(2)} (${pct}%) ${sessionLabel}`);
+          }
         }
         continue;
       }
