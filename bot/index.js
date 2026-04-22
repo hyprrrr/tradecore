@@ -5921,9 +5921,18 @@ async function placeSmartOrder(symbol, qty, side, isScalp = false) {
 // Fetch all bar data on startup so the first scan fires immediately
 // with full data instead of waiting for serial fetches.
 async function prewarmData() {
-  log('sys', `Pre-warming bar cache for ${CONFIG.symbols.length} symbols…`);
+  log('sys', `Pre-warming bar cache for ${CONFIG.symbols.length} symbols (batched to avoid rate limits)…`);
   const t = Date.now();
-  await fetchAllBarsParallel(CONFIG.symbols);
+  // Use small batches with delays during startup to avoid hitting Alpaca rate limits
+  // Cold cache = all symbols fetch simultaneously = rate limit burst
+  const STARTUP_BATCH = 2;
+  for (let i = 0; i < CONFIG.symbols.length; i += STARTUP_BATCH) {
+    const batch = CONFIG.symbols.slice(i, i + STARTUP_BATCH);
+    await fetchAllBarsParallel(batch);
+    if (i + STARTUP_BATCH < CONFIG.symbols.length) {
+      await new Promise(r => setTimeout(r, 300)); // 300ms between startup batches
+    }
+  }
   log('sys', `Bar cache ready in ${Date.now() - t}ms — first scan will fire immediately`);
 }
 
