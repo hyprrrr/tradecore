@@ -771,6 +771,8 @@ async function runAdaptiveTuning() {
       fade_min_profit:    +(CONFIG.fadeMinProfit * 100).toFixed(2),
       fade_pullback:      +(CONFIG.fadePullback * 100).toFixed(2),
       hard_max_loss:      +(CONFIG.hardMaxLoss * 100).toFixed(2),
+      scalp_mode:         CONFIG.scalpMode,     // preserve — don't let adapt turn off scalp
+      shorts_enabled:     CONFIG.shortsEnabled,  // preserve — don't let adapt change shorts
       updated_at:         new Date().toISOString(),
     });
     await syncLog('adapt', `🧠 Adapted | ${summary} | ${JSON.stringify(changes)}`);
@@ -2762,7 +2764,7 @@ function signalSMC(sym, bars5m, bars15m) {
   if (direction==='buy'  && trapsSMC.sellerTrapScore > 0) { score += trapsSMC.sellerTrapScore; reasons.push(`🪤 Trapped sellers = support ✅`); }
   if (direction==='sell' && trapsSMC.buyerTrapScore  > 0) { score += trapsSMC.buyerTrapScore;  reasons.push(`🪤 Trapped buyers = resistance ✅`); }
 
-  if (score < 6) return { signal:'HOLD', confidence:0, score, reasons };
+  if (score < 6) return { signal:'HOLD', confidence:0, score, reasons, rsi: r };
   const conf = Math.min(95, 50 + score*5);
   return { signal:direction==='buy'?'BUY':'SELL', confidence:conf, score, reasons, rsi:r, atr:atr(bars5m,14) };
 }
@@ -2997,7 +2999,7 @@ function signalWyckoff(sym, bars5m, bars15m) {
   // Volume test — last bar high volume = sign of strength/weakness
   if (lastVol > avgVol * 1.5) { score+=1; reasons.push(`High volume ${(lastVol/avgVol).toFixed(1)}x ✅`); }
 
-  if (score < 6) return { signal:'HOLD', confidence:0, score, reasons };
+  if (score < 6) return { signal:'HOLD', confidence:0, score, reasons, rsi: r };
   const conf = Math.min(95, 40 + score*5);
   return { signal:direction==='buy'?'BUY':'SELL', confidence:conf, score, reasons, rsi:r, atr:atr(bars5m,14) };
 }
@@ -3049,23 +3051,47 @@ function generateSignal(sym, bars5m, bars15m) {
   let direction   = null;
 
   // ── GATE 1: RSI must be in meaningful territory ──
-  // Neutral RSI (40-60) = no edge. We only trade extremes.
+  // Primary mode: mean-reversion at RSI extremes
+  // Momentum mode: activates on trending days when RSI stays 45-65
   const r = rsi(c5, CONFIG.rsiPeriod);
   let rsiScore = 0;
-  if      (r < CONFIG.rsiOversold)   { rsiScore = 2; direction = 'buy';  reasons.push(`RSI oversold ${r.toFixed(1)} ✅`); }
-  else if (r > CONFIG.rsiOverbought) {
-    // Shorts disabled — overbought RSI can't generate a trade, skip immediately
-    if (!CONFIG.shortsEnabled) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI overbought (${r.toFixed(1)}) but shorts disabled`], rsi: r };
-    rsiScore = 2; direction = 'sell'; reasons.push(`RSI overbought ${r.toFixed(1)} ✅`);
-  }
-  else if (r < 38)                   { rsiScore = 1; direction = 'buy';  reasons.push(`RSI leaning oversold ${r.toFixed(1)}`); }
-  else if (r > 62)                   {
-    // Leaning overbought — skip if shorts disabled
-    if (!CONFIG.shortsEnabled) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI leaning overbought (${r.toFixed(1)}) but shorts disabled`], rsi: r };
-    rsiScore = 1; direction = 'sell'; reasons.push(`RSI leaning overbought ${r.toFixed(1)}`);
-  }
-  else {
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no edge`], rsi: r };
+
+  // Detect if this is a trending day vs mean-reversion day
+  const _e8  = ema(c5, 8);
+  const _e21 = ema(c5, 21);
+  const _e50 = ema(c5, Math.min(50, c5.length));
+  const emaBullStack = price > _e8 && _e8 > _e21 && _e21 > _e50;
+  const emaBearStack = price < _e8 && _e8 < _e21 && _e21 < _e50;
+  const _macdLine  = _e8 - _e21;
+  const _prevMacd  = ema(c5.slice(0,-1), 8) - ema(c5.slice(0,-1), 21);
+  const macdRising  = _macdLine > _prevMacd && _macdLine > 0;
+  const macdFalling = _macdLine < _prevMacd && _macdLine < 0;
+
+  if (r < CONFIG.rsiOversold) {
+    rsiScore = 2; direction = 'buy';
+    reasons.push(`RSI oversold ${r.toFixed(1)} ✅`);
+  } else if (r > CONFIG.rsiOverbought) {
+    if (!CONFIG.shortsEnabled) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi: r };
+    rsiScore = 2; direction = 'sell';
+    reasons.push(`RSI overbought ${r.toFixed(1)} ✅`);
+  } else if (r < 38) {
+    rsiScore = 1; direction = 'buy';
+    reasons.push(`RSI leaning oversold ${r.toFixed(1)}`);
+  } else if (r > 62) {
+    if (!CONFIG.shortsEnabled) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI leaning overbought (${r.toFixed(1)}) — shorts disabled`], rsi: r };
+    rsiScore = 1; direction = 'sell';
+    reasons.push(`RSI leaning overbought ${r.toFixed(1)}`);
+  } else if (r >= 45 && r <= 65 && emaBullStack && macdRising) {
+    // ── MOMENTUM MODE: trending day, RSI healthy, EMAs stacked bullish ──
+    // Don't wait for oversold — ride the trend while structure holds
+    rsiScore = 1; direction = 'buy';
+    reasons.push(`Momentum mode: RSI ${r.toFixed(1)} + EMA bull stack + MACD rising ✅`);
+  } else if (r >= 35 && r <= 55 && emaBearStack && macdFalling && CONFIG.shortsEnabled) {
+    // Momentum short: trending down day
+    rsiScore = 1; direction = 'sell';
+    reasons.push(`Momentum mode: RSI ${r.toFixed(1)} + EMA bear stack + MACD falling ✅`);
+  } else {
+    return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no trend or extreme`], rsi: r };
   }
   passedGates++;
 
@@ -4518,7 +4544,7 @@ async function managePosition(sym, price, bars) {
   // ── PRE-TP1 TRAILING: protect gains between BE and TP1 ──────────
   // Once up 0.8%+ and break-even set, trail 1.2× ATR below high water
   // This locks partial profits before TP1 fires
-  if (pos.breakEvenSet && !pos.tp1Hit && chg >= 0.008) {
+  if (pos.breakEvenSet && !pos.tp1Hit && chg >= 0.005) { // trail from 0.5% (was 0.8%)
     const preTrail = pos.highWater * (1 - Math.max(posAtrPct * 1.2, 0.004));
     if (preTrail > positions[sym].stopPrice) {
       positions[sym].stopPrice = preTrail;
@@ -5450,10 +5476,10 @@ async function scalpPositionMonitor() {
 
   try {
     for (const [sym, pos] of Object.entries(scalpPositions)) {
-      // CRITICAL: skip first 3 seconds after entry
+      // CRITICAL: skip first 5 seconds after entry (increased from 3)
       // Stale bar prices from before entry can immediately trigger stop loss
       const ageSecs = (Date.now() - new Date(pos.entryTime).getTime()) / 1000;
-      if (ageSecs < 3) continue;
+      if (ageSecs < 5) continue;
 
       // CRITICAL: Always use LIVE price for scalp decisions
       // NEVER use priceHistory5m — it's the 5m bar close which can be 5 minutes stale
