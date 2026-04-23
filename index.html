@@ -1309,13 +1309,18 @@ function procEq(raw, cap){
   stableEq = raw; return true;
 }
 
+let chartMouseX = null;
 function startChart(){
   const cv=$('equityChart'); if(!cv||chartRAF) return;
   chartCtx = cv.getContext('2d');
-  // Load historical equity on startup so chart has full session history
   loadEquityHistory();
+  // Mouse tracking for hover tooltip
+  cv.addEventListener('mousemove', e=>{
+    const r=cv.getBoundingClientRect();
+    chartMouseX = (e.clientX-r.left)*(cv.width/r.width);
+  });
+  cv.addEventListener('mouseleave', ()=>{ chartMouseX=null; });
   (function loop(){
-    // Skip rendering when tab is hidden — prevents stale stream buildup
     if(!document.hidden) renderChart();
     chartRAF=requestAnimationFrame(loop);
   })();
@@ -1346,8 +1351,7 @@ document.addEventListener('visibilitychange', () => {
       // Empty stream — reload history from server
       loadEquityHistory();
     }
-    // Reset animation noise only (not the stream)
-    _n1=0; _n2=0; _v1=0; _v2=0;
+    // Reset animation state
     chartLineGlow = 0;
     chartVelocity = 0;
   }
@@ -1387,6 +1391,237 @@ async function loadEquityHistory(){
 }
 
 // Called by poll() when new equity data arrives from Supabase
+function drawChart(){
+  if(!chartRAF) startChart();
+  if(eqHist.length === 0) return;
+  const newTarget = eqHist[eqHist.length-1];
+  if(newTarget > 0 && newTarget !== chartTarget){
+    if(chartTarget !== 0){
+      chartLineGlow = 1.0;   // flash on new data
+      lastDataUpdate = Date.now();
+    }
+    chartTarget = newTarget;
+    if(chartCurrent === 0) chartCurrent = chartTarget;
+  }
+}
+
+function renderChart(){
+  const cv=$('equityChart'); if(!cv||!chartCtx) return;
+  const W=cv.parentElement.offsetWidth, H=cv.parentElement.offsetHeight;
+  if(W<=0||H<=0) return;
+  if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; }
+
+  const now=Date.now(), ctx=chartCtx, cap=getStartingCapital();
+  ctx.clearRect(0,0,W,H);
+
+  // ── 1. SPRING: glide toward target ───────────────────────────
+  if(chartTarget>0 && chartCurrent>0){
+    const diff=chartTarget-chartCurrent;
+    chartVelocity+=diff*0.06;
+    chartVelocity*=0.80;
+    chartCurrent+=chartVelocity;
+    if(Math.abs(diff)<0.01 && Math.abs(chartVelocity)<0.01){
+      chartCurrent=chartTarget; chartVelocity=0;
+    }
+  }
+
+  // ── 2. NO MICRO-DRIFT — Robinhood style is clean flat between ticks
+  const displayVal = chartCurrent || cap;
+
+  // ── 3. STREAM POINT ──────────────────────────────────────────
+  if(displayVal>0 && !document.hidden){
+    const last=chartStream[chartStream.length-1];
+    const gap = last ? (now-last.t) : 99999;
+    // Bridge gaps (tab switch etc) with flat line instead of cliff
+    if(last && gap>8000 && gap<600000){
+      // insert flat bridge points
+      const steps=Math.min(10, Math.floor(gap/2000));
+      for(let i=1;i<=steps;i++) chartStream.push({t:last.t+(gap/steps)*i, v:last.v});
+    }
+    if(!last || Math.abs(displayVal-last.v)>0.10 || gap>1000){
+      chartStream.push({t:now, v:displayVal});
+      if(chartStream.length>STREAM_CAP) chartStream.shift();
+    }
+  }
+
+  // ── 4. GLOW DECAY ────────────────────────────────────────────
+  chartLineGlow=Math.max(0, chartLineGlow-0.015);
+
+  // ── 5. EMPTY STATE ───────────────────────────────────────────
+  const empty=$('chartEmpty');
+  if(chartStream.length<4){ if(empty) empty.style.display='flex'; return; }
+  if(empty) empty.style.display='none';
+
+  // ── 6. VISIBLE WINDOW ────────────────────────────────────────
+  const windowMs=WINDOW_SECS*1000;
+  const tEnd=now, tStart=tEnd-windowMs;
+  let visible=chartStream.filter(p=>p.t>=tStart);
+  if(visible.length<2) return;
+
+  // ── 7. DOWNSAMPLE to max 300 pts for performance ─────────────
+  if(visible.length>300){
+    const step=Math.ceil(visible.length/300);
+    visible=visible.filter((_,i)=>i%step===0||i===visible.length-1);
+  }
+
+  // ── 8. LAYOUT ────────────────────────────────────────────────
+  const P={t:48,b:28,l:58,r:20};
+  const cW=W-P.l-P.r, cH=H-P.t-P.b;
+
+  // ── 9. DYNAMIC Y-AXIS ─────────────────────────────────────────
+  const vals=visible.map(p=>p.v);
+  const rawMin=Math.min(...vals);
+  const rawMax=Math.max(...vals);
+  const dataRange=rawMax-rawMin;
+  // Padding: 25% of range, min = 0.04% of equity so tiny moves show clearly
+  const pad=Math.max(dataRange*0.25, (chartTarget||cap)*0.0004);
+  const minV=rawMin-pad, maxV=rawMax+pad;
+  const vRange=maxV-minV||1;
+
+  const tx=t=>P.l+((t-tStart)/windowMs)*cW;
+  const ty=v=>P.t+cH-((v-minV)/vRange)*cH;
+
+  // ── 10. GRID LINES ───────────────────────────────────────────
+  ctx.font='10px ui-monospace,monospace';
+  ctx.textAlign='right';
+  const steps=4;
+  for(let i=0;i<=steps;i++){
+    const v=minV+(vRange/steps)*i;
+    const y=ty(v);
+    if(y<P.t||y>P.t+cH) continue;
+    ctx.setLineDash([2,8]);
+    ctx.strokeStyle='rgba(255,255,255,0.05)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(P.l,y); ctx.lineTo(W-P.r,y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(255,255,255,0.22)';
+    // Robinhood style: show dollar value with smart formatting
+    const diff=v-cap;
+    let lbl;
+    if(vRange<2000) lbl='$'+Math.round(v).toLocaleString('en-US');
+    else lbl='$'+(v/1000).toFixed(1)+'k';
+    ctx.fillText(lbl, P.l-6, y+3);
+  }
+
+  // Baseline (starting capital / day start)
+  const baseY=ty(cap);
+  if(baseY>=P.t && baseY<=P.t+cH){
+    ctx.setLineDash([3,7]);
+    ctx.strokeStyle='rgba(255,255,255,0.12)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // ── 11. COLOR LOGIC ──────────────────────────────────────────
+  // Color based on current value vs cap (green = up, red = down)
+  const isUp=displayVal>=cap;
+  const lineCol=isUp?'#00d4aa':'#ff4757';
+  const fillCol=isUp?'rgba(0,212,170,':'rgba(255,71,87,';
+
+  // ── 12. BUILD PATH ────────────────────────────────────────────
+  const pts=visible.map(p=>[tx(p.t), ty(p.v)]);
+
+  // Smooth bezier path — Robinhood style
+  function buildPath(){
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for(let i=0;i<pts.length-1;i++){
+      const p0=pts[Math.max(i-1,0)];
+      const p1=pts[i];
+      const p2=pts[i+1];
+      const p3=pts[Math.min(i+2,pts.length-1)];
+      const tension=0.15; // lower = smoother/less wiggly
+      const cp1x=p1[0]+(p2[0]-p0[0])*tension;
+      const cp1y=p1[1]+(p2[1]-p0[1])*tension;
+      const cp2x=p2[0]-(p3[0]-p1[0])*tension;
+      const cp2y=p2[1]-(p3[1]-p1[1])*tension;
+      ctx.bezierCurveTo(cp1x,cp1y,cp2x,cp2y,p2[0],p2[1]);
+    }
+  }
+
+  // ── 13. GRADIENT FILL ─────────────────────────────────────────
+  const grad=ctx.createLinearGradient(0,P.t,0,H-P.b);
+  grad.addColorStop(0,   fillCol+'0.18)');
+  grad.addColorStop(0.5, fillCol+'0.06)');
+  grad.addColorStop(1,   fillCol+'0)');
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], Math.min(H-P.b, Math.max(P.t, ty(minV-1))));
+  ctx.lineTo(pts[0][0], pts[0][1]);
+  buildPath();
+  ctx.lineTo(pts[pts.length-1][0], Math.min(H-P.b, Math.max(P.t, ty(minV-1))));
+  ctx.closePath();
+  ctx.fillStyle=grad;
+  ctx.fill();
+
+  // ── 14. LINE ─────────────────────────────────────────────────
+  ctx.beginPath();
+  buildPath();
+  ctx.strokeStyle=lineCol;
+  ctx.lineWidth=2;
+  ctx.lineJoin='round';
+  ctx.lineCap='round';
+  ctx.shadowColor=lineCol;
+  ctx.shadowBlur=chartLineGlow*12+3;
+  ctx.stroke();
+  ctx.shadowBlur=0;
+
+  // ── 15. LIVE DOT ─────────────────────────────────────────────
+  const ex=pts[pts.length-1][0];
+  const ey=pts[pts.length-1][1];
+  if(ex>=P.l && ex<=W-P.r && ey>=P.t && ey<=P.t+cH){
+    const pulse=0.4+0.3*Math.sin(now*0.003);
+    ctx.beginPath();
+    ctx.arc(ex,ey,6+pulse*3,0,Math.PI*2);
+    ctx.fillStyle=lineCol.replace(')',`,${0.15*pulse})`).replace('rgb','rgba');
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(ex,ey,3,0,Math.PI*2);
+    ctx.fillStyle=lineCol;
+    ctx.shadowColor=lineCol;
+    ctx.shadowBlur=8;
+    ctx.fill();
+    ctx.shadowBlur=0;
+  }
+
+  // ── 16. HOVER TOOLTIP ────────────────────────────────────────
+  if(typeof chartMouseX==='number' && chartMouseX>=P.l && chartMouseX<=W-P.r){
+    // Find closest point
+    let closest=pts[0], closestVal=visible[0].v;
+    for(let i=0;i<pts.length;i++){
+      if(Math.abs(pts[i][0]-chartMouseX)<Math.abs(closest[0]-chartMouseX)){
+        closest=pts[i]; closestVal=visible[i].v;
+      }
+    }
+    // Vertical crosshair
+    ctx.setLineDash([3,5]);
+    ctx.strokeStyle='rgba(255,255,255,0.15)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(closest[0],P.t); ctx.lineTo(closest[0],P.t+cH); ctx.stroke();
+    ctx.setLineDash([]);
+    // Dot on line
+    ctx.beginPath(); ctx.arc(closest[0],closest[1],3.5,0,Math.PI*2);
+    ctx.fillStyle=lineCol; ctx.fill();
+    // Tooltip
+    const diff2=closestVal-cap;
+    const diffPct=(diff2/cap*100).toFixed(2);
+    const tip=(diff2>=0?'+':'')+"$"+Math.abs(diff2).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+" ("+(diff2>=0?'+':'')+diffPct+"%)";
+    ctx.font='bold 11px ui-monospace,monospace';
+    const tw2=ctx.measureText(tip).width+16;
+    let tx2=closest[0]-tw2/2;
+    tx2=Math.max(P.l,Math.min(W-P.r-tw2,tx2));
+    const ty2=closest[1]-36;
+    ctx.fillStyle='rgba(15,17,21,0.92)';
+    ctx.beginPath();
+    ctx.roundRect(tx2,ty2,tw2,22,4);
+    ctx.fill();
+    ctx.fillStyle=diff2>=0?'#00d4aa':'#ff4757';
+    ctx.textAlign='center';
+    ctx.fillText(tip,tx2+tw2/2,ty2+14);
+    ctx.textAlign='right';
+  }
+}
+
+
 function drawChart(){
   if(!chartRAF) startChart();
   if(eqHist.length === 0) return;
@@ -2190,6 +2425,39 @@ startChart();
 switchTab('overview');
 if(getSbUrl()&&getSbKey()){ testConnection(); }
 else openModal();
+
+// ── APEX live poller — checks for new strategies every 8 seconds ──
+// Independent of main poll() so strategies appear instantly
+// without waiting for the full 30-second settings refresh cycle
+let _apexLastJson = '';
+async function pollApex() {
+  try {
+    const u = getSbUrl(), k = getSbKey();
+    if (!u || !k) return;
+    const res = await fetch(
+      u + '/rest/v1/tc_settings?id=eq.1&select=apex_strategies',
+      { headers: { 'apikey': k, 'Authorization': 'Bearer ' + k } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    const raw = rows?.[0]?.apex_strategies;
+    if (!raw || raw === _apexLastJson) return; // no change
+    _apexLastJson = raw;
+    renderApexStrategies(raw);
+    // Flash the panel to signal an update
+    const panel = $('apexStrategies');
+    if (panel) {
+      panel.style.transition = 'opacity 0.2s';
+      panel.style.opacity = '0.3';
+      setTimeout(() => { panel.style.opacity = '1'; }, 200);
+    }
+  } catch(e) {}
+}
+// Start polling after 3s (let page settle), then every 8s
+setTimeout(() => {
+  pollApex();
+  setInterval(pollApex, 8000);
+}, 3000);
 </script>
 </body>
 </html>
