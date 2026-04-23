@@ -2202,36 +2202,53 @@ function renderApexStrategies(strategiesJson) {
   const countBadge = $('apexCount');
   if (!container) return;
 
-  let strategies = [];
+  let rules = [];
   try {
-    strategies = typeof strategiesJson === 'string'
+    rules = typeof strategiesJson === 'string'
       ? JSON.parse(strategiesJson)
       : (Array.isArray(strategiesJson) ? strategiesJson : []);
   } catch(e) { return; }
 
-  if (!strategies.length) {
-    container.innerHTML = '<div style="color:#555;font-size:11px;font-style:italic">Strategies appear after 5+ trades are analyzed...</div>';
+  if (!rules.length) {
+    container.innerHTML = '<div style="color:#555;font-size:11px;font-style:italic">Analyzing trades... strategies appear after 4+ real trades.</div>';
     if (countBadge) countBadge.textContent = '0 active';
     return;
   }
 
-  if (countBadge) countBadge.textContent = strategies.length + ' active';
+  if (countBadge) countBadge.textContent = rules.length + ' active';
 
-  container.innerHTML = strategies.map(s => {
-    const wr = s.winRate || 0;
-    const isWarn = s.rule?.type === 'rsi_avoid' || s.rule?.type === 'hold_avoid';
-    const wrClass = wr >= 0.6 ? 'good' : 'bad';
-    const wrPct = (wr * 100).toFixed(0);
-    const age = s.generated ? timeAgo(new Date(s.generated)) : '';
-    return `<div class="apex-card${isWarn?' apex-warn':''}">
-      <div class="apex-card-name">${s.name}</div>
-      <div class="apex-card-desc">${s.description}</div>
-      <div class="apex-card-meta">
-        <span class="apex-wr ${wrClass}">${wrPct}% WR</span>
-        &nbsp;·&nbsp; ${s.sampleSize || 0} trades
-        ${age ? '&nbsp;·&nbsp; updated ' + age : ''}
-      </div>
-    </div>`;
+  // Type → icon + color
+  const typeIcon = {
+    sym_boost:'🟢', sym_block:'🔴', rsi_boost:'🟢', rsi_block:'🔴',
+    time_boost:'🟢', time_block:'🟡', hold_warn:'🟡',
+    config_adjust:'⚙️', conf_adjust:'📊',
+  };
+  const typeLabel = {
+    sym_boost:'BOOST', sym_block:'BLOCK', rsi_boost:'BOOST', rsi_block:'BLOCK',
+    time_boost:'TIMING', time_block:'CAUTION', hold_warn:'WARNING',
+    config_adjust:'CONFIG', conf_adjust:'THRESHOLD',
+  };
+
+  container.innerHTML = rules.map(r => {
+    const wr = r.wr || 0;
+    const isBlock = r.type?.includes('block') || r.type?.includes('avoid');
+    const isWarn  = r.type?.includes('warn') || r.type?.includes('caution');
+    const cls = isBlock ? ' apex-warn' : '';
+    const icon = typeIcon[r.type] || '🧠';
+    const lbl  = typeLabel[r.type] || 'RULE';
+    const wrPct = (wr*100).toFixed(0);
+    const wrCls = wr >= 0.6 ? 'good' : wr >= 0.45 ? '' : 'bad';
+    const edge  = r.edge ? ((r.edge>0?'+':'')+(r.edge*100).toFixed(0)+'pp vs baseline') : '';
+    const boost = r.action?.boost ? '+'+r.action.boost+' conf' : r.action?.block ? 'BLOCKED' : r.action?.minConf ? 'min '+r.action.minConf+'% conf' : '';
+    return '<div class="apex-card'+cls+'">'
+      + '<div class="apex-card-name">'+icon+' ['+lbl+'] '+r.name+'</div>'
+      + '<div class="apex-card-desc">'+r.description+'</div>'
+      + '<div class="apex-card-meta">'
+      + '<span class="apex-wr '+wrCls+'">'+wrPct+'% WR</span>'
+      + (r.n ? ' &nbsp;·&nbsp; '+r.n+' trades' : '')
+      + (edge ? ' &nbsp;·&nbsp; '+edge : '')
+      + (boost ? ' &nbsp;·&nbsp; <b>'+boost+'</b>' : '')
+      + '</div></div>';
   }).join('');
 }
 
