@@ -615,7 +615,8 @@ async function apexAnalyze() {
 
   // Save to Supabase so dashboard can display them
   try {
-    await sbFetch(tbl('tc_settings') + '?id=eq.1', 'PATCH', {
+    // Always write to real tc_settings — APEX data should persist across sim/live
+    await sbFetch('tc_settings?id=eq.1', 'PATCH', {
       apex_strategies: JSON.stringify(learnedStrategies),
       updated_at: new Date().toISOString(),
     });
@@ -681,7 +682,7 @@ function apexFilterSignal(sig, ctx = {}) {
 async function apexLoadStrategies() {
   try {
     // Load previously saved strategies
-    const data = await sbFetch(tbl('tc_settings') + '?id=eq.1&select=apex_strategies', 'GET');
+    const data = await sbFetch('tc_settings?id=eq.1&select=apex_strategies', 'GET');
     const saved = data?.[0]?.apex_strategies;
     if (saved) {
       const parsed = typeof saved === 'string' ? JSON.parse(saved) : saved;
@@ -697,7 +698,7 @@ async function apexLoadStrategies() {
     try {
       const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(); // last 7 days
       const hist = await sbFetch(
-        tbl('tc_trades') + '?order=created_at.desc&limit=200&created_at=gte.' + since + '&select=symbol,pnl,side,created_at',
+        'tc_trades?order=created_at.desc&limit=200&created_at=gte.' + since + '&select=symbol,pnl,side,created_at',
         'GET'
       );
       if (Array.isArray(hist) && hist.length) {
