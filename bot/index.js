@@ -3520,6 +3520,21 @@ function generateSignal(sym, bars5m, bars15m) {
   let passedGates = 0;
   let direction   = null;
 
+  // ── GATE 0: Price slope — no catching falling knives ─────────
+  // If price is in a steep downtrend (dropped >1% in last 3 bars),
+  // RSI oversold is a falling knife not a reversal.
+  // If price is in a steep uptrend, RSI overbought is continuation not reversal.
+  // We check BOTH directions so we know which signals are valid.
+  const last3 = c5.slice(-4);
+  const slope3 = last3.length >= 4 ? (last3[3] - last3[0]) / last3[0] : 0;
+  const last6  = c5.slice(-7);
+  const slope6 = last6.length >= 7 ? (last6[6] - last6[0]) / last6[0] : 0;
+  // Steep drop: >0.8% in 3 bars = still falling = risky long
+  const isFallingKnife = slope3 < -0.008;
+  // Steep rise: >0.8% in 3 bars = still rising = risky short
+  const isRisingTide   = slope3 > 0.008;
+  // We'll use these in Gate 1 to filter bad RSI signals
+
   // ── GATE 1: RSI must be in meaningful territory ──
   // Primary mode: mean-reversion at RSI extremes
   // Momentum mode: activates on trending days when RSI stays 45-65
@@ -3538,12 +3553,22 @@ function generateSignal(sym, bars5m, bars15m) {
   const macdFalling = _macdLine < _prevMacd && _macdLine < 0;
 
   if (r < CONFIG.rsiOversold) {
+    // Falling knife check: if price still dropping steeply, wait for stabilization
+    if (isFallingKnife) {
+      return { signal:'HOLD', confidence:0, score:0,
+        reasons:[`RSI oversold (${r.toFixed(1)}) but price still falling (${(slope3*100).toFixed(2)}% in 3 bars) — falling knife`], rsi:r };
+    }
     rsiScore = 2; direction = 'buy';
-    reasons.push(`RSI oversold ${r.toFixed(1)} ✅`);
+    reasons.push(`RSI oversold ${r.toFixed(1)} + price stabilizing ✅`);
   } else if (r > CONFIG.rsiOverbought) {
-    if (!CONFIG.shortsEnabled) return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi: r };
+    if (!CONFIG.shortsEnabled) return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi:r };
+    // Rising tide check: if still surging, short too early
+    if (isRisingTide) {
+      return { signal:'HOLD', confidence:0, score:0,
+        reasons:[`RSI overbought (${r.toFixed(1)}) but price still rising (${(slope3*100).toFixed(2)}% in 3 bars) — wait for peak`], rsi:r };
+    }
     rsiScore = 2; direction = 'sell';
-    reasons.push(`RSI overbought ${r.toFixed(1)} ✅`);
+    reasons.push(`RSI overbought ${r.toFixed(1)} + momentum fading ✅`);
   } else if (r < 38) {
     rsiScore = 1; direction = 'buy';
     reasons.push(`RSI leaning oversold ${r.toFixed(1)}`);
@@ -3578,22 +3603,29 @@ function generateSignal(sym, bars5m, bars15m) {
   }
   passedGates++;
 
-  // ── GATE 2: MACD confirmation (scoring gate) ──
+  // ── GATE 2: MACD — HARD GATE ──────────────────────────────────
+  // MACD must agree with direction. No MACD agreement = no trade.
+  // This is the single biggest filter against catching falling knives.
   const e8  = ema(c5, 8),  e21 = ema(c5, 21);
   const pe8 = ema(c5.slice(0,-1), 8), pe21 = ema(c5.slice(0,-1), 21);
   const macdBull  = e8 > e21;
   const macdCross = (pe8 < pe21 && e8 > e21) || (pe8 > pe21 && e8 < e21);
   const macdAgrees = (direction === 'buy' && macdBull) || (direction === 'sell' && !macdBull);
-  let macdScore = 0;
-  if (macdAgrees) {
-    macdScore = macdCross ? 2 : 1;
-    if (macdCross) reasons.push(`MACD crossover ${direction === 'buy' ? '↑' : '↓'} ✅`);
+  if (!macdAgrees) {
+    // MACD hard disagrees — block the signal
+    // Exception: RSI is extremely oversold (<25) or overbought (>75) — momentum
+    // extreme can override a lagging MACD in fast-moving markets
+    const rsiExtreme = (direction === 'buy' && r < 25) || (direction === 'sell' && r > 75);
+    if (!rsiExtreme) {
+      return { signal:'HOLD', confidence:0, score:0,
+        reasons:[...reasons, `MACD disagrees with ${direction} (e8=${e8.toFixed(2)} vs e21=${e21.toFixed(2)}) — blocked`], rsi:r };
+    }
+    reasons.push(`MACD disagrees but RSI extreme (${r.toFixed(1)}) — allowed`);
+  } else {
+    const macdScore = macdCross ? 2 : 1;
+    if (macdCross) reasons.push(`MACD crossover ${direction==='buy'?'↑':'↓'} ✅`);
     else reasons.push(`MACD aligned ✅`);
     passedGates++;
-  } else {
-    // MACD disagrees — costs a gate but doesn't hard-block
-    // Strong RSI can still override weak MACD disagreement
-    reasons.push(`MACD disagrees — reduced confidence`);
   }
 
   // ── GATE 3: Trend alignment ──
@@ -3637,33 +3669,46 @@ function generateSignal(sym, bars5m, bars15m) {
   const avgVol  = vol.slice(-20).reduce((a,b)=>a+b,0) / Math.min(20, vol.length);
   const curVol  = vol[vol.length-1];
   const volRatio = avgVol > 0 ? curVol / avgVol : 1;
-  if (!isSimMode() && volRatio < 0.5) {
-    // Only hard-block on live — sim bars can have weird volume in off-hours
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `Volume very low (${volRatio.toFixed(1)}x) — no conviction`], rsi: r };
+  if (volRatio < 0.4) {
+    // Hard block on very low volume — applies in sim too
+    // Sim bars during off-hours have near-zero volume = stale/unreliable
+    return { signal: 'HOLD', confidence: 0, score: 0,
+      reasons: [...reasons, `Volume very low (${volRatio.toFixed(1)}x avg) — no conviction`], rsi: r };
   }
   const volScore = volRatio >= 1.5 ? 2 : volRatio >= 0.8 ? 1 : 0;
   if (volRatio >= 0.8) { reasons.push(`Volume ${volRatio.toFixed(1)}x avg ✅`); passedGates++; }
   else { reasons.push(`Volume low (${volRatio.toFixed(1)}x)`); }
 
-  // ── GATE 5: 15-minute timeframe agreement (soft gate) ──
-  // Disagreement costs a gate pass but doesn't hard-block — reduces false kills
-  if (c15) {
+  // ── GATE 5: 15-minute timeframe — HARD GATE ───────────────────
+  // 15min must agree with 5min direction. Multi-timeframe confluence
+  // is the most reliable filter against bad entries.
+  if (c15 && c15.length >= 15) {
     const r15    = rsi(c15, CONFIG.rsiPeriod);
     const e8_15  = ema(c15, 8), e21_15 = ema(c15, 21);
-    const bull15 = e8_15 > e21_15 && r15 < 65;
-    const bear15 = e8_15 < e21_15 && r15 > 35;
-    if      (direction === 'buy'  && bull15) { reasons.push(`15min bullish ✅`); passedGates++; }
-    else if (direction === 'sell' && bear15) { reasons.push(`15min bearish ✅`); passedGates++; }
-    else { reasons.push(`15min neutral — reduced confidence`); }
-    // No hard return — let other gates compensate
+    const price15 = c15[c15.length - 1];
+    const bull15 = e8_15 > e21_15;   // 15m EMA bullish
+    const bear15 = e8_15 < e21_15;   // 15m EMA bearish
+    const rsiAgrees15 = (direction === 'buy' && r15 < 70) ||
+                        (direction === 'sell' && r15 > 30);
+    if (direction === 'buy' && (!bull15 || !rsiAgrees15)) {
+      return { signal:'HOLD', confidence:0, score:0,
+        reasons:[...reasons, `15min disagrees with long (e8_15=${e8_15.toFixed(2)} vs e21_15=${e21_15.toFixed(2)}, RSI15=${r15.toFixed(0)})`], rsi:r };
+    }
+    if (direction === 'sell' && (!bear15 || !rsiAgrees15)) {
+      return { signal:'HOLD', confidence:0, score:0,
+        reasons:[...reasons, `15min disagrees with short (e8_15=${e8_15.toFixed(2)} vs e21_15=${e21_15.toFixed(2)}, RSI15=${r15.toFixed(0)})`], rsi:r };
+    }
+    reasons.push(`15min ${direction==='buy'?'bullish':'bearish'} confirmed ✅`);
+    passedGates++;
   }
 
   // ── GATE 6: ADX — trend strength (soft gate) ──
   const adxData = adx(bars5m);
   if (adxData.adx > 0) {
-    if (!isSimMode() && adxData.adx < 15) {
-      // Only hard-block on live with very weak ADX — sim bars can be low ADX
-      return { signal: 'HOLD', confidence: 0, score: 0, reasons: [...reasons, `ADX ${adxData.adx.toFixed(0)} — too weak`], rsi: r };
+    if (adxData.adx < 15) {
+      // Weak ADX = no trend = choppy = bad entries in both sim and live
+      return { signal: 'HOLD', confidence: 0, score: 0,
+        reasons: [...reasons, `ADX ${adxData.adx.toFixed(0)} < 15 — market choppy, no trend`], rsi: r };
     }
     const adxAligned = direction === 'buy'
       ? adxData.diPlus > adxData.diMinus
