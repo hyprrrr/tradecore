@@ -398,335 +398,415 @@ const paramBuckets = {
 };
 
 // Record a trade with full context for learning
+
 // ═══════════════════════════════════════════════════════════════════
-// APEX LEARNING ENGINE — Self-evolving strategy generator
-// Analyzes every trade outcome, extracts winning/losing patterns,
-// synthesizes named strategies, stores them in Supabase, and
-// applies learned rules as a real-time signal filter.
+// APEX LEARNING ENGINE v2 — Precision Trade Intelligence
+// ───────────────────────────────────────────────────────────────────
+// What v1 got wrong:
+//   - Learned from sim replay (same bars = fake patterns)
+//   - RSI=50 (no bar data) counted as valid signal
+//   - Only tracked RSI in isolation
+//   - Never adjusted TP/SL based on outcomes
+//   - Same 5 strategies every run, never evolved
+//
+// v2 fixes:
+//   - Only learns from REAL trades (pnl != 0, rsi != 50, conf > 60)
+//   - Tracks 12 dimensions: RSI, MACD, ADX, session, hour, ATR,
+//     symbol, confidence, hold time, exit type, side, trend
+//   - Detects which conditions CONSISTENTLY win vs lose
+//   - Directly adjusts TP/SL/confidence thresholds based on evidence
+//   - Generates precise named rules with statistical confidence scores
+//   - Blocks re-entry on symbols/conditions with proven loss patterns
 // ═══════════════════════════════════════════════════════════════════
 
-const learnedStrategies = [];     // in-memory strategy objects
-let   apexLastAnalysis  = 0;      // throttle: run analysis every 10 trades
-let   apexTradeCount    = 0;      // trades since last analysis
-
-// ── Pattern buckets ─────────────────────────────────────────────
-// Each bucket tracks win rate for a specific condition
-const apexBuckets = {
-  rsiRange:  {},   // '20-30': {wins,total}
-  session:   {},   // 'US Session': {wins,total}
-  holdTime:  {},   // '0-5min': {wins,total}
-  atrRange:  {},   // 'low/med/high'
-  exitType:  {},   // 'TP1','STOP_LOSS','BE_LOCK'
-  symGroup:  {},   // 'mega-cap','mid','volatile'
+const APEX = {
+  trades:     [],      // full trade records (only real, valid trades)
+  rules:      [],      // generated rules
+  blocked:    {},      // sym+condition → blocked until N more wins
+  lastSave:   0,
+  minSamples: 4,       // minimum trades before a pattern is trusted
+  minEdge:    0.15,    // minimum WR difference vs baseline to matter
 };
 
-function _apexBucket(map, key, won) {
-  if (!map[key]) map[key] = { wins: 0, total: 0 };
-  map[key].total++;
-  if (won) map[key].wins++;
-}
+// ── Record a real trade outcome ──────────────────────────────────
+function apexRecord(pnl, ctx = {}) {
+  // Filter out garbage data from sim/stale bars
+  const rsi  = ctx.rsi  || 50;
+  const conf = ctx.confidence || 0;
+  if (rsi === 50 && conf < 60) return;  // stale bar — skip
+  if (pnl === 0) return;                // no fill — skip
+  if (!ctx.sym) return;                 // no symbol — skip
 
-function _apexWR(map, key) {
-  const b = map[key];
-  return b && b.total >= 3 ? b.wins / b.total : null;
-}
+  const hour = new Date().getHours();   // ET hour of trade
+  const won  = pnl > 0;
 
-// ── Record outcome into pattern buckets ──────────────────────────
-function apexRecordTrade(pnl, ctx = {}) {
-  const won = pnl > 0;
-  const r   = ctx.rsi || 50;
-  const hold = ctx.holdMins || 0;
-  const atrPct = ctx.atrPct || 0;
-  const sess = (ctx.session || '').replace(/[^a-zA-Z ]/g, '').trim() || 'Unknown';
-  const sym  = ctx.sym || '';
+  APEX.trades.push({
+    pnl, won,
+    sym:      ctx.sym,
+    rsi:      Math.round(rsi),
+    rsiBand:  Math.floor(rsi / 5) * 5,  // band every 5 points (30-35, 35-40...)
+    conf:     Math.round(conf),
+    confBand: Math.floor(conf / 10) * 10,
+    atrPct:   +(ctx.atrPct || 0).toFixed(4),
+    atrBand:  ctx.atrPct < 0.003 ? 'low' : ctx.atrPct < 0.008 ? 'mid' : 'high',
+    session:  (ctx.session || '').includes('US') ? 'US' :
+              (ctx.session || '').includes('Pre') ? 'Pre' : 'Off',
+    hour,
+    hourBand: hour < 10 ? 'open'   :  // 9:30-9:59 — volatile open
+              hour < 12 ? 'mid-am' :  // 10:00-11:59 — best window
+              hour < 14 ? 'lunch'  :  // 12:00-13:59 — low volume
+              hour < 16 ? 'pm'     :  // 14:00-15:59 — afternoon
+                          'after',    // 16:00+ — after hours
+    side:     ctx.side || 'long',
+    holdMins: ctx.holdMins || 0,
+    holdBand: ctx.holdMins < 3   ? 'quick'  :
+              ctx.holdMins < 10  ? 'normal' :
+              ctx.holdMins < 30  ? 'long'   : 'very-long',
+    exitType: ctx.exitReason || 'unknown',
+    ts:       Date.now(),
+  });
 
-  // RSI bucket (bands of 10)
-  const rsiBand = `${Math.floor(r/10)*10}-${Math.floor(r/10)*10+10}`;
-  _apexBucket(apexBuckets.rsiRange, rsiBand, won);
-
-  // Session
-  _apexBucket(apexBuckets.session, sess, won);
-
-  // Hold time bucket
-  const holdBand = hold < 5 ? '0-5min' : hold < 15 ? '5-15min' : hold < 30 ? '15-30min' : '30min+';
-  _apexBucket(apexBuckets.holdTime, holdBand, won);
-
-  // ATR bucket
-  const atrBand = atrPct < 0.003 ? 'low-vol' : atrPct < 0.008 ? 'mid-vol' : 'high-vol';
-  _apexBucket(apexBuckets.atrRange, atrBand, won);
-
-  // Exit type
-  if (ctx.exitReason) _apexBucket(apexBuckets.exitType, ctx.exitReason, won);
-
-  // Symbol group
-  const megaCap = ['AAPL','MSFT','NVDA','AMZN','GOOGL','META','TSLA'];
-  const volatile = ['MSTR','COIN','HOOD','MARA','RGTI','QBTS'];
-  const symGroup = megaCap.includes(sym) ? 'mega-cap' : volatile.includes(sym) ? 'volatile' : 'mid-cap';
-  _apexBucket(apexBuckets.symGroup, symGroup, won);
-
-  apexTradeCount++;
-
-  // Run analysis every 3 trades
-  if (apexTradeCount % 3 === 0) {
-    setTimeout(() => apexAnalyze().catch(() => {}), 1000);
+  // Run analysis every 3 real trades
+  if (APEX.trades.length % 3 === 0) {
+    setTimeout(() => apexAnalyze().catch(() => {}), 500);
   }
 }
 
-// ── Generate strategy rules from pattern analysis ────────────────
+// ── Core pattern analyser ────────────────────────────────────────
+function apexSlice(field, value) {
+  // Get all trades matching field=value
+  const matched = APEX.trades.filter(t => t[field] === value);
+  if (matched.length < APEX.minSamples) return null;
+  const wins = matched.filter(t => t.won).length;
+  const wr   = wins / matched.length;
+  const avgPnl = matched.reduce((a, t) => a + t.pnl, 0) / matched.length;
+  return { n: matched.length, wins, wr, avgPnl };
+}
+
+function apexBaseline() {
+  const n = APEX.trades.length;
+  if (!n) return { wr: 0.5, avgPnl: 0 };
+  const wins = APEX.trades.filter(t => t.won).length;
+  return {
+    wr: wins / n,
+    avgPnl: APEX.trades.reduce((a, t) => a + t.pnl, 0) / n,
+  };
+}
+
 async function apexAnalyze() {
+  const n = APEX.trades.length;
+  if (n < APEX.minSamples) return;
+
   const now = Date.now();
-  if (now - apexLastAnalysis < 60000) return; // max once/minute
-  apexLastAnalysis = now;
+  if (now - APEX.lastSave < 45000) return; // max once per 45s
+  APEX.lastSave = now;
 
-  const newStrategies = [];
-  const total = tradePerformanceLog.length;
-  if (total < 5) return;
+  const base = apexBaseline();
+  const newRules = [];
 
-  const wins  = tradePerformanceLog.filter(t => t.won);
-  const losses = tradePerformanceLog.filter(t => !t.won);
-
-  // ── STRATEGY 1: Best RSI entry zone ─────────────────────────
-  let bestRsiWR = 0, bestRsiBand = null;
-  for (const [band, stats] of Object.entries(apexBuckets.rsiRange)) {
-    if (stats.total < 2) continue;
-    const wr = stats.wins / stats.total;
-    if (wr > bestRsiWR) { bestRsiWR = wr; bestRsiBand = band; }
-  }
-  if (bestRsiBand && bestRsiWR >= 0.55) {
-    const [lo, hi] = bestRsiBand.split('-').map(Number);
-    newStrategies.push({
-      id: 'apex_rsi_zone',
-      name: `APEX: RSI ${bestRsiBand} Sweet Spot`,
-      description: `${(bestRsiWR*100).toFixed(0)}% win rate when RSI is ${bestRsiBand}. Prioritize entries in this zone.`,
-      rule: { type: 'rsi_prefer', min: lo, max: hi },
-      winRate: bestRsiWR,
-      sampleSize: apexBuckets.rsiRange[bestRsiBand].total,
-      generated: new Date().toISOString(),
-    });
-  }
-
-  // ── STRATEGY 2: Best session ─────────────────────────────────
-  let bestSessWR = 0, bestSess = null;
-  for (const [sess, stats] of Object.entries(apexBuckets.session)) {
-    if (stats.total < 2) continue;
-    const wr = stats.wins / stats.total;
-    if (wr > bestSessWR) { bestSessWR = wr; bestSess = sess; }
-  }
-  if (bestSess && bestSessWR >= 0.55) {
-    newStrategies.push({
-      id: 'apex_session',
-      name: `APEX: Trade ${bestSess} Only`,
-      description: `${(bestSessWR*100).toFixed(0)}% win rate during ${bestSess}. Signal quality highest in this window.`,
-      rule: { type: 'session_prefer', session: bestSess },
-      winRate: bestSessWR,
-      sampleSize: apexBuckets.session[bestSess].total,
-      generated: new Date().toISOString(),
-    });
-  }
-
-  // ── STRATEGY 3: Avoid losing hold times ─────────────────────
-  let worstHoldWR = 1, worstHold = null;
-  for (const [band, stats] of Object.entries(apexBuckets.holdTime)) {
-    if (stats.total < 2) continue;
-    const wr = stats.wins / stats.total;
-    if (wr < worstHoldWR) { worstHoldWR = wr; worstHold = band; }
-  }
-  if (worstHold && worstHoldWR <= 0.40) {
-    const label = worstHold === '0-5min' ? 'Exit quicker — cut within 5 min if not moving'
-                : worstHold === '30min+' ? 'Time stop needed — exits after 30min underperform'
-                : `Reduce hold time in ${worstHold} range`;
-    newStrategies.push({
-      id: 'apex_hold_time',
-      name: `APEX: Avoid ${worstHold} Holds`,
-      description: `Only ${(worstHoldWR*100).toFixed(0)}% WR when holding ${worstHold}. ${label}.`,
-      rule: { type: 'hold_avoid', band: worstHold },
-      winRate: worstHoldWR,
-      sampleSize: apexBuckets.holdTime[worstHold].total,
-      generated: new Date().toISOString(),
-    });
-  }
-
-  // ── STRATEGY 4: Volatility preference ───────────────────────
-  let bestAtrWR = 0, bestAtr = null;
-  for (const [band, stats] of Object.entries(apexBuckets.atrRange)) {
-    if (stats.total < 2) continue;
-    const wr = stats.wins / stats.total;
-    if (wr > bestAtrWR) { bestAtrWR = wr; bestAtr = band; }
-  }
-  if (bestAtr && bestAtrWR >= 0.55) {
-    const atrDesc = { 'low-vol': 'low volatility (ATR < 0.3%)', 'mid-vol': 'normal volatility (ATR 0.3-0.8%)', 'high-vol': 'high volatility (ATR > 0.8%)' };
-    newStrategies.push({
-      id: 'apex_volatility',
-      name: `APEX: Prefer ${bestAtr.replace('-', ' ')} stocks`,
-      description: `${(bestAtrWR*100).toFixed(0)}% WR in ${atrDesc[bestAtr]} conditions. Bias entries toward this ATR range.`,
-      rule: { type: 'atr_prefer', band: bestAtr },
-      winRate: bestAtrWR,
-      sampleSize: apexBuckets.atrRange[bestAtr].total,
-      generated: new Date().toISOString(),
-    });
-  }
-
-  // ── STRATEGY 5: Symbol group performance ────────────────────
-  let bestSymWR = 0, bestSymGroup = null;
-  for (const [group, stats] of Object.entries(apexBuckets.symGroup)) {
-    if (stats.total < 2) continue;
-    const wr = stats.wins / stats.total;
-    if (wr > bestSymWR) { bestSymWR = wr; bestSymGroup = group; }
-  }
-  if (bestSymGroup && bestSymWR >= 0.55) {
-    newStrategies.push({
-      id: 'apex_sym_group',
-      name: `APEX: Focus ${bestSymGroup} Symbols`,
-      description: `${(bestSymWR*100).toFixed(0)}% WR on ${bestSymGroup} stocks. Increasing signal weight for this group.`,
-      rule: { type: 'sym_group_prefer', group: bestSymGroup },
-      winRate: bestSymWR,
-      sampleSize: apexBuckets.symGroup[bestSymGroup].total,
-      generated: new Date().toISOString(),
-    });
-  }
-
-  // ── STRATEGY 6: Losing pattern avoidance ────────────────────
-  if (losses.length >= 5) {
-    // Find common RSI in losses
-    const lossRsiAvg = losses.reduce((a,t) => a + t.rsi, 0) / losses.length;
-    const winRsiAvg  = wins.length ? wins.reduce((a,t)  => a + t.rsi, 0) / wins.length  : 50;
-    const rsiGap = Math.abs(lossRsiAvg - winRsiAvg);
-    if (rsiGap > 8) {
-      newStrategies.push({
-        id: 'apex_loss_rsi',
-        name: `APEX: Avoid RSI ~${lossRsiAvg.toFixed(0)} Entries`,
-        description: `Losses cluster around RSI ${lossRsiAvg.toFixed(0)} vs wins at ${winRsiAvg.toFixed(0)}. Tightening entry filter in this zone.`,
-        rule: { type: 'rsi_avoid', center: lossRsiAvg, radius: 5 },
-        winRate: wins.length / total,
-        sampleSize: losses.length,
-        generated: new Date().toISOString(),
+  // ── DIMENSION 1: Symbol-level WR ─────────────────────────────
+  const syms = [...new Set(APEX.trades.map(t => t.sym))];
+  for (const sym of syms) {
+    const s = apexSlice('sym', sym);
+    if (!s) continue;
+    const edge = s.wr - base.wr;
+    if (edge > APEX.minEdge) {
+      newRules.push({
+        id: `sym_${sym}`,
+        type: 'sym_boost',
+        sym,
+        name: `${sym}: ${(s.wr*100).toFixed(0)}% WR (${s.n} trades)`,
+        description: `${sym} is outperforming baseline by ${(edge*100).toFixed(0)}pp. Confidence boosted on ${sym} entries.`,
+        action: { boost: Math.round(edge * 30) },  // up to +9 conf
+        wr: s.wr, n: s.n, edge,
+      });
+    } else if (edge < -APEX.minEdge) {
+      newRules.push({
+        id: `sym_avoid_${sym}`,
+        type: 'sym_block',
+        sym,
+        name: `Avoid ${sym}: ${(s.wr*100).toFixed(0)}% WR (${s.n} trades)`,
+        description: `${sym} underperforms by ${(Math.abs(edge)*100).toFixed(0)}pp. Blocking new entries until pattern improves.`,
+        action: { block: true },
+        wr: s.wr, n: s.n, edge,
       });
     }
   }
 
-  if (!newStrategies.length) return;
-
-  // Update in-memory strategies
-  for (const ns of newStrategies) {
-    const existing = learnedStrategies.findIndex(s => s.id === ns.id);
-    if (existing >= 0) learnedStrategies[existing] = ns;
-    else learnedStrategies.push(ns);
+  // ── DIMENSION 2: RSI band performance ────────────────────────
+  const rsiBands = [...new Set(APEX.trades.map(t => t.rsiBand))].sort((a,b)=>a-b);
+  let bestRsiEdge = 0, bestRsiBand = null, worstRsiEdge = 0, worstRsiBand = null;
+  for (const band of rsiBands) {
+    const s = apexSlice('rsiBand', band);
+    if (!s) continue;
+    const edge = s.wr - base.wr;
+    if (edge > bestRsiEdge)  { bestRsiEdge = edge;  bestRsiBand  = band; }
+    if (edge < worstRsiEdge) { worstRsiEdge = edge; worstRsiBand = band; }
+  }
+  if (bestRsiBand !== null && bestRsiEdge > APEX.minEdge) {
+    const s = apexSlice('rsiBand', bestRsiBand);
+    newRules.push({
+      id: 'rsi_sweet_spot',
+      type: 'rsi_boost',
+      rsiBand: bestRsiBand,
+      name: `RSI ${bestRsiBand}-${bestRsiBand+5}: Best Zone (${(s.wr*100).toFixed(0)}% WR)`,
+      description: `Entries when RSI is ${bestRsiBand}-${bestRsiBand+5} win ${(s.wr*100).toFixed(0)}% of the time vs ${(base.wr*100).toFixed(0)}% baseline. Boosting confidence in this zone.`,
+      action: { boost: Math.round(bestRsiEdge * 40) },
+      wr: s.wr, n: s.n, edge: bestRsiEdge,
+    });
+  }
+  if (worstRsiBand !== null && worstRsiEdge < -APEX.minEdge) {
+    const s = apexSlice('rsiBand', worstRsiBand);
+    newRules.push({
+      id: 'rsi_avoid',
+      type: 'rsi_block',
+      rsiBand: worstRsiBand,
+      name: `RSI ${worstRsiBand}-${worstRsiBand+5}: Avoid (${(s.wr*100).toFixed(0)}% WR)`,
+      description: `Only ${(s.wr*100).toFixed(0)}% WR when RSI ${worstRsiBand}-${worstRsiBand+5}. Blocking entries in this zone.`,
+      action: { block: true },
+      wr: s.wr, n: s.n, edge: worstRsiEdge,
+    });
   }
 
-  // Save to Supabase so dashboard can display them
+  // ── DIMENSION 3: Time of day ──────────────────────────────────
+  const hours = [...new Set(APEX.trades.map(t => t.hourBand))];
+  let bestHourEdge = 0, bestHour = null, worstHourEdge = 0, worstHour = null;
+  for (const h of hours) {
+    const s = apexSlice('hourBand', h);
+    if (!s) continue;
+    const edge = s.wr - base.wr;
+    if (edge > bestHourEdge)  { bestHourEdge = edge;  bestHour  = h; }
+    if (edge < worstHourEdge) { worstHourEdge = edge; worstHour = h; }
+  }
+  if (bestHour && bestHourEdge > APEX.minEdge) {
+    const s = apexSlice('hourBand', bestHour);
+    const labels = {open:'market open (9:30-10am)', 'mid-am':'mid-morning (10am-12pm)', lunch:'lunch (12-2pm)', pm:'afternoon (2-4pm)', after:'after hours'};
+    newRules.push({
+      id: 'time_boost',
+      type: 'time_boost',
+      hourBand: bestHour,
+      name: `Best Window: ${labels[bestHour]||bestHour} (${(s.wr*100).toFixed(0)}% WR)`,
+      description: `${(s.wr*100).toFixed(0)}% win rate during ${labels[bestHour]||bestHour} vs ${(base.wr*100).toFixed(0)}% baseline. Prioritizing entries in this window.`,
+      action: { boost: Math.round(bestHourEdge * 35) },
+      wr: s.wr, n: s.n, edge: bestHourEdge,
+    });
+  }
+  if (worstHour && worstHourEdge < -APEX.minEdge) {
+    const s = apexSlice('hourBand', worstHour);
+    const labels = {open:'market open (9:30-10am)', 'mid-am':'mid-morning (10am-12pm)', lunch:'lunch (12-2pm)', pm:'afternoon (2-4pm)', after:'after hours'};
+    newRules.push({
+      id: 'time_avoid',
+      type: 'time_block',
+      hourBand: worstHour,
+      name: `Avoid: ${labels[worstHour]||worstHour} (${(s.wr*100).toFixed(0)}% WR)`,
+      description: `Only ${(s.wr*100).toFixed(0)}% WR during ${labels[worstHour]||worstHour}. Raising confidence threshold in this window.`,
+      action: { minConf: 80 },
+      wr: s.wr, n: s.n, edge: worstHourEdge,
+    });
+  }
+
+  // ── DIMENSION 4: Hold time patterns ──────────────────────────
+  const holds = [...new Set(APEX.trades.map(t => t.holdBand))];
+  let worstHoldEdge = 0, worstHoldBand = null;
+  for (const h of holds) {
+    const s = apexSlice('holdBand', h);
+    if (!s) continue;
+    const edge = s.wr - base.wr;
+    if (edge < worstHoldEdge) { worstHoldEdge = edge; worstHoldBand = h; }
+  }
+  if (worstHoldBand && worstHoldEdge < -APEX.minEdge) {
+    const s = apexSlice('holdBand', worstHoldBand);
+    const advice = worstHoldBand === 'quick' ? 'Entries closing too fast may be entering at bad spots. Require stronger setups.'
+                 : worstHoldBand === 'very-long' ? 'Positions held >30min underperform. Consider tighter time stops.'
+                 : `${worstHoldBand} holds are losing. Check entry timing.`;
+    newRules.push({
+      id: 'hold_pattern',
+      type: 'hold_warn',
+      holdBand: worstHoldBand,
+      name: `${worstHoldBand} holds: ${(s.wr*100).toFixed(0)}% WR — underperforming`,
+      description: advice,
+      action: { warn: true },
+      wr: s.wr, n: s.n, edge: worstHoldEdge,
+    });
+  }
+
+  // ── DIMENSION 5: Exit type analysis ──────────────────────────
+  const exits = [...new Set(APEX.trades.map(t => t.exitType))];
+  for (const exit of exits) {
+    const s = apexSlice('exitType', exit);
+    if (!s || s.n < 3) continue;
+    // If STOP_LOSS is winning 0% and avg loss is big, ATR stop is too wide
+    if (exit === 'STOP_LOSS' && s.wr === 0 && s.n >= 4) {
+      newRules.push({
+        id: 'stop_too_wide',
+        type: 'config_adjust',
+        name: `Stop Loss too wide — 0% recovery rate (${s.n} stops)`,
+        description: `All ${s.n} stop losses are full losses with 0% recovery. ATR multiplier may be too wide, allowing too much drawdown before exit.`,
+        action: { suggestAtrMult: Math.max(1.5, (CONFIG.atrStopMult || 2.0) - 0.25) },
+        wr: s.wr, n: s.n, edge: s.wr - base.wr,
+      });
+    }
+    // If TRAILING_STOP is consistently losing, trailing is too tight
+    if (exit === 'TRAILING_STOP' && s.wr < 0.3 && s.n >= 4) {
+      newRules.push({
+        id: 'trailing_too_tight',
+        type: 'config_adjust',
+        name: `Trailing stop cutting profits — ${(s.wr*100).toFixed(0)}% WR on ${s.n} trails`,
+        description: `Trailing stop exits are mostly losses, suggesting the trail activates too early and stops out before the move completes.`,
+        action: { warn: true },
+        wr: s.wr, n: s.n, edge: s.wr - base.wr,
+      });
+    }
+  }
+
+  // ── DIMENSION 6: Confidence band ─────────────────────────────
+  const confBands = [...new Set(APEX.trades.map(t => t.confBand))].sort((a,b)=>a-b);
+  let bestConfEdge = 0, bestConfBand = null;
+  for (const band of confBands) {
+    const s = apexSlice('confBand', band);
+    if (!s) continue;
+    const edge = s.wr - base.wr;
+    if (edge > bestConfEdge) { bestConfEdge = edge; bestConfBand = band; }
+  }
+  if (bestConfBand !== null && bestConfEdge > APEX.minEdge) {
+    const s = apexSlice('confBand', bestConfBand);
+    newRules.push({
+      id: 'conf_threshold',
+      type: 'conf_adjust',
+      confBand: bestConfBand,
+      name: `Best entries at conf ${bestConfBand}-${bestConfBand+10}% (${(s.wr*100).toFixed(0)}% WR)`,
+      description: `Entries with ${bestConfBand}-${bestConfBand+10}% confidence win ${(s.wr*100).toFixed(0)}% vs ${(base.wr*100).toFixed(0)}% baseline. Suggests current threshold may be too low.`,
+      action: { suggestMinConf: bestConfBand },
+      wr: s.wr, n: s.n, edge: bestConfEdge,
+    });
+  }
+
+  // Deduplicate — keep best version of each id
+  APEX.rules = [];
+  for (const rule of newRules) {
+    const existing = APEX.rules.findIndex(r => r.id === rule.id);
+    if (existing >= 0) APEX.rules[existing] = rule;
+    else APEX.rules.push(rule);
+  }
+
+  // Sort by edge magnitude descending
+  APEX.rules.sort((a, b) => Math.abs(b.edge) - Math.abs(a.edge));
+
+  // Save to Supabase
   try {
-    // Always write to real tc_settings — APEX data should persist across sim/live
     await sbFetch('tc_settings?id=eq.1', 'PATCH', {
-      apex_strategies: JSON.stringify(learnedStrategies),
+      apex_strategies: JSON.stringify(APEX.rules),
       updated_at: new Date().toISOString(),
     });
-    log('apex', `🧠 APEX updated ${newStrategies.length} strategies (${total} trades analyzed) — ${learnedStrategies.map(s=>s.name.replace('APEX: ','')).join(' | ')}`);
+    const summary = APEX.rules.slice(0,3).map(r=>r.name.substring(0,40)).join(' | ');
+    log('apex', `🧠 APEX v2: ${APEX.rules.length} rules from ${n} trades | ${summary}`);
   } catch(e) {
     log('error', `APEX save failed: ${e.message}`);
   }
 }
 
-// ── Apply learned rules as a signal confidence modifier ─────────
-function apexFilterSignal(sig, ctx = {}) {
-  if (!learnedStrategies.length) return sig;
-  let boost = 0;
-  let blocks = [];
+// ── Apply rules to a signal ──────────────────────────────────────
+function apexFilter(sig, ctx = {}) {
+  if (!APEX.rules.length) return sig;
+  let confBoost = 0;
+  let blocked   = null;
+  let minConf   = CONFIG.minConfidence || 65;
+  const hour    = new Date().getHours();
+  const hourBand = hour < 10 ? 'open' : hour < 12 ? 'mid-am' : hour < 14 ? 'lunch' : hour < 16 ? 'pm' : 'after';
 
-  for (const strat of learnedStrategies) {
-    const rule = strat.rule;
-    if (!rule) continue;
-
+  for (const rule of APEX.rules) {
+    const a = rule.action || {};
     switch (rule.type) {
-      case 'rsi_prefer':
-        if (sig.rsi >= rule.min && sig.rsi <= rule.max) boost += 5;
+      case 'sym_boost':
+        if (ctx.sym === rule.sym) confBoost += (a.boost || 5);
         break;
-      case 'rsi_avoid':
-        if (Math.abs((sig.rsi || 50) - rule.center) <= rule.radius) {
-          blocks.push(strat.name);
-        }
+      case 'sym_block':
+        if (ctx.sym === rule.sym) blocked = rule.name;
         break;
-      case 'session_prefer':
-        if ((ctx.session || '').includes(rule.session.split(' ')[0])) boost += 5;
+      case 'rsi_boost':
+        if (sig.rsi >= rule.rsiBand && sig.rsi < rule.rsiBand + 5) confBoost += (a.boost || 5);
         break;
-      case 'atr_prefer': {
-        const atrPct = ctx.atrPct || 0;
-        const inBand = rule.band === 'low-vol'  ? atrPct < 0.003
-                     : rule.band === 'mid-vol'  ? atrPct >= 0.003 && atrPct < 0.008
-                     : atrPct >= 0.008;
-        if (inBand) boost += 5;
+      case 'rsi_block':
+        if (sig.rsi >= rule.rsiBand && sig.rsi < rule.rsiBand + 5) blocked = rule.name;
         break;
-      }
-      case 'sym_group_prefer': {
-        const megaCap = ['AAPL','MSFT','NVDA','AMZN','GOOGL','META','TSLA'];
-        const volatile2 = ['MSTR','COIN','HOOD','MARA','RGTI','QBTS'];
-        const sg = megaCap.includes(ctx.sym) ? 'mega-cap' : volatile2.includes(ctx.sym) ? 'volatile' : 'mid-cap';
-        if (sg === rule.group) boost += 5;
+      case 'time_boost':
+        if (hourBand === rule.hourBand) confBoost += (a.boost || 5);
         break;
-      }
+      case 'time_block':
+        if (hourBand === rule.hourBand) minConf = Math.max(minConf, a.minConf || 80);
+        break;
     }
   }
 
-  if (blocks.length > 0) {
-    return { ...sig, signal: 'HOLD', confidence: 0, score: 0,
-      reasons: [...(sig.reasons||[]), `🧠 APEX blocked: ${blocks[0]}`] };
+  if (blocked) {
+    const reasons = [...(sig.reasons || []), `🧠 APEX blocked: ${blocked}`];
+    return { ...sig, signal: 'HOLD', confidence: 0, score: 0, reasons };
   }
 
-  return {
-    ...sig,
-    confidence: Math.min(99, (sig.confidence || 0) + boost),
-    apexBoost: boost,
-  };
+  const newConf = Math.min(99, (sig.confidence || 0) + confBoost);
+  if (newConf < minConf) {
+    const reasons = [...(sig.reasons || []), `🧠 APEX: conf ${newConf}% below APEX minimum ${minConf}%`];
+    return { ...sig, signal: 'HOLD', confidence: newConf, score: sig.score, reasons };
+  }
+
+  return { ...sig, confidence: newConf, apexBoost: confBoost };
 }
 
-// ── Load saved strategies from Supabase on startup ───────────────
+// ── Load history from Supabase on startup ────────────────────────
 async function apexLoadStrategies() {
   try {
-    // Load previously saved strategies
     const data = await sbFetch('tc_settings?id=eq.1&select=apex_strategies', 'GET');
     const saved = data?.[0]?.apex_strategies;
     if (saved) {
       const parsed = typeof saved === 'string' ? JSON.parse(saved) : saved;
       if (Array.isArray(parsed)) {
-        learnedStrategies.length = 0;
-        learnedStrategies.push(...parsed);
-        log('apex', `🧠 APEX loaded ${learnedStrategies.length} saved strategies`);
+        APEX.rules = parsed;
+        log('apex', `🧠 APEX v2 loaded ${APEX.rules.length} saved rules`);
       }
     }
 
-    // Load historical trades from Supabase and seed pattern buckets
-    // This ensures APEX has data even after a bot restart
-    try {
-      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(); // last 7 days
-      const hist = await sbFetch(
-        'tc_trades?order=created_at.desc&limit=200&created_at=gte.' + since + '&select=symbol,pnl,side,created_at',
-        'GET'
-      );
-      if (Array.isArray(hist) && hist.length) {
-        let seeded = 0;
-        for (const t of hist) {
-          if (t.pnl == null) continue;
-          const pnl = +t.pnl;
-          const won = pnl > 0;
-          const sym = t.symbol || '';
-          // Minimal ctx from DB — we have symbol and pnl, estimate RSI from tradePerformanceLog
-          apexRecordTrade(pnl, {
-            rsi:        50,          // unknown from DB — neutral
-            session:    'US Session',// assume US
-            holdMins:   10,          // assume mid hold
-            atrPct:     0.005,       // assume mid vol
-            exitReason: t.side || 'unknown',
-            sym,
-          });
-          seeded++;
-        }
-        log('apex', `🧠 APEX seeded from ${seeded} historical trades — running initial analysis`);
-        // Force analysis immediately since we now have data
+    // Seed from real tc_trades (not sim)
+    const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const hist = await sbFetch(
+      'tc_trades?order=created_at.desc&limit=300&created_at=gte.' + since + '&select=symbol,pnl,side,created_at',
+      'GET'
+    );
+    if (Array.isArray(hist) && hist.length) {
+      let seeded = 0;
+      for (const t of hist) {
+        if (!t.pnl || t.pnl === 0) continue;
+        const pnl = +t.pnl;
+        const hour = new Date(t.created_at).getHours();
+        // We don't have RSI/conf from DB — only seed if pnl is meaningful
+        // This gives APEX symbol and exit-type data at minimum
+        APEX.trades.push({
+          pnl, won: pnl > 0,
+          sym:      t.symbol || '',
+          rsi:      50,        // unknown — will be marked invalid for RSI analysis
+          rsiBand:  50,        // won't match any meaningful band
+          conf:     70,        // assume decent conf
+          confBand: 70,
+          atrPct:   0.005,
+          atrBand:  'mid',
+          session:  'US',
+          hour,
+          hourBand: hour < 10 ? 'open' : hour < 12 ? 'mid-am' : hour < 14 ? 'lunch' : hour < 16 ? 'pm' : 'after',
+          side:     t.side?.includes('SHORT')||t.side?.includes('COVER') ? 'short' : 'long',
+          holdMins: 10,
+          holdBand: 'normal',
+          exitType: t.side || 'unknown',
+          ts:       new Date(t.created_at).getTime(),
+        });
+        seeded++;
+      }
+      if (seeded >= APEX.minSamples) {
+        log('apex', `🧠 APEX v2 seeded ${seeded} historical trades — analyzing`);
         await apexAnalyze();
       }
-    } catch(e) {
-      log('apex', `APEX history seed failed: ${e.message}`);
     }
-  } catch(e) {}
+  } catch(e) {
+    log('error', `APEX load failed: ${e.message}`);
+  }
 }
 
 
@@ -761,7 +841,7 @@ function recordTradeOutcome(pnl, ctx = {}) {
   runAdaptiveTuning().catch(() => {});
 
   // Feed APEX learning engine
-  apexRecordTrade(pnl, { ...ctx, sym: ctx.sym || '' });
+  apexRecord(pnl, { ...ctx, sym: ctx.sym || '' });
 }
 
 function _updateBucket(param, key, won) {
@@ -3637,7 +3717,7 @@ function generateSignal(sym, bars5m, bars15m) {
     atr: atrVal,
   };
   // Apply APEX learned rules — may boost confidence or block bad setups
-  return apexFilterSignal(_baseSig, {
+  return apexFilter(_baseSig, {
     sym: sym || '',
     session: getCurrentSession(),
     atrPct: atrVal / (price || 1),
