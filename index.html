@@ -1260,7 +1260,7 @@ let eqHist=[], stableEq=0, eqResetAt=0;
 //   - The chart window is the last WINDOW_SECS of stream data,
 //     mapped left→right so newer data is always on the right.
 // ═══════════════════════════════════════════════════════════
-const WINDOW_SECS  = 600;   // 10 minutes of history — spikes look less dramatic at wider scale
+const WINDOW_SECS  = 14400; // 4 hours of history — shows full session
 const STREAM_CAP   = 8000;  // max points in ring buffer
 
 let chartTarget   = 0;      // real equity from server
@@ -1302,6 +1302,8 @@ function procEq(raw, cap){
 function startChart(){
   const cv=$('equityChart'); if(!cv||chartRAF) return;
   chartCtx = cv.getContext('2d');
+  // Load historical equity on startup so chart has full session history
+  loadEquityHistory();
   (function loop(){
     // Skip rendering when tab is hidden — prevents stale stream buildup
     if(!document.hidden) renderChart();
@@ -1313,26 +1315,66 @@ function startChart(){
 // and reseed from current value so the chart starts fresh
 document.addEventListener('visibilitychange', () => {
   if(!document.hidden){
-    // Tab is visible again — clean up the stream
     const now = Date.now();
-    if(chartCurrent > 0){
-      // Keep only the last 3 seconds of real points
-      // so the chart starts fresh without a cliff
-      chartStream = chartStream.filter(p => p.t >= now - 3000);
-      // If stream is basically empty, seed one point at current value
-      // so the chart has something to draw from
-      if(chartStream.length < 3 && chartCurrent > 0){
-        chartStream.push({ t: now - 2000, v: chartCurrent });
-        chartStream.push({ t: now - 1000, v: chartCurrent });
-        chartStream.push({ t: now,        v: chartCurrent });
+    // DON'T wipe chartStream — keep full history
+    // Just remove the gap that built up while tab was hidden
+    // by bridging: add a flat line from last known point to now
+    const lastPt = chartStream[chartStream.length-1];
+    if(lastPt && chartCurrent > 0){
+      const gapMs = now - lastPt.t;
+      if(gapMs > 5000){
+        // Fill gap with flat line at last known value
+        // This prevents the cliff/spike from the discontinuity
+        const steps = Math.min(20, Math.floor(gapMs / 1000));
+        for(let i=1; i<=steps; i++){
+          chartStream.push({ t: lastPt.t + (gapMs/steps)*i, v: lastPt.v });
+        }
+        chartStream.push({ t: now, v: chartCurrent });
+        if(chartStream.length > STREAM_CAP) chartStream.splice(0, chartStream.length-STREAM_CAP);
       }
+    } else if(chartStream.length < 3 && chartCurrent > 0){
+      // Empty stream — reload history from server
+      loadEquityHistory();
     }
-    // Reset all animation state
+    // Reset animation noise only (not the stream)
     _n1=0; _n2=0; _v1=0; _v2=0;
     chartLineGlow = 0;
     chartVelocity = 0;
   }
 });
+
+// Load historical equity from tc_equity table and seed chartStream
+async function loadEquityHistory(){
+  try {
+    const SB=getSbUrl(), KEY=getSbKey();
+    if(!SB||!KEY) return;
+    // Fetch last 4 hours of equity snapshots
+    const since = new Date(Date.now() - 4*60*60*1000).toISOString();
+    const url = `${SB}/rest/v1/tc_equity?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=500`;
+    const res = await fetch(url, { headers:{'apikey':KEY,'Authorization':'Bearer '+KEY} });
+    if(!res.ok) return;
+    const rows = await res.json();
+    if(!rows||!rows.length) return;
+
+    // Seed chartStream with historical points
+    const cap = chartTarget > 0 ? chartTarget * 1.5 : 150000; // upper sanity bound
+    let seeded = 0;
+    for(const row of rows){
+      const t = new Date(row.created_at).getTime();
+      const v = +row.value;
+      if(!v||v<=0||v>cap*2) continue; // skip bad values
+      // Only add if meaningfully different from last point (avoid flat line spam)
+      const last = chartStream[chartStream.length-1];
+      if(!last || Math.abs(v-last.v)>0.5 || (t-last.t)>60000){
+        chartStream.push({t, v});
+        seeded++;
+      }
+    }
+    // Cap at STREAM_CAP
+    if(chartStream.length > STREAM_CAP) chartStream.splice(0, chartStream.length-STREAM_CAP);
+    if(seeded > 0) console.log(`[chart] Seeded ${seeded} historical equity points`);
+  } catch(e) { console.warn('[chart] History load failed:', e.message); }
+}
 
 // Called by poll() when new equity data arrives from Supabase
 function drawChart(){
