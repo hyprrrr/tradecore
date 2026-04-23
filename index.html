@@ -1031,6 +1031,16 @@ tbody tr:hover td { background: rgba(255,255,255,0.02); }
               <option value="wyckoff">Wyckoff Phases</option>
             </select>
             <div class="settings-desc" id="strategyDesc"></div>
+
+            <div style="margin-top:14px">
+              <div class="settings-title" style="display:flex;align-items:center;gap:8px">
+                <span>🧠 APEX Learned Strategies</span>
+                <span id="apexCount" style="font-size:10px;background:rgba(0,212,170,0.15);color:#00d4aa;padding:2px 7px;border-radius:20px;font-weight:600">0 active</span>
+              </div>
+              <div id="apexStrategies" style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+                <div style="color:#555;font-size:11px;font-style:italic">Strategies appear after 5+ trades are analyzed...</div>
+              </div>
+            </div>
           </div>
 
           <div class="settings-section">
@@ -1944,12 +1954,60 @@ function onStrategyChange(){
   saveSettings();
 }
 
+function renderApexStrategies(strategiesJson) {
+  const container = $('apexStrategies');
+  const countBadge = $('apexCount');
+  if (!container) return;
+
+  let strategies = [];
+  try {
+    strategies = typeof strategiesJson === 'string'
+      ? JSON.parse(strategiesJson)
+      : (Array.isArray(strategiesJson) ? strategiesJson : []);
+  } catch(e) { return; }
+
+  if (!strategies.length) {
+    container.innerHTML = '<div style="color:#555;font-size:11px;font-style:italic">Strategies appear after 5+ trades are analyzed...</div>';
+    if (countBadge) countBadge.textContent = '0 active';
+    return;
+  }
+
+  if (countBadge) countBadge.textContent = strategies.length + ' active';
+
+  container.innerHTML = strategies.map(s => {
+    const wr = s.winRate || 0;
+    const isWarn = s.rule?.type === 'rsi_avoid' || s.rule?.type === 'hold_avoid';
+    const wrClass = wr >= 0.6 ? 'good' : 'bad';
+    const wrPct = (wr * 100).toFixed(0);
+    const age = s.generated ? timeAgo(new Date(s.generated)) : '';
+    return `<div class="apex-card${isWarn?' apex-warn':''}">
+      <div class="apex-card-name">${s.name}</div>
+      <div class="apex-card-desc">${s.description}</div>
+      <div class="apex-card-meta">
+        <span class="apex-wr ${wrClass}">${wrPct}% WR</span>
+        &nbsp;·&nbsp; ${s.sampleSize || 0} trades
+        ${age ? '&nbsp;·&nbsp; updated ' + age : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function timeAgo(date) {
+  const secs = Math.floor((Date.now() - date) / 1000);
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return Math.floor(secs/60) + 'm ago';
+  if (secs < 86400) return Math.floor(secs/3600) + 'h ago';
+  return Math.floor(secs/86400) + 'd ago';
+}
+
 function loadSettings(){
   return sbGet('tc_settings','?id=eq.1').then(data=>{
     if(!data||!data.length) return;
     const s=data[0];
     if(s.symbols){ symbols=s.symbols.split(',').map(x=>x.trim().toUpperCase()); renderSymbolTags(); }
     if(s.strategy){ const el=$('strategy'); if(el){ el.value=s.strategy; onStrategyChange(); } }
+    // Render APEX learned strategies
+    if(s.apex_strategies) renderApexStrategies(s.apex_strategies);
     const nm={startingCapital:'starting_capital',maxPositions:'max_positions',rsiOversold:'rsi_oversold',minConfidence:'min_confidence',confirmCount:'confirm_count'};
     Object.entries(nm).forEach(([id,k])=>{ const e=$(id); if(e&&s[k]!=null) e.value=+s[k]; });
     const rm={maxPosPct:['max_position_pct','maxPosPctV','%'],tp1Pct:['tp1_pct','tp1V','%'],tp2Pct:['tp2_pct','tp2V','%'],tp3Pct:['tp3_pct','tp3V','%'],atrStopMult:['atr_stop_mult','atrStopV','×'],hardMaxLoss:['hard_max_loss','hardLossV','%']};
