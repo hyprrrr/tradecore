@@ -2488,38 +2488,74 @@ const simState = {
 
 // Load historical 5-minute bars for all symbols to replay
 async function loadSimBars(symbols) {
-  log('sim', `🎮 Loading bar replay data for ${symbols.length} symbols from Alpaca…`);
+  log('sim', `🎮 Loading 60 days of bar history for ${symbols.length} symbols…`);
   simState.bars    = {};
   simState.cursor  = 0;
   simState.loaded  = false;
 
-  // Use Alpaca historical bars — reliable from Railway, no rate limiting issues
-  // Get last 5 days of 5-min bars
+  // Fetch 60 days of 5-min bars using pagination (Alpaca limit=1000 per request)
+  // 60 days × 6.5 trading hours × 12 bars/hour = ~4,680 bars per symbol
+  // We paginate with next_page_token until we have all bars or hit 60 days
   const end   = new Date();
-  const start = new Date(end.getTime() - 5 * 24 * 60 * 60 * 1000);
+  const start = new Date(end.getTime() - 60 * 24 * 60 * 60 * 1000);
   const startStr = start.toISOString().split('.')[0] + 'Z';
   const endStr   = end.toISOString().split('.')[0] + 'Z';
 
-  const results = await Promise.allSettled(symbols.map(async sym => {
-    try {
-      const url = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=5Min&start=${startStr}&end=${endStr}&limit=1000&adjustment=raw&feed=${getDataFeed()}`;
-      const data = await alpacaFetch(url);
-      const bars  = (data?.bars || []).map(b => ({
-        t: b.t,
-        o: b.o, h: b.h, l: b.l, c: b.c,
-        v: b.v || 0,
-      })).filter(b => b.c && b.h && b.l && b.o);
-      return { sym, bars: bars.length >= 20 ? bars : null };
-    } catch(e) {
-      log('warn', `Sim: failed to load ${sym}: ${e.message}`);
-      return { sym, bars: null };
-    }
-  }));
+  async function fetchAllBarsForSym(sym) {
+    const allBars = [];
+    let nextToken = null;
+    let pages = 0;
+    const maxPages = 8; // max 8 × 1000 = 8,000 bars per symbol
 
-  for (const r of results) {
-    if (r.status === 'fulfilled' && r.value?.bars) {
-      simState.bars[r.value.sym] = r.value.bars;
+    do {
+      try {
+        let url = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=5Min&start=${startStr}&end=${endStr}&limit=1000&adjustment=raw&feed=${getDataFeed()}`;
+        if (nextToken) url += `&page_token=${encodeURIComponent(nextToken)}`;
+        const data = await alpacaFetch(url);
+        const bars = (data?.bars || []).map(b => ({
+          t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0,
+        })).filter(b => b.c && b.h && b.l && b.o);
+
+        // Filter: only keep market hours (9:30-16:00 ET) bars
+        // Skip pre/after market — they have low volume and mess up indicators
+        const mktBars = bars.filter(b => {
+          const d = new Date(b.t);
+          const h = d.getUTCHours() - 4; // ET offset (approximate — no DST handling needed for filtering)
+          const m = d.getUTCMinutes();
+          const etMins = h * 60 + m;
+          return etMins >= 570 && etMins < 960; // 9:30am-4:00pm = 570-960 mins
+        });
+
+        allBars.push(...mktBars);
+        nextToken = data?.next_page_token || null;
+        pages++;
+
+        // Small delay between pages to avoid rate limiting
+        if (nextToken) await new Promise(r => setTimeout(r, 150));
+      } catch(e) {
+        log('warn', `Sim: page ${pages} failed for ${sym}: ${e.message}`);
+        break;
+      }
+    } while (nextToken && pages < maxPages);
+
+    return allBars;
+  }
+
+  // Fetch symbols in batches of 3 (rate limit friendly)
+  log('sim', `🎮 Fetching paginated history (this takes ~20s)…`);
+  for (let i = 0; i < symbols.length; i += 3) {
+    const batch = symbols.slice(i, i + 3);
+    const results = await Promise.allSettled(batch.map(async sym => {
+      const bars = await fetchAllBarsForSym(sym);
+      return { sym, bars };
+    }));
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value?.bars?.length >= 50) {
+        simState.bars[r.value.sym] = r.value.bars;
+        log('sim', `🎮 ${r.value.sym}: ${r.value.bars.length} bars loaded`);
+      }
     }
+    if (i + 3 < symbols.length) await new Promise(r => setTimeout(r, 300));
   }
 
   const loaded = Object.keys(simState.bars);
@@ -2527,18 +2563,18 @@ async function loadSimBars(symbols) {
 
   const lengths = Object.values(simState.bars).map(b => b.length);
   if (lengths.length === 0) {
-    log('error', 'Sim: no bar data loaded — check Alpaca API keys');
+    log('error', 'Sim: no bar data — check Alpaca keys');
     return false;
   }
 
   simState.totalBars   = Math.min(...lengths);
-  simState.cursor      = 20; // start with enough history for indicators
+  simState.cursor      = 50; // start with 50 bars of history for indicators
   simState.loaded      = true;
-  simState.startTime   = simState.bars[Object.keys(simState.bars)[0]][0].t;
+  simState.startTime   = simState.bars[loaded[0]][0].t;
   simState.currentTime = simState.startTime;
 
-  log('sim', `🎮 Bar replay ready: ${simState.totalBars} bars per symbol`);
-  log('sim', `🎮 Replay starts at: ${simState.startTime}`);
+  log('sim', `🎮 Replay ready: ${simState.totalBars} bars/symbol (~${(simState.totalBars/78).toFixed(0)} trading days)`);
+  log('sim', `🎮 Starts: ${simState.startTime} | Ends: ${simState.bars[loaded[0]][simState.totalBars-1].t}`);
   return true;
 }
 
@@ -2548,31 +2584,50 @@ function simAdvanceCursor() {
   if (!simState.loaded) return null;
 
   if (simState.cursor >= simState.totalBars - 20) {
-    // End of replay — fully reset so next run starts clean
-    log('sim', '🎮 Bar replay complete — resetting for next run');
-    simState.cursor = 20;
+    // End of 60-day replay — close all open positions at last price then stop
+    log('sim', `🎮 Replay complete — ${simState.totalBars} bars processed`);
+    log('sim', `🎮 Final equity: $${portfolio.toFixed(2)} | ${totalWins}W/${totalLosses}L`);
 
-    // Clear all open positions so they don't carry over
-    Object.keys(positions).forEach(k => delete positions[k]);
-    Object.keys(shortPositions).forEach(k => delete shortPositions[k]);
+    // Force-close all open positions at final bar price
+    for (const sym of Object.keys(positions)) {
+      const pos = positions[sym];
+      const finalPrice = simCurrentPrice(sym) || pos.entryPrice;
+      const pnl = (finalPrice - pos.entryPrice) * pos.qty;
+      portfolio += pos.qty * finalPrice;
+      delete positions[sym];
+      log('sim', `🎮 Sim end — closed ${sym} long @ $${finalPrice.toFixed(2)} PnL: $${pnl.toFixed(2)}`);
+    }
+    for (const sym of Object.keys(shortPositions)) {
+      const pos = shortPositions[sym];
+      const finalPrice = simCurrentPrice(sym) || pos.entryPrice;
+      const pnl = (pos.entryPrice - finalPrice) * pos.qty;
+      portfolio += pnl;
+      delete shortPositions[sym];
+      log('sim', `🎮 Sim end — closed ${sym} short PnL: $${pnl.toFixed(2)}`);
+    }
     pendingSignals.clear();
-    portfolio = CONFIG.startingCapital;
-    realDailyStartEquity = CONFIG.startingCapital;
-    totalWins = 0; totalLosses = 0;
 
-    // Clear sim positions from Supabase
-    sbFetch('sim_tc_positions?symbol=neq.____NONE____', 'DELETE').catch(()=>{});
+    // Update final sim portfolio state
     sbFetch('sim_tc_portfolio?id=eq.1', 'PATCH', {
-      cash: CONFIG.startingCapital, total_value: CONFIG.startingCapital,
-      day_pnl: 0, total_wins: 0, total_losses: 0,
-      session: '🎮 SIM RESET', updated_at: new Date().toISOString(),
+      cash: +portfolio.toFixed(2), total_value: +portfolio.toFixed(2),
+      total_wins: totalWins, total_losses: totalLosses,
+      session: '🎮 SIM COMPLETE', updated_at: new Date().toISOString(),
     }).catch(()=>{});
+
+    // Pause — don't auto-reset, let user review results
+    simState.cursor = simState.totalBars - 20; // hold at last bar
+    log('sim', '🎮 Sim paused at end. Toggle Sim off/on to restart with fresh data.');
+    return null; // signal to stop advancing
   }
 
   simState.cursor++;
   const firstSym = Object.keys(simState.bars)[0];
   if (simState.bars[firstSym]?.[simState.cursor]) {
     simState.currentTime = simState.bars[firstSym][simState.cursor].t;
+  }
+  // Check if we just hit end-of-replay
+  if (simState.cursor >= simState.totalBars - 20) {
+    return null; // signals runSimScan to stop
   }
 
   // Return sliced bars — bot only sees bars UP TO current cursor
@@ -2630,7 +2685,7 @@ async function runSimScan() {
 
   // 1 bar per scan — keeps positions visible and lets you watch them play out
   // Scan runs every 3s in sim mode (controlled by tick interval override below)
-  const SIM_BARS_PER_SCAN = 1;
+  const SIM_BARS_PER_SCAN = 5; // 5 bars per scan = ~3hrs to complete 60 trading days
   let lastSnapshot = null;
   let lastBarTime = null;
 
