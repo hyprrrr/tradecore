@@ -1270,7 +1270,7 @@ let eqHist=[], stableEq=0, eqResetAt=0;
 //   - The chart window is the last WINDOW_SECS of stream data,
 //     mapped left→right so newer data is always on the right.
 // ═══════════════════════════════════════════════════════════
-const WINDOW_SECS  = 14400; // 4 hours of history — shows full session
+const WINDOW_SECS  = 1800;  // 30 min default — tight enough to see movement clearly
 const STREAM_CAP   = 8000;  // max points in ring buffer
 
 let chartTarget   = 0;      // real equity from server
@@ -1500,16 +1500,20 @@ function renderChart(){
   // ── 7. LAYOUT ─────────────────────────────────────────────────
   const P = { t:56, b:22, l:50, r:16 };
   const cW = W - P.l - P.r;
+
+  // Dynamic Y-axis: zoom to actual data range + 20% padding
+  // This prevents the "flat stick" look when equity barely moves
   const cH = H - P.t - P.b;
 
-  // Value range — padding so line isn't clipped to edges
+  // Value range — DYNAMIC zoom to actual data, not anchored to cap
   const vals = visible.map(p=>p.v);
-  const rawMin = Math.min(...vals, cap);
-  const rawMax = Math.max(...vals, cap);
-  // Generous padding: 30% of range or at least 0.5% of cap
-  // Prevents small moves from filling the whole chart height
+  // Don't include cap in min/max — that forces a flat line on small moves
+  const rawMin = Math.min(...vals);
+  const rawMax = Math.max(...vals);
   const rangeRaw = rawMax - rawMin;
-  const padding = Math.max(rangeRaw * 0.30, cap * 0.005);
+  // Zoom padding: 30% of actual range, minimum 0.05% of equity (not 0.5%)
+  // This makes +$128 on $100k actually visible as real movement
+  const padding = Math.max(rangeRaw * 0.30, (chartTarget||cap) * 0.0003);
   const minV = rawMin - padding;
   const maxV = rawMax + padding;
   const range = maxV - minV || 1;
@@ -1531,7 +1535,11 @@ function renderChart(){
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(P.l,y); ctx.lineTo(W-P.r,y); ctx.stroke();
     ctx.fillStyle = 'rgba(255,255,255,0.20)';
-    ctx.fillText('$'+Math.round(v/1000)+'k', P.l-5, y+3);
+    // Smart label: show full value when zoomed in (<$1k range), else show Xk
+    const label = range < 1000
+      ? '$' + v.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0})
+      : '$' + (v/1000).toFixed(1) + 'k';
+    ctx.fillText(label, P.l-5, y+3);
   }
   ctx.setLineDash([]);
 
