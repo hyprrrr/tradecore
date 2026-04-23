@@ -466,8 +466,8 @@ function apexRecordTrade(pnl, ctx = {}) {
 
   apexTradeCount++;
 
-  // Run analysis every 5 trades
-  if (apexTradeCount % 5 === 0) {
+  // Run analysis every 3 trades
+  if (apexTradeCount % 3 === 0) {
     setTimeout(() => apexAnalyze().catch(() => {}), 1000);
   }
 }
@@ -488,11 +488,11 @@ async function apexAnalyze() {
   // ── STRATEGY 1: Best RSI entry zone ─────────────────────────
   let bestRsiWR = 0, bestRsiBand = null;
   for (const [band, stats] of Object.entries(apexBuckets.rsiRange)) {
-    if (stats.total < 3) continue;
+    if (stats.total < 2) continue;
     const wr = stats.wins / stats.total;
     if (wr > bestRsiWR) { bestRsiWR = wr; bestRsiBand = band; }
   }
-  if (bestRsiBand && bestRsiWR >= 0.60) {
+  if (bestRsiBand && bestRsiWR >= 0.55) {
     const [lo, hi] = bestRsiBand.split('-').map(Number);
     newStrategies.push({
       id: 'apex_rsi_zone',
@@ -508,11 +508,11 @@ async function apexAnalyze() {
   // ── STRATEGY 2: Best session ─────────────────────────────────
   let bestSessWR = 0, bestSess = null;
   for (const [sess, stats] of Object.entries(apexBuckets.session)) {
-    if (stats.total < 3) continue;
+    if (stats.total < 2) continue;
     const wr = stats.wins / stats.total;
     if (wr > bestSessWR) { bestSessWR = wr; bestSess = sess; }
   }
-  if (bestSess && bestSessWR >= 0.60) {
+  if (bestSess && bestSessWR >= 0.55) {
     newStrategies.push({
       id: 'apex_session',
       name: `APEX: Trade ${bestSess} Only`,
@@ -527,7 +527,7 @@ async function apexAnalyze() {
   // ── STRATEGY 3: Avoid losing hold times ─────────────────────
   let worstHoldWR = 1, worstHold = null;
   for (const [band, stats] of Object.entries(apexBuckets.holdTime)) {
-    if (stats.total < 3) continue;
+    if (stats.total < 2) continue;
     const wr = stats.wins / stats.total;
     if (wr < worstHoldWR) { worstHoldWR = wr; worstHold = band; }
   }
@@ -549,11 +549,11 @@ async function apexAnalyze() {
   // ── STRATEGY 4: Volatility preference ───────────────────────
   let bestAtrWR = 0, bestAtr = null;
   for (const [band, stats] of Object.entries(apexBuckets.atrRange)) {
-    if (stats.total < 3) continue;
+    if (stats.total < 2) continue;
     const wr = stats.wins / stats.total;
     if (wr > bestAtrWR) { bestAtrWR = wr; bestAtr = band; }
   }
-  if (bestAtr && bestAtrWR >= 0.60) {
+  if (bestAtr && bestAtrWR >= 0.55) {
     const atrDesc = { 'low-vol': 'low volatility (ATR < 0.3%)', 'mid-vol': 'normal volatility (ATR 0.3-0.8%)', 'high-vol': 'high volatility (ATR > 0.8%)' };
     newStrategies.push({
       id: 'apex_volatility',
@@ -569,11 +569,11 @@ async function apexAnalyze() {
   // ── STRATEGY 5: Symbol group performance ────────────────────
   let bestSymWR = 0, bestSymGroup = null;
   for (const [group, stats] of Object.entries(apexBuckets.symGroup)) {
-    if (stats.total < 3) continue;
+    if (stats.total < 2) continue;
     const wr = stats.wins / stats.total;
     if (wr > bestSymWR) { bestSymWR = wr; bestSymGroup = group; }
   }
-  if (bestSymGroup && bestSymWR >= 0.60) {
+  if (bestSymGroup && bestSymWR >= 0.55) {
     newStrategies.push({
       id: 'apex_sym_group',
       name: `APEX: Focus ${bestSymGroup} Symbols`,
@@ -680,6 +680,7 @@ function apexFilterSignal(sig, ctx = {}) {
 // ── Load saved strategies from Supabase on startup ───────────────
 async function apexLoadStrategies() {
   try {
+    // Load previously saved strategies
     const data = await sbFetch(tbl('tc_settings') + '?id=eq.1&select=apex_strategies', 'GET');
     const saved = data?.[0]?.apex_strategies;
     if (saved) {
@@ -687,8 +688,42 @@ async function apexLoadStrategies() {
       if (Array.isArray(parsed)) {
         learnedStrategies.length = 0;
         learnedStrategies.push(...parsed);
-        log('apex', `🧠 APEX loaded ${learnedStrategies.length} learned strategies`);
+        log('apex', `🧠 APEX loaded ${learnedStrategies.length} saved strategies`);
       }
+    }
+
+    // Load historical trades from Supabase and seed pattern buckets
+    // This ensures APEX has data even after a bot restart
+    try {
+      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(); // last 7 days
+      const hist = await sbFetch(
+        tbl('tc_trades') + '?order=created_at.desc&limit=200&created_at=gte.' + since + '&select=symbol,pnl,side,created_at',
+        'GET'
+      );
+      if (Array.isArray(hist) && hist.length) {
+        let seeded = 0;
+        for (const t of hist) {
+          if (t.pnl == null) continue;
+          const pnl = +t.pnl;
+          const won = pnl > 0;
+          const sym = t.symbol || '';
+          // Minimal ctx from DB — we have symbol and pnl, estimate RSI from tradePerformanceLog
+          apexRecordTrade(pnl, {
+            rsi:        50,          // unknown from DB — neutral
+            session:    'US Session',// assume US
+            holdMins:   10,          // assume mid hold
+            atrPct:     0.005,       // assume mid vol
+            exitReason: t.side || 'unknown',
+            sym,
+          });
+          seeded++;
+        }
+        log('apex', `🧠 APEX seeded from ${seeded} historical trades — running initial analysis`);
+        // Force analysis immediately since we now have data
+        await apexAnalyze();
+      }
+    } catch(e) {
+      log('apex', `APEX history seed failed: ${e.message}`);
     }
   } catch(e) {}
 }
@@ -3986,7 +4021,7 @@ async function coverShort(sym, price, reason) {
   const pnl = (pos.entryPrice - price) * qty;
   if (isSimMode()) portfolio += pnl; // only track in sim — live uses Alpaca
   pnl > 0 ? totalWins++ : totalLosses++;
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short', sym, exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete shortPositions[sym];
   alpacaShorts.delete(sym);
   // Immediately delete from Supabase so dashboard reflects closure instantly
@@ -4179,7 +4214,7 @@ async function exitPosition(sym, price, reason) {
   // Adding proceeds in live mode causes cash to inflate and diverge from reality
   if (isSimMode()) portfolio += qtyToSell * price;
   pnl > 0 ? totalWins++ : totalLosses++;
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long', sym, exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete positions[sym];
   alpacaPositions.delete(sym);
   sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE').catch(() => {});
@@ -5730,7 +5765,7 @@ async function exitScalp(sym, price, reason) {
 
   if (isSimMode()) portfolio += direction === 'long' ? qty * price : pnl;
   pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++);
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: 50, session: getCurrentSession(), side: pos?.direction||'long', exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*pos.qty) : 0 });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: 50, session: getCurrentSession(), side: pos?.direction||'long', sym, exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*pos.qty) : 0 });
 
   const holdSecs = Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 1000);
   const icons = { SCALP_TP:'🎯', SCALP_SL:'🛑', SCALP_TRAIL:'📉', SCALP_TIME:'⏰', SCALP_REVERSE:'↩️', SCALP_MANUAL:'🖐' };
