@@ -180,7 +180,7 @@ async function loadRemoteConfig() {
     if (s.peak_rsi_exit)    CONFIG.peakRsiExit       = +s.peak_rsi_exit;
     if (s.fade_min_profit)  CONFIG.fadeMinProfit     = +s.fade_min_profit / 100;
     if (s.fade_pullback)    CONFIG.fadePullback      = +s.fade_pullback / 100;
-    if (s.hard_max_loss)    CONFIG.hardMaxLoss       = +s.hard_max_loss / 100;
+    if (s.hard_max_loss)    CONFIG.hardMaxLoss       = Math.max(0.01, +s.hard_max_loss / 100); // min 1% hard stop
     if (s.initial_stop_pct) CONFIG.initialStopPct    = +s.initial_stop_pct / 100;
     if (s.atr_stop_mult)    CONFIG.atrStopMult       = Math.min(2.0, Math.max(1.5, +s.atr_stop_mult)); // clamp 1.5-2.0x
     if (s.discord_webhook)  CONFIG.discordWebhook   = s.discord_webhook;
@@ -3552,14 +3552,27 @@ function generateSignal(sym, bars5m, bars15m) {
     rsiScore = 1; direction = 'sell';
     reasons.push(`RSI leaning overbought ${r.toFixed(1)}`);
   } else if (r >= 45 && r <= 65 && emaBullStack && macdRising) {
-    // ── MOMENTUM MODE: trending day, RSI healthy, EMAs stacked bullish ──
-    // Don't wait for oversold — ride the trend while structure holds
-    rsiScore = 1; direction = 'buy';
-    reasons.push(`Momentum mode: RSI ${r.toFixed(1)} + EMA bull stack + MACD rising ✅`);
+    // ── MOMENTUM MODE: trending up ──
+    // Extra check: price must be near recent high (not in downtrend bounce)
+    const recent20High = Math.max(...c5.slice(-20));
+    const pctFromHigh = (recent20High - price) / recent20High;
+    if (pctFromHigh > 0.02) {
+      // Price is >2% below recent high = this is a relief bounce, not a trend
+      // Don't go long into a downtrend — look for short instead
+      if (CONFIG.shortsEnabled && macdFalling) {
+        rsiScore = 1; direction = 'sell';
+        reasons.push(`Momentum short: RSI ${r.toFixed(1)} relief bounce (${(pctFromHigh*100).toFixed(1)}% below high)`);
+      } else {
+        return { signal:'HOLD', confidence:0, score:0,
+          reasons:[`Momentum blocked: ${(pctFromHigh*100).toFixed(1)}% below 20-bar high — downtrend`], rsi:r };
+      }
+    } else {
+      rsiScore = 1; direction = 'buy';
+      reasons.push(`Momentum long: RSI ${r.toFixed(1)} + EMA bull stack + MACD rising ✅`);
+    }
   } else if (r >= 35 && r <= 55 && emaBearStack && macdFalling && CONFIG.shortsEnabled) {
-    // Momentum short: trending down day
     rsiScore = 1; direction = 'sell';
-    reasons.push(`Momentum mode: RSI ${r.toFixed(1)} + EMA bear stack + MACD falling ✅`);
+    reasons.push(`Momentum short: RSI ${r.toFixed(1)} + EMA bear stack + MACD falling ✅`);
   } else {
     return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no trend or extreme`], rsi: r };
   }
@@ -3752,11 +3765,17 @@ function generateSignal(sym, bars5m, bars15m) {
   // Note low confidence but don't hard-block — let position sizing handle risk
 
   // ── SESSION QUALITY FILTER ────────────────────────────────────────
-  // US stocks have low liquidity during Asia/pre-market sessions
-  // Require higher confidence outside US hours to reduce false signals
   const session = getCurrentSession();
   const isOffHours = session.includes('Off') || session.includes('Asia') || session.includes('Pre');
-  const sessionMinConf = isOffHours ? 80 : 65; // stricter off-hours
+  const sessionMinConf = isOffHours ? 80 : 65;
+
+  // Block US-listed international ETFs during off-hours — they track closed markets
+  // and have almost zero real volume during Asia session
+  const intlETFs = ['EWG','EWJ','EWA','EWY','EWZ','FXI','EFA','EEM','VWO','IEFA','MCHI'];
+  if (isOffHours && intlETFs.includes(sym)) {
+    return { signal:'HOLD', confidence:0, score:0,
+      reasons:[`${sym} is intl ETF — no signal during ${session}`], rsi:r };
+  }
   if (finalConf < sessionMinConf) {
     // Log first time per symbol to help diagnose — don't spam
     reasons.push(`Conf ${finalConf}% below session minimum ${sessionMinConf}% (${session})`);
@@ -3902,14 +3921,17 @@ function calcQty(symbol, price, bars, confidence = 70) {
 
   // Hard dollar cap — never put more than maxPositionPct of STARTING capital in one trade
   // Use startingCapital not current portfolio — prevents oversizing on winning streaks
-  const baseCap    = Math.max(portfolio, CONFIG.startingCapital);
-  // WR-weighted confidence scaling — bet smaller during losing streaks
+  // Always size against STARTING capital — prevents runaway sizing on winning streaks
+  const baseCap    = CONFIG.startingCapital;
+  // Cap maxPositionPct — adaptive engine can drift it up, hard cap at 8%
+  const cappedMaxPos = Math.min(0.08, Math.max(0.02, CONFIG.maxPositionPct));
+  // WR-weighted confidence scaling
   const recentWR = totalWins + totalLosses > 10
     ? totalWins / (totalWins + totalLosses)
     : 0.5;
   const wrMult = recentWR >= 0.60 ? 1.0 : recentWR >= 0.50 ? 0.85 : recentWR >= 0.40 ? 0.65 : 0.45;
   const confScale  = Math.max(0.4, Math.min(1.0, (confidence - CONFIG.minConfidence) / 30 + 0.5)) * wrMult;
-  const scaledPct  = CONFIG.maxPositionPct * confScale;
+  const scaledPct  = cappedMaxPos * confScale;
   const maxCost    = baseCap * scaledPct;              // hard dollar cap
   const maxShares  = Math.floor(maxCost / price);
 
@@ -3919,7 +3941,7 @@ function calcQty(symbol, price, bars, confidence = 70) {
     let atrVal = atr(bars, 14);
     // Minimum ATR floor: 0.1% of price — prevents insane qty on near-zero ATR stocks
     // e.g. NIO at $6.91 with ATR=0.01 → floor to $0.0069, capping qty to reasonable size
-    const atrFloor = price * 0.0025; // min 0.25% — prevents insane qty on low-ATR bars
+    const atrFloor = price * 0.004;  // min 0.4% — prevents insane qty on low-ATR ETFs (was 0.25%)
     atrVal = Math.max(atrVal, atrFloor);
     if (atrVal > 0) {
       // Risk at most 1% of starting capital per trade
@@ -4172,7 +4194,7 @@ async function coverShort(sym, price, reason) {
   await syncLog('sell', `${icon} COVER ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
 
   // Trigger recovery on short losses too
-  if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
+  if (pnl < 0 && CONFIG.recoveryMode) {
     triggerRecovery(sym, Math.abs(pnl), price, pos);
   }
 }
@@ -5926,7 +5948,7 @@ async function exitScalp(sym, price, reason) {
   }
 
   // Trigger recovery on scalp losses too
-  if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
+  if (pnl < 0 && CONFIG.recoveryMode) {
     triggerRecovery(sym, Math.abs(pnl), price, pos);
   }
 }
