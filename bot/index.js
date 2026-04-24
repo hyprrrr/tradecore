@@ -425,7 +425,7 @@ const APEX = {
   blocked:    {},      // sym+condition → blocked until N more wins
   lastSave:   0,
   minSamples: 4,       // minimum trades before a pattern is trusted
-  minEdge:    0.15,    // minimum WR difference vs baseline to matter
+  minEdge:    0.10,    // 10pp edge vs baseline required (was 15pp — too strict)
 };
 
 // ── Record a real trade outcome ──────────────────────────────────
@@ -681,16 +681,49 @@ async function apexAnalyze() {
     });
   }
 
-  // Deduplicate — keep best version of each id
-  APEX.rules = [];
-  for (const rule of newRules) {
-    const existing = APEX.rules.findIndex(r => r.id === rule.id);
-    if (existing >= 0) APEX.rules[existing] = rule;
-    else APEX.rules.push(rule);
+  // ── DIMENSION 7: TP optimization ─────────────────────────────
+  // Analyze which exit types are working and suggest config changes
+  const tp1Exits  = APEX.trades.filter(t => t.exitType === 'TP1');
+  const tp2Exits  = APEX.trades.filter(t => t.exitType === 'TP2');
+  const slExits   = APEX.trades.filter(t => t.exitType === 'STOP_LOSS');
+  const beExits   = APEX.trades.filter(t => t.exitType === 'BREAK_EVEN_STOP');
+
+  if (tp1Exits.length >= 3) {
+    const tp1WR = tp1Exits.filter(t=>t.won).length / tp1Exits.length;
+    if (tp1WR >= 0.85) {
+      // TP1 is consistently hitting — great, log it as confirmation
+      newRules.push({
+        id: 'tp1_optimal',
+        type: 'config_info',
+        name: `TP1 hitting at ${(tp1WR*100).toFixed(0)}% rate (${tp1Exits.length} trades) ✅`,
+        description: `Take-profit level 1 is working well. Current TP1 (${(CONFIG.tp1Pct*100).toFixed(1)}%) is well-calibrated for current market conditions.`,
+        action: { info: true },
+        wr: tp1WR, n: tp1Exits.length, edge: tp1WR - base.wr,
+      });
+    }
   }
 
-  // Sort by edge magnitude descending
-  APEX.rules.sort((a, b) => Math.abs(b.edge) - Math.abs(a.edge));
+  if (slExits.length >= 4) {
+    const slWR = slExits.filter(t=>t.won).length / slExits.length;
+    if (slWR === 0) {
+      // Every stop loss is a full loss — stop is too wide or entries too bad
+      // Suggest tightening
+      const suggestedMult = Math.max(1.5, (CONFIG.atrStopMult||2.0) - 0.25);
+      newRules.push({
+        id: 'sl_too_wide',
+        type: 'config_adjust',
+        name: `Stop losses 0% WR — tighten ATR mult to ${suggestedMult.toFixed(2)}x`,
+        description: `All ${slExits.length} stop loss exits are full losses with zero recovery. Current ATR multiplier (${CONFIG.atrStopMult}x) may be too wide. Suggested: ${suggestedMult}x.`,
+        action: { suggestAtrMult: suggestedMult, applyNow: true },
+        wr: slWR, n: slExits.length, edge: slWR - base.wr,
+      });
+      // Actually apply the suggestion if edge is very clear
+      if (slExits.length >= 6 && CONFIG.atrStopMult > 1.5) {
+        CONFIG.atrStopMult = suggestedMult;
+        log('apex', "APEX AUTO-TIGHTENED ATR stop mult to "+suggestedMult.toFixed(2)+"x after "+slExits.length+" full losses");
+      }
+    }
+  }
 
   // Save to Supabase
   try {
@@ -734,6 +767,10 @@ function apexFilter(sig, ctx = {}) {
         break;
       case 'time_block':
         if (hourBand === rule.hourBand) minConf = Math.max(minConf, a.minConf || 80);
+        break;
+      case 'drawdown_guard':
+        // Recent losing streak — raise minimum confidence for all trades
+        minConf = Math.max(minConf, a.minConf || 80);
         break;
     }
   }
@@ -779,22 +816,33 @@ async function apexLoadStrategies() {
         const hour = new Date(t.created_at).getHours();
         // We don't have RSI/conf from DB — only seed if pnl is meaningful
         // This gives APEX symbol and exit-type data at minimum
+        // Use real stored values if available (new schema), else estimate
+        const tRsi  = t.rsi     || 50;
+        const tConf = t.confidence || 70;
+        const tAtr  = t.atr_pct || 0.005;
+        const tHold = t.hold_mins || 10;
+        const tSess = t.session || 'US';
+        // Only seed trades where we have real signal data
+        // (not just pnl — we need RSI/conf to learn accurately)
+        const hasRealData = tRsi !== 50 || tConf > 60;
+        if (!hasRealData && pnl === 0) continue; // skip empty rows
+
         APEX.trades.push({
           pnl, won: pnl > 0,
           sym:      t.symbol || '',
-          rsi:      50,        // unknown — will be marked invalid for RSI analysis
-          rsiBand:  50,        // won't match any meaningful band
-          conf:     70,        // assume decent conf
-          confBand: 70,
-          atrPct:   0.005,
-          atrBand:  'mid',
-          session:  'US',
+          rsi:      Math.round(tRsi),
+          rsiBand:  Math.floor(tRsi / 5) * 5,
+          conf:     Math.round(tConf),
+          confBand: Math.floor(tConf / 10) * 10,
+          atrPct:   tAtr,
+          atrBand:  tAtr < 0.003 ? 'low' : tAtr < 0.008 ? 'mid' : 'high',
+          session:  tSess.includes('US') ? 'US' : tSess.includes('Pre') ? 'Pre' : 'Off',
           hour,
           hourBand: hour < 10 ? 'open' : hour < 12 ? 'mid-am' : hour < 14 ? 'lunch' : hour < 16 ? 'pm' : 'after',
           side:     t.side?.includes('SHORT')||t.side?.includes('COVER') ? 'short' : 'long',
-          holdMins: 10,
-          holdBand: 'normal',
-          exitType: t.side || 'unknown',
+          holdMins: tHold,
+          holdBand: tHold < 3 ? 'quick' : tHold < 10 ? 'normal' : tHold < 30 ? 'long' : 'very-long',
+          exitType: t.reason || t.side || 'unknown',
           ts:       new Date(t.created_at).getTime(),
         });
         seeded++;
@@ -842,6 +890,18 @@ function recordTradeOutcome(pnl, ctx = {}) {
 
   // Feed APEX learning engine
   apexRecord(pnl, { ...ctx, sym: ctx.sym || '' });
+}
+
+// Helper: enrich trade object with analytics for tc_trades insert
+function enrichTrade(trade, pos) {
+  return {
+    ...trade,
+    rsi:       pos?.sigInfo?.rsi     || null,
+    atrPct:    pos?.atrAtEntry ? pos.atrAtEntry / (trade.price||1) : null,
+    holdMins:  pos?.entryTime ? Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000) : null,
+    session:   getCurrentSession(),
+    direction: pos?.direction || trade.side?.includes('COVER')||trade.side?.includes('SHORT') ? 'short' : 'long',
+  };
 }
 
 function _updateBucket(param, key, won) {
@@ -1684,13 +1744,19 @@ async function syncPositions() {
 
 async function syncTrade(trade) {
   await sbFetch(tbl('tc_trades'), 'POST', {
-    symbol: trade.sym,
-    side: trade.side,
-    qty: trade.qty,
-    price: +trade.price.toFixed(4),
-    pnl: trade.pnl !== null ? +trade.pnl.toFixed(2) : null,
-    reason: trade.reason || null,
+    symbol:     trade.sym,
+    side:       trade.side,
+    qty:        trade.qty,
+    price:      +trade.price.toFixed(4),
+    pnl:        trade.pnl !== null ? +trade.pnl.toFixed(2) : null,
+    reason:     trade.reason || null,
     confidence: trade.confidence || null,
+    // Extended fields for APEX learning engine
+    rsi:        trade.rsi        || null,
+    atr_pct:    trade.atrPct     || null,
+    hold_mins:  trade.holdMins   || null,
+    session:    trade.session    || null,
+    direction:  trade.direction  || null,
     created_at: new Date().toISOString(),
   });
 }
@@ -4224,7 +4290,10 @@ async function coverShort(sym, price, reason) {
   const pnl = (pos.entryPrice - price) * qty;
   if (isSimMode()) portfolio += pnl; // only track in sim — live uses Alpaca
   pnl > 0 ? totalWins++ : totalLosses++;
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'short', sym, exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50,
+    atrPct: pos?.atrAtEntry ? pos.atrAtEntry/price : 0,
+    session: getCurrentSession(), side: 'short', sym, exitReason: reason,
+    holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete shortPositions[sym];
   alpacaShorts.delete(sym);
   // Immediately delete from Supabase so dashboard reflects closure instantly
@@ -4417,7 +4486,10 @@ async function exitPosition(sym, price, reason) {
   // Adding proceeds in live mode causes cash to inflate and diverge from reality
   if (isSimMode()) portfolio += qtyToSell * price;
   pnl > 0 ? totalWins++ : totalLosses++;
-  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50, session: getCurrentSession(), side: 'long', sym, exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
+  recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50,
+    atrPct: pos?.atrAtEntry ? pos.atrAtEntry/price : 0,
+    session: getCurrentSession(), side: 'long', sym, exitReason: reason,
+    holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*(pos.qtyRemaining||pos.qty)) : 0, ...(pos.entryAnalytics||{}) });
   delete positions[sym];
   alpacaPositions.delete(sym);
   sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE').catch(() => {});
