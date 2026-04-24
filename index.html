@@ -1118,8 +1118,9 @@ function renderCandlestickChart(data){
   const svg  = $('equityChart');
   const wrap = $('chartWrap');
   if(!svg||!wrap) return;
-  const W = wrap.clientWidth;
-  const H = wrap.clientHeight;
+  const W = wrap.clientWidth || 800;
+  const H = wrap.clientHeight || 400;
+  if(!W || !H) return;
   svg.setAttribute('width', W);
   svg.setAttribute('height', H);
   svg.innerHTML = '';
@@ -1294,7 +1295,9 @@ function renderDepthChart(){
   const svg = $('depthSvg');
   if(!svg) return;
   const wrap = svg.parentElement;
-  const W = wrap.clientWidth, H = wrap.clientHeight;
+  if(!wrap) return;
+  const W = wrap.clientWidth || 280, H = wrap.clientHeight || 90;
+  if(!W || !H) return;
   svg.setAttribute('width',W); svg.setAttribute('height',H); svg.innerHTML='';
   let ac=0, bc=0;
   const ap=[], bp=[];
@@ -1321,7 +1324,9 @@ function renderSparkline(tradeHistory){
   const svg  = $('sparkSvg');
   if(!svg) return;
   const wrap = svg.parentElement;
-  const W = wrap.clientWidth, H = wrap.clientHeight;
+  if(!wrap) return;
+  const W = wrap.clientWidth || 280, H = wrap.clientHeight || 50;
+  if(!W || !H) return;
   svg.setAttribute('width',W); svg.setAttribute('height',H); svg.innerHTML='';
 
   // Build sparkline from real equity progression
@@ -1437,8 +1442,11 @@ async function pollData(){
   const tw    = +(p.total_wins  ||0);
   const tl    = +(p.total_losses||0);
   const wr    = tw+tl>0 ? (tw/(tw+tl))*100 : 0;
-  const highVal = +(p.peak_equity||eq);
-  const lowVal  = +(p.trough_equity||eq);
+  // peak/trough equity - calculated from equity history or fall back to current
+  const histMax = eqChartData.length ? Math.max(...eqChartData.map(d=>d.high||d.close||0)) : eq;
+  const histMin = eqChartData.length ? Math.min(...eqChartData.map(d=>d.low||d.close||eq)) : eq;
+  const highVal = histMax > eq ? histMax : eq;
+  const lowVal  = histMin < eq ? histMin : eq;
 
   // ── Update header stats ─────────────────────────────────────
   const eqEl = $('mainEquity');
@@ -1487,9 +1495,9 @@ async function pollData(){
   // Build equity candles from real trades
   const candles = buildEquityCandles(trd);
   if(candles.length) eqChartData = candles;
-  renderCandlestickChart(eqChartData.length?eqChartData:null);
-  renderSparkline(trd);
-  renderDepthChart();
+  try{renderCandlestickChart(eqChartData.length?eqChartData:null);}catch(e){}
+  try{renderSparkline(trd);}catch(e){}
+  try{renderDepthChart();}catch(e){}
 }
 
 /* ══ CONNECTION STATUS ══════════════════════════════════════════ */
@@ -1617,23 +1625,25 @@ async function exportCSV(){
 
 /* ══ INIT ═══════════════════════════════════════════════════════ */
 function init(){
-  // Render initial placeholder charts
-  renderWatchlist();
-  renderTicker();
-  renderOrderBook([]);
-  renderOrders([]);
-  renderHistory([]);
-  renderDepthChart();
-  renderSparkline([]);
-  updateClock();
+  // Safe renders — wrapped so a crash here never blocks button wiring
+  try { renderWatchlist(); } catch(e){}
+  try { renderTicker(); } catch(e){}
+  try { renderOrders([]); } catch(e){}
+  try { renderHistory([]); } catch(e){}
+  try { updateClock(); } catch(e){}
 
-  // Generate placeholder equity chart while loading
-  const placeholderData = [];
-  const now = Date.now();
-  let v = startCapital;
-  for(let i=29;i>=0;i--){ v+=rnd(-500,700); placeholderData.push({time:new Date(now-i*3600000),open:v-rnd(0,200),high:v+rnd(0,300),low:v-rnd(0,300),close:v,volume:0,up:true}); }
-  eqChartData = placeholderData;
-  renderCandlestickChart(eqChartData);
+  // Defer canvas/SVG renders until after first paint (they need real clientWidth)
+  requestAnimationFrame(()=>{
+    try { renderDepthChart(); } catch(e){}
+    try { renderSparkline([]); } catch(e){}
+    // Placeholder equity chart
+    const placeholderData = [];
+    const now = Date.now();
+    let v = startCapital;
+    for(let i=29;i>=0;i--){ v+=rnd(-500,700); placeholderData.push({time:new Date(now-i*3600000),open:v-rnd(0,200),high:v+rnd(0,300),low:v-rnd(0,300),close:v,volume:0,up:true}); }
+    eqChartData = placeholderData;
+    try { renderCandlestickChart(eqChartData); } catch(e){}
+  });
 
   setInterval(updateClock, 1000);
 
@@ -1642,8 +1652,9 @@ function init(){
   window.addEventListener('resize',()=>{
     clearTimeout(resizeTimer);
     resizeTimer=setTimeout(()=>{
-      renderCandlestickChart(eqChartData.length?eqChartData:null);
-      renderDepthChart(); renderSparkline();
+      try{renderCandlestickChart(eqChartData.length?eqChartData:null);}catch(e){}
+      try{renderDepthChart();}catch(e){}
+      try{renderSparkline();}catch(e){}
     },150);
   });
 
