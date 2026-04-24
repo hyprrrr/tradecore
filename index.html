@@ -1282,7 +1282,7 @@ let eqHist=[], stableEq=0, eqResetAt=0;
 //     mapped left→right so newer data is always on the right.
 // ═══════════════════════════════════════════════════════════
 const WINDOW_SECS  = 1800;  // 30 min default — tight enough to see movement clearly
-const STREAM_CAP   = 8000;  // max points in ring buffer
+const STREAM_CAP   = 500;  // max points in ring buffer
 
 let chartTarget   = 0;      // real equity from server
 let chartCurrent  = 0;      // displayed value, glides toward target
@@ -1331,9 +1331,22 @@ function startChart(){
     chartMouseX = (e.clientX-r.left)*(cv.width/r.width);
   });
   cv.addEventListener('mouseleave', ()=>{ chartMouseX=null; });
+  let _lastRender = 0;
+  let _lastRenderVal = 0;
   (function loop(){
-    if(!document.hidden) renderChart();
-    chartRAF=requestAnimationFrame(loop);
+    chartRAF = requestAnimationFrame(loop);
+    if (document.hidden) return; // skip when hidden
+
+    const now = Date.now();
+    const valChanged = Math.abs(chartCurrent - _lastRenderVal) > 0.05;
+    const timePassed = (now - _lastRender) > 100; // max 10fps
+
+    // Only render if value changed OR 100ms passed (for animations/glow decay)
+    if (valChanged || timePassed) {
+      _lastRender    = now;
+      _lastRenderVal = chartCurrent;
+      renderChart();
+    }
   })();
 }
 
@@ -1450,8 +1463,12 @@ function renderChart(){
       for(let i=1;i<=steps;i++) chartStream.push({t:last.t+(gap/steps)*i, v:last.v});
     }
     if(!last || Math.abs(displayVal-last.v)>0.10 || gap>1000){
-      chartStream.push({t:now, v:displayVal});
-      if(chartStream.length>STREAM_CAP) chartStream.shift();
+      // Spike guard: reject single-frame jumps >3% of equity (bad data)
+      const _pj = last ? Math.abs(displayVal-last.v)/Math.max(last.v,1) : 0;
+      if(_pj < 0.03 || chartStream.length < 5){
+        chartStream.push({t:now, v:displayVal});
+        if(chartStream.length>STREAM_CAP) chartStream.shift();
+      }
     }
   }
 
