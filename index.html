@@ -1078,7 +1078,7 @@ function saveConfig() {
   localStorage.setItem('sbUrl',  CONFIG.sbUrl);
   localStorage.setItem('sbKey',  CONFIG.sbKey);
   $('configPanel').classList.remove('open');
-  fetchAll();
+  startDataSync();
 }
 
 // Pre-fill saved values
@@ -1339,6 +1339,136 @@ async function fetchAll() {
   ]);
 }
 
+// ═══════════════════════════════════════ TIERED POLLING + REALTIME ═══════════════════════════════════════
+// Strategy:
+//   • Supabase Realtime (WebSocket) pushes changes for portfolio/positions/trades/logs → instant updates.
+//   • Polling runs as a fallback at tiered intervals in case the socket drops.
+//   • Settings poll slowly; they rarely change.
+//
+// Tiers (when socket is healthy, intervals are doubled to reduce load; when degraded, full rate):
+//   fast   → portfolio, positions, logs, bot status
+//   medium → trades, equity
+//   slow   → settings
+
+const pollTimers = { fast: null, medium: null, slow: null };
+const POLL_INTERVALS = {
+  fast:   { healthy: 2000, degraded: 1000 },
+  medium: { healthy: 5000, degraded: 3000 },
+  slow:   30000,
+};
+let realtimeChannel = null;
+let realtimeHealthy = false;
+
+function stopAllPollers() {
+  for (const k of Object.keys(pollTimers)) {
+    if (pollTimers[k]) { clearInterval(pollTimers[k]); pollTimers[k] = null; }
+  }
+}
+
+function startTieredPollers() {
+  stopAllPollers();
+  const fastMs   = realtimeHealthy ? POLL_INTERVALS.fast.healthy   : POLL_INTERVALS.fast.degraded;
+  const mediumMs = realtimeHealthy ? POLL_INTERVALS.medium.healthy : POLL_INTERVALS.medium.degraded;
+
+  pollTimers.fast = setInterval(() => {
+    if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
+    fetchBotStatus();
+    fetchPortfolio();
+    fetchPositions();
+    fetchLogs();
+  }, fastMs);
+
+  pollTimers.medium = setInterval(() => {
+    if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
+    fetchTrades();
+    fetchEquity();
+  }, mediumMs);
+
+  pollTimers.slow = setInterval(() => {
+    if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
+    fetchSettings();
+  }, POLL_INTERVALS.slow);
+}
+
+// ── Supabase Realtime via raw WebSocket (no SDK needed) ──────────────────────
+// Protocol reference: Supabase Realtime uses Phoenix channel frames over WS.
+function connectRealtime() {
+  if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
+  if (realtimeChannel) { try { realtimeChannel.close(); } catch(e){} realtimeChannel = null; }
+
+  // Build ws URL: https://xxx.supabase.co → wss://xxx.supabase.co/realtime/v1/websocket
+  const wsUrl = CONFIG.sbUrl.replace(/^https?:/, 'wss:').replace(/\/$/, '')
+              + `/realtime/v1/websocket?apikey=${encodeURIComponent(CONFIG.sbKey)}&vsn=1.0.0`;
+
+  let ws;
+  try { ws = new WebSocket(wsUrl); } catch(e) { return; }
+  realtimeChannel = ws;
+
+  const prefix  = state.mode === 'sim' ? 'sim_tc_' : 'tc_';
+  const tables  = ['portfolio', 'positions', 'trades', 'logs'];
+  const topicOf = t => `realtime:public:${prefix}${t}`;
+
+  let heartbeatTimer = null;
+  let refCounter = 1;
+  const ref = () => String(refCounter++);
+
+  ws.addEventListener('open', () => {
+    realtimeHealthy = true;
+    // Subscribe to each table's change stream.
+    tables.forEach(t => {
+      ws.send(JSON.stringify({
+        topic: topicOf(t),
+        event: 'phx_join',
+        payload: { config: { postgres_changes: [{ event: '*', schema: 'public', table: prefix + t }] } },
+        ref: ref(),
+      }));
+    });
+    // Phoenix heartbeat every 25s — keeps the socket alive.
+    heartbeatTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ topic: 'phoenix', event: 'heartbeat', payload: {}, ref: ref() }));
+      }
+    }, 25000);
+    // Restart pollers at healthy (slower) cadence now that realtime is up.
+    startTieredPollers();
+  });
+
+  ws.addEventListener('message', ev => {
+    let msg; try { msg = JSON.parse(ev.data); } catch(e) { return; }
+    // We care about postgres_changes events on our subscribed topics.
+    if (msg.event !== 'postgres_changes' || !msg.topic) return;
+    // Route: topic "realtime:public:tc_trades" → "trades"
+    const tail = msg.topic.split(':').pop() || '';
+    const tableSuffix = tail.replace(prefix, '');
+    // Trigger targeted refetches — cheaper than refetching everything.
+    switch (tableSuffix) {
+      case 'portfolio': fetchPortfolio(); break;
+      case 'positions': fetchPositions(); break;
+      case 'trades':    fetchTrades(); fetchEquity(); break;
+      case 'logs':      fetchLogs(); break;
+    }
+  });
+
+  const degrade = () => {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    if (!realtimeHealthy) return;
+    realtimeHealthy = false;
+    startTieredPollers();  // switch back to full-rate polling
+    // Retry connection after a backoff
+    setTimeout(() => connectRealtime(), 5000);
+  };
+  ws.addEventListener('close', degrade);
+  ws.addEventListener('error', degrade);
+}
+
+function startDataSync() {
+  if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
+  fetchAll();
+  startTieredPollers();
+  connectRealtime();
+}
+// ═══════════════════════════════════════ END TIERED POLLING + REALTIME ═══════════════════════════════════════
+
 // ═══════════════════════════════════════ ACTIONS ═══════════════════════════════════════
 async function toggleSetting(field, value) {
   const body = { [field]: value, updated_at: new Date().toISOString() };
@@ -1366,8 +1496,13 @@ async function toggleSimMode() {
 
   // Clear chart so it rebuilds with sim/live data
   lastEquityChart = [];
+  state._lastEquityHash = null;
+  chart.allCandles = [];  // force first-load view behavior in drawCandlestickChart
   const svg = $('equityChart');
   if (svg) svg.innerHTML = '';
+
+  // Realtime is subscribed to the previous prefix — reconnect to the new one.
+  connectRealtime();
 
   // Full refresh with new mode's tables
   setTimeout(fetchAll, 300);
@@ -1570,9 +1705,20 @@ function updateConnStatus() {
 // ═══════════════════════════════════════ EQUITY CHART (CANDLESTICKS FROM SNAPSHOTS) ═══════════════════════════════════════
 function renderEquityChart(snapshots) {
   if (!snapshots || !snapshots.length) return;
-  // Store snapshots then rebuild via current TF
+
+  // Skip redundant rebuilds: if nothing material changed, bail early.
+  // Hash = count + last timestamp + last value (cheap & sufficient).
+  const last = snapshots[snapshots.length - 1];
+  const hash = `${snapshots.length}|${last.created_at}|${last.value}`;
+  if (hash === state._lastEquityHash && chart.allCandles.length) return;
+  state._lastEquityHash = hash;
+
   state.equitySnapshots = snapshots;
-  setTF(chart.tf);
+
+  // Rebuild candles at current TF but preserve user's pan/zoom (handled by
+  // drawCandlestickChart). This path runs every poll — do NOT reset view.
+  const rebuilt = buildCandlesForTF(snapshots, chart.tf);
+  drawCandlestickChart(rebuilt);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1625,16 +1771,28 @@ function buildCandlesForTF(snapshots, tf) {
 }
 
 function setTF(tf) {
+  // User-initiated timeframe change — safe to reset view.
   chart.tf = tf;
   chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
   if (!chart.allCandles.length) return;
   // Default view: show last 60 candles (or all if fewer)
   chart.viewCount = Math.min(60, chart.allCandles.length);
   chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
-  redrawChart();
+  if (!chart.isDragging) redrawChart();
 }
 
+// rAF-batched redraw — coalesces multiple calls per frame into one render
+let _redrawScheduled = false;
 function redrawChart() {
+  if (_redrawScheduled) return;
+  _redrawScheduled = true;
+  requestAnimationFrame(() => {
+    _redrawScheduled = false;
+    _redrawChartImmediate();
+  });
+}
+
+function _redrawChartImmediate() {
   const candles = chart.allCandles;
   if (!candles.length) return;
 
@@ -1770,7 +1928,7 @@ function redrawChart() {
     hit.setAttribute('height', ch);
     hit.setAttribute('fill', 'transparent');
     hit.style.cursor = 'crosshair';
-    hit.addEventListener('mouseenter', () => showTooltip(d, x, top, up, color));
+    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, top, up, color); });
     hit.addEventListener('mouseleave', hideTooltip);
     svg.appendChild(hit);
   });
@@ -1842,6 +2000,7 @@ function initChartInteraction() {
     chart.dragStartX   = e.clientX;
     chart.dragStartView = chart.viewStart;
     wrap.style.cursor  = 'grabbing';
+    hideTooltip();
     e.preventDefault();
   });
   window.addEventListener('mousemove', e => {
@@ -1908,14 +2067,32 @@ function initChartInteraction() {
 // ── Compatibility wrapper so old code calling drawCandlestickChart still works ──
 function drawCandlestickChart(candles) {
   if (!candles || !candles.length) return;
+
+  // Detect whether user was pinned to the right edge (viewing latest data)
+  // before we swap in new candles. Tolerance of 1 candle for rounding.
+  const prevLen       = chart.allCandles.length;
+  const wasAtRightEdge = prevLen === 0
+    || (chart.viewStart + chart.viewCount >= prevLen - 1);
+
   chart.allCandles = candles;
-  // Only reset view if this is genuinely new data (different length)
-  if (Math.abs(candles.length - chart.viewCount) > 10 || chart.viewCount === 60) {
+
+  // First load → default view: last 60 candles (or all if fewer).
+  if (prevLen === 0) {
     chart.viewCount = Math.min(60, candles.length);
     chart.viewStart = Math.max(0, candles.length - chart.viewCount);
+  } else if (wasAtRightEdge) {
+    // User hasn't panned away — keep window size, just slide to the new right edge.
+    chart.viewStart = Math.max(0, candles.length - chart.viewCount);
   }
+  // else: user has panned back to inspect history — leave viewStart/viewCount alone.
+
+  // Clamp in case data shrank (e.g. TF switch, sim reset)
+  chart.viewCount = Math.max(5, Math.min(candles.length, chart.viewCount));
+  chart.viewStart = Math.max(0, Math.min(candles.length - chart.viewCount, chart.viewStart));
+
   initChartInteraction();
-  redrawChart();
+  // Don't yank the chart out from under an active drag.
+  if (!chart.isDragging) redrawChart();
 }
 function makeLinePath(values, xScale, yScale) {
   let d = '';
@@ -2399,7 +2576,7 @@ function saveConnectionSettings() {
   localStorage.setItem('botUrl', CONFIG.botUrl);
   localStorage.setItem('sbUrl',  CONFIG.sbUrl);
   localStorage.setItem('sbKey',  CONFIG.sbKey);
-  fetchAll();
+  startDataSync();
   const statusEl = $('settingsSaveStatus');
   if (statusEl) { statusEl.textContent = '✓ Connecting…'; statusEl.style.color = 'var(--buy)'; }
 }
@@ -2461,8 +2638,7 @@ function init() {
   if (CONFIG.sbUrl && CONFIG.sbKey) {
     // Defer first fetch until after layout paints (so chart has real dimensions)
     requestAnimationFrame(() => {
-      fetchAll();
-      pollTimer = setInterval(fetchAll, 5000);
+      startDataSync();
     });
   } else {
     // Show config panel if no creds
