@@ -1179,63 +1179,47 @@ async function fetchTrades() {
 }
 
 async function fetchEquity() {
-  const tbl = state.mode === 'sim' ? 'sim_tc_trades' : 'tc_trades';
+  // Read the equity curve directly from tc_equity — the bot writes a snapshot
+  // of Alpaca's actual equity every 2 minutes. This is the only source of
+  // truth for the curve. Previously we summed pnl from tc_trades, which
+  // produced garbage: stale/test trades warped the running total, yielding
+  // candles that showed "equity went from $98k to $134k" inside a 5-minute
+  // bucket while Alpaca reported a $96k account. Now the chart can never
+  // disagree with Alpaca.
+  const tbl = state.mode === 'sim' ? 'sim_tc_equity' : 'tc_equity';
   const since = new Date(Date.now() - 30*24*60*60*1000).toISOString();
   const data = await sbFetch(
-    `${tbl}?select=pnl,created_at&created_at=gte.${since}&order=created_at.asc&limit=2000`,
+    `${tbl}?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=5000`,
     'GET'
   );
 
   const startCap = state.settings.starting_capital || 100000;
-  // Live equity from portfolio (includes unrealized P&L from open positions).
-  // This is what the header shows — we pin the chart's last point to this so
-  // the candles track the header in real time instead of waiting for a close.
+  // Live equity for the tail (includes unrealized P&L on open positions).
   const livePortfolioValue = state.portfolio ? +state.portfolio.total_value : null;
 
+  let snapshots;
+
   if (!data || !Array.isArray(data) || data.length === 0) {
-    // No trades — draw flat baseline, but pin the tail to live equity if we have it.
+    // No history yet — draw flat baseline at the live equity (or starting cap).
     const now = Date.now();
     const base = livePortfolioValue || startCap;
-    const flat = Array.from({length: 24}, (_, i) => ({
+    snapshots = Array.from({length: 24}, (_, i) => ({
       value: i === 23 ? base : startCap,
       created_at: new Date(now - (23 - i) * 3600 * 1000).toISOString(),
     }));
-    renderEquityChart(flat);
-    renderSparkline(flat);
-    return;
-  }
+  } else {
+    // Use raw snapshots as-is. Each row is a real, recorded equity value.
+    snapshots = data.map(r => ({ value: +r.value, created_at: r.created_at }));
 
-  // Build cumulative equity snapshots — one snapshot per settled trade.
-  // Previously pushed two points at the same timestamp (before + after pnl)
-  // which inflated OHLC inside a bucket and made mid-bucket equity look
-  // artificially volatile. Now each snapshot is the equity AFTER the trade
-  // settles, which is the only value that actually matters for the curve.
-  let equity = startCap;
-  const snapshots = [];
-
-  // Starting point 1 hour before first trade (baseline)
-  const firstTs = new Date(data[0].created_at).getTime();
-  snapshots.push({ value: startCap, created_at: new Date(firstTs - 3600000).toISOString() });
-
-  data.forEach(t => {
-    equity += +(t.pnl) || 0;
-    snapshots.push({ value: equity, created_at: t.created_at });
-  });
-
-  // ── LIVE TAIL ────────────────────────────────────────────────────
-  // Append a live snapshot using portfolio.total_value (includes unrealized
-  // P&L on open positions). Without this, the chart only moves when a trade
-  // closes, visibly lagging the header P&L by minutes.
-  //
-  // Critical: only append if the value is materially different from the last
-  // settled equity — otherwise we create ghost candles at every poll. Also
-  // align the tail timestamp to the current bucket boundary the chart is on
-  // so it merges into the current candle instead of spawning a fresh bucket.
-  if (livePortfolioValue != null && Number.isFinite(livePortfolioValue)) {
-    const lastSettled = snapshots[snapshots.length - 1].value;
-    const drift = Math.abs(livePortfolioValue - lastSettled);
-    if (drift >= 0.01) { // only append on a real change
-      snapshots.push({ value: livePortfolioValue, created_at: new Date().toISOString() });
+    // ── LIVE TAIL ──
+    // Append current portfolio.total_value so the chart stays synced with
+    // the header between 2-minute snapshots. Only append when it differs
+    // materially from the latest snapshot to avoid ghost candles.
+    if (livePortfolioValue != null && Number.isFinite(livePortfolioValue)) {
+      const lastVal = snapshots[snapshots.length - 1].value;
+      if (Math.abs(livePortfolioValue - lastVal) >= 0.01) {
+        snapshots.push({ value: livePortfolioValue, created_at: new Date().toISOString() });
+      }
     }
   }
 
