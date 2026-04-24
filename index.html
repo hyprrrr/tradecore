@@ -1176,14 +1176,42 @@ async function fetchTrades() {
 }
 
 async function fetchEquity() {
-  const tbl = state.mode === 'sim' ? 'sim_tc_equity' : 'tc_equity';
-  const since = new Date(Date.now() - 7*24*60*60*1000).toISOString();
-  const data = await sbFetch(`${tbl}?select=value,created_at&created_at=gte.${since}&order=created_at.asc`, 'GET');
-  if (data && Array.isArray(data)) {
-    state.equitySnapshots = data;
-    renderEquityChart(data);
-    renderSparkline(data);
+  // The bot doesn't have a tc_equity table - we build the equity curve from
+  // tc_trades.pnl (cumulative) and tc_portfolio.total_value snapshots.
+  const tbl = state.mode === 'sim' ? 'sim_tc_trades' : 'tc_trades';
+  const since = new Date(Date.now() - 30*24*60*60*1000).toISOString(); // 30 days
+  const data = await sbFetch(`${tbl}?select=pnl,created_at,symbol,side,price&created_at=gte.${since}&order=created_at.asc&limit=2000`, 'GET');
+
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    // No trades yet — draw flat baseline from starting capital
+    const startCap = state.settings.starting_capital || 100000;
+    const now = Date.now();
+    const flatData = Array.from({length:10}, (_,i) => ({
+      value: startCap,
+      created_at: new Date(now - (9-i)*3600*1000).toISOString()
+    }));
+    renderEquityChart(flatData);
+    renderSparkline(flatData);
+    return;
   }
+
+  // Build cumulative equity snapshots from trade PnL
+  const startCap = state.settings.starting_capital || 100000;
+  let equity = startCap;
+  const snapshots = [];
+
+  // Add starting point
+  const firstTime = new Date(new Date(data[0].created_at).getTime() - 3600000).toISOString();
+  snapshots.push({ value: startCap, created_at: firstTime });
+
+  data.forEach(t => {
+    equity += (+(t.pnl) || 0);
+    snapshots.push({ value: equity, created_at: t.created_at });
+  });
+
+  state.equitySnapshots = snapshots;
+  renderEquityChart(snapshots);
+  renderSparkline(snapshots);
 }
 
 async function fetchLogs() {
@@ -1199,29 +1227,103 @@ async function fetchSettings() {
   const data = await sbFetch('tc_settings?id=eq.1&select=*', 'GET');
   if (data && data[0]) {
     state.settings = data[0];
-    updateSettingsUI(data[0]);
+    const s = data[0];
+    updateSettingsUI(s);
+
+    // Sync sim mode state from DB (source of truth)
+    const simOn = !!s.sim_mode;
+    state.mode = simOn ? 'sim' : 'alpaca';
+    $('modeText').textContent = simOn ? 'SIM' : 'LIVE';
+    $('modeDot').className    = 'status-dot ' + (simOn ? 'paused' : 'live');
+    $('simBtn').textContent   = simOn ? 'Exit Sim' : 'Enter Sim';
+
+    // Session pill from settings
+    if (s.session && $('sessionPill')) $('sessionPill').textContent = s.session;
+
+    // Win/loss from settings
+    const tw = s.total_wins   || 0;
+    const tl = s.total_losses || 0;
+    if ($('mainWL'))     $('mainWL').textContent     = tw + 'W / ' + tl + 'L';
+    if ($('statWinLoss')) $('statWinLoss').textContent = tw + 'W / ' + tl + 'L';
+    const wr = tw+tl > 0 ? (tw/(tw+tl)*100).toFixed(1) : '0.0';
+    if ($('statWinRate')) {
+      $('statWinRate').textContent = wr + '%';
+      $('statWinRate').style.color = +wr >= 50 ? 'var(--buy)' : 'var(--sell)';
+    }
+    const sw = s.scalp_wins   || 0;
+    const sl = s.scalp_losses || 0;
+    if ($('statScalpWL'))  $('statScalpWL').textContent  = sw + ' / ' + sl;
+    if ($('statScalpRate')) $('statScalpRate').textContent = (sw+sl > 0 ? (sw/(sw+sl)*100).toFixed(1) : '0.0') + '% WR';
   }
 }
 
 async function fetchBotStatus() {
-  const status = await botFetch('/');
-  if (status) {
+  // Primary: check Supabase portfolio - this is our real connectivity indicator
+  const tbl = state.mode === 'sim' ? 'sim_tc_portfolio' : 'tc_portfolio';
+  const portData = await sbFetch(`${tbl}?id=eq.1&select=*`, 'GET');
+  if (portData && portData[0]) {
     state.connected = true;
-    state.mode = (status.mode || 'alpaca').toLowerCase();
-    updateBotStatus(status);
-  } else {
+  } else if (CONFIG.sbUrl && CONFIG.sbKey) {
+    // Supabase creds set but fetch failed - still try
     state.connected = false;
   }
+
+  // Also read sim_mode from settings to keep mode in sync
+  const settingsData = await sbFetch('tc_settings?id=eq.1&select=sim_mode,session,total_wins,total_losses,scalp_wins,scalp_losses,uptime_min,open_positions,short_positions,scalp_positions', 'GET');
+  if (settingsData && settingsData[0]) {
+    const s = settingsData[0];
+    const simOn = !!s.sim_mode;
+    state.mode = simOn ? 'sim' : 'alpaca';
+
+    // Update mode pill and sim button
+    $('modeText').textContent = simOn ? 'SIM' : 'LIVE';
+    $('modeDot').className    = 'status-dot ' + (simOn ? 'paused' : 'live');
+    $('simBtn').textContent   = simOn ? 'Exit Sim' : 'Enter Sim';
+
+    // Sync settings tab toggle
+    if ($('setSim')) $('setSim').checked = simOn;
+  }
+
+  // Secondary: try Railway bot for richer status (optional - won't block)
+  if (CONFIG.botUrl) {
+    const status = await botFetch('/');
+    if (status) {
+      updateBotStatus(status);
+      state.connected = true; // bot alive = definitely connected
+    }
+  } else {
+    // Build status from portfolio+settings data
+    if (portData && portData[0]) {
+      const p = portData[0];
+      const synth = {
+        mode:             state.mode,
+        session:          p.session || '--',
+        wins:             p.total_wins    || 0,
+        losses:           p.total_losses  || 0,
+        scalp_wins:       p.scalp_wins    || 0,
+        scalp_losses:     p.scalp_losses  || 0,
+        uptime_min:       p.uptime_min    || 0,
+        open_positions:   p.open_positions   || 0,
+        short_positions:  p.short_positions  || 0,
+        scalp_positions:  p.scalp_positions  || 0,
+      };
+      updateBotStatus(synth);
+    }
+  }
+
   updateConnStatus();
 }
 
 async function fetchAll() {
   if (!CONFIG.sbUrl || !CONFIG.sbKey) {
-    renderLogs([{type:'warn',message:'Please enter Supabase credentials in Config',created_at:new Date().toISOString()}]);
+    renderLogs([{type:'warn', message:'Enter Supabase URL + Key in Settings → Connection, then click Connect', created_at: new Date().toISOString()}]);
+    // Show config panel automatically
+    $('configPanel')?.classList.add('open');
     return;
   }
-  await fetchBotStatus();
+  // Fetch bot status and all data in parallel - bot status won't block chart/positions
   await Promise.all([
+    fetchBotStatus(),
     fetchPortfolio(),
     fetchPositions(),
     fetchTrades(),
@@ -1242,8 +1344,27 @@ async function toggleSetting(field, value) {
 async function toggleSimMode() {
   const newSim = state.mode !== 'sim';
   await toggleSetting('sim_mode', newSim);
-  // Trigger a full refresh after mode switch
-  setTimeout(fetchAll, 500);
+
+  // Immediately update UI without waiting for bot to respond
+  state.mode = newSim ? 'sim' : 'alpaca';
+  $('modeText').textContent = newSim ? 'SIM' : 'LIVE';
+  $('modeDot').className    = 'status-dot ' + (newSim ? 'paused' : 'live');
+  $('simBtn').textContent   = newSim ? 'Exit Sim' : 'Enter Sim';
+  if ($('setSim')) $('setSim').checked = newSim;
+  if ($('chartBadge')) {
+    $('chartBadge').textContent       = newSim ? 'SIM' : 'LIVE';
+    $('chartBadge').style.background  = newSim ? 'rgba(155,89,182,0.2)' : 'var(--accent-dim)';
+    $('chartBadge').style.color       = newSim ? '#9b59b6' : 'var(--accent)';
+    $('chartBadge').style.borderColor = newSim ? 'rgba(155,89,182,0.25)' : 'rgba(0,229,199,0.25)';
+  }
+
+  // Clear chart so it rebuilds with sim/live data
+  lastEquityChart = [];
+  const svg = $('equityChart');
+  if (svg) svg.innerHTML = '';
+
+  // Full refresh with new mode's tables
+  setTimeout(fetchAll, 300);
 }
 
 async function resetCircuit() {
@@ -1410,45 +1531,61 @@ function escapeHtml(s) {
 }
 
 function updateConnStatus() {
-  const dot = $('connDot');
+  const dot  = $('connDot');
   const text = $('connText');
+  if (!dot || !text) return;
   if (state.connected) {
-    dot.className = 'conn-dot';
-    text.textContent = state.mode === 'sim' ? 'WS Sim' : 'WS Live';
+    dot.className  = 'conn-dot';
+    text.textContent = state.mode === 'sim' ? 'Supabase · SIM' : 'Supabase · Live';
   } else {
-    dot.className = 'conn-dot offline';
-    text.textContent = 'Offline';
+    dot.className  = 'conn-dot offline';
+    text.textContent = CONFIG.sbUrl ? 'Connecting…' : 'Offline — enter config';
   }
 }
 
 // ═══════════════════════════════════════ EQUITY CHART (CANDLESTICKS FROM SNAPSHOTS) ═══════════════════════════════════════
 function renderEquityChart(snapshots) {
-  if (!snapshots || snapshots.length < 2) return;
+  if (!snapshots || snapshots.length < 1) return;
 
-  // Group snapshots into candle periods (every N points = 1 candle)
+  // Need at least 2 points for a candle — if only 1, duplicate it
+  if (snapshots.length === 1) {
+    const s = snapshots[0];
+    snapshots = [s, { value: s.value, created_at: new Date(new Date(s.created_at).getTime() + 3600000).toISOString() }];
+  }
+
+  // Group snapshots into candle periods (max 80 candles for readability)
   const groupSize = Math.max(1, Math.floor(snapshots.length / 80));
   const candles = [];
   for (let i = 0; i < snapshots.length; i += groupSize) {
     const group = snapshots.slice(i, i + groupSize);
-    const values = group.map(s => +s.value);
+    const values = group.map(s => +s.value).filter(v => isFinite(v));
+    if (!values.length) continue;
     candles.push({
-      time: new Date(group[Math.floor(group.length/2)].created_at),
-      open: values[0],
-      high: Math.max(...values),
-      low: Math.min(...values),
-      close: values[values.length - 1],
+      time:   new Date(group[Math.floor(group.length/2)].created_at),
+      open:   values[0],
+      high:   Math.max(...values),
+      low:    Math.min(...values),
+      close:  values[values.length - 1],
       volume: group.length,
     });
   }
+
+  if (!candles.length) return;
   lastEquityChart = candles;
   drawCandlestickChart(candles);
 }
 
 function drawCandlestickChart(candles) {
-  const svg = $('equityChart');
+  const svg  = $('equityChart');
   const wrap = $('chartWrap');
-  const W = wrap.clientWidth;
-  const H = wrap.clientHeight;
+  if (!svg || !wrap) return;
+  const W = wrap.clientWidth  || wrap.offsetWidth  || 800;
+  const H = wrap.clientHeight || wrap.offsetHeight || 400;
+  if (!W || !H || !candles || !candles.length) {
+    // Retry after paint
+    requestAnimationFrame(() => drawCandlestickChart(candles));
+    return;
+  }
   svg.setAttribute('width', W);
   svg.setAttribute('height', H);
   svg.innerHTML = '';
@@ -1658,9 +1795,12 @@ function hideTooltip() { $('chartTooltip').style.display = 'none'; }
 function renderSparkline(snapshots) {
   if (!snapshots || snapshots.length < 2) return;
   const svg = $('sparkSvg');
+  if (!svg) return;
   const wrap = svg.parentElement;
-  const W = wrap.clientWidth;
-  const H = wrap.clientHeight;
+  if (!wrap) return;
+  const W = wrap.clientWidth  || wrap.offsetWidth  || 280;
+  const H = wrap.clientHeight || wrap.offsetHeight || 50;
+  if (!W || !H) { requestAnimationFrame(() => renderSparkline(snapshots)); return; }
   svg.setAttribute('width', W);
   svg.setAttribute('height', H);
   svg.innerHTML = '';
@@ -2123,8 +2263,14 @@ function init() {
 
   // Auto-connect if credentials exist
   if (CONFIG.sbUrl && CONFIG.sbKey) {
-    fetchAll();
-    pollTimer = setInterval(fetchAll, 5000);
+    // Defer first fetch until after layout paints (so chart has real dimensions)
+    requestAnimationFrame(() => {
+      fetchAll();
+      pollTimer = setInterval(fetchAll, 5000);
+    });
+  } else {
+    // Show config panel if no creds
+    setTimeout(() => $('configPanel')?.classList.add('open'), 400);
   }
 
   // Resize handler
