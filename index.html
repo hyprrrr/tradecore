@@ -641,6 +641,9 @@
           </div>
         </div>
         <div class="chart-controls">
+          <button class="tf-btn" data-tf="5M">5M</button>
+          <button class="tf-btn" data-tf="15M">15M</button>
+          <button class="tf-btn" data-tf="30M">30M</button>
           <button class="tf-btn active" data-tf="1H">1H</button>
           <button class="tf-btn" data-tf="4H">4H</button>
           <button class="tf-btn" data-tf="1D">1D</button>
@@ -1592,16 +1595,63 @@ function renderPositions(positions) {
     body.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-dim);">No open positions</div>';
     return;
   }
-  body.innerHTML = positions.map((p,i) => {
-    const side = p.side || 'LONG';
-    const up = (p.pnl_pct||0) >= 0;
-    const sideClass = side.includes('SHORT') ? 'tag-short' : side.includes('SCALP') ? 'tag-scalp' : 'tag-long';
-    return `<div class="watch-row ${i===0?'active':''}" data-side="${side}" data-symbol="${p.symbol}">
-      <div class="watch-name">${p.symbol} <span>${side}</span></div>
-      <div class="watch-price" style="color:${up?'var(--buy)':'var(--sell)'}">${fmt(p.current_price)}</div>
-      <div class="watch-change ${up?'up':'down'}">${fmtP(p.pnl_pct||0)}</div>
-    </div>`;
-  }).join('');
+
+  // If we're transitioning from empty to populated, clear the placeholder.
+  if (body.querySelector('.watch-row') === null) body.innerHTML = '';
+
+  // Build a map of currently-live symbols so we can diff.
+  const wanted = new Set(positions.map(p => p.symbol));
+  const existing = {};
+  body.querySelectorAll('.watch-row').forEach(row => {
+    existing[row.dataset.symbol] = row;
+  });
+
+  // Remove rows for symbols that are no longer open (position closed).
+  for (const sym in existing) {
+    if (!wanted.has(sym)) existing[sym].remove();
+  }
+
+  // Update-in-place or append — never rebuild the container innerHTML, so
+  // the DOM node persists from position open → close without flicker.
+  positions.forEach((p, i) => {
+    const side      = p.side || 'LONG';
+    const up        = (p.pnl_pct || 0) >= 0;
+    const priceStr  = fmt(p.current_price);
+    const pctStr    = fmtP(p.pnl_pct || 0);
+    const color     = up ? 'var(--buy)' : 'var(--sell)';
+    const changeCls = up ? 'up' : 'down';
+
+    let row = existing[p.symbol];
+    if (!row) {
+      // New position — create the row once.
+      row = document.createElement('div');
+      row.className = 'watch-row';
+      row.dataset.side = side;
+      row.dataset.symbol = p.symbol;
+      row.innerHTML = `
+        <div class="watch-name">${p.symbol} <span class="watch-side">${side}</span></div>
+        <div class="watch-price"></div>
+        <div class="watch-change"></div>`;
+      body.appendChild(row);
+    }
+
+    // Patch only the cells that changed — skip DOM writes when values match.
+    const nameSide = row.querySelector('.watch-side');
+    if (nameSide && nameSide.textContent !== side) nameSide.textContent = side;
+    row.dataset.side = side;
+
+    const priceEl = row.querySelector('.watch-price');
+    if (priceEl.textContent !== priceStr) priceEl.textContent = priceStr;
+    if (priceEl.style.color !== color)    priceEl.style.color = color;
+
+    const changeEl = row.querySelector('.watch-change');
+    if (changeEl.textContent !== pctStr) changeEl.textContent = pctStr;
+    const targetCls = 'watch-change ' + changeCls;
+    if (changeEl.className !== targetCls) changeEl.className = targetCls;
+
+    // Keep the first card flagged as 'active' for styling.
+    row.classList.toggle('active', i === 0);
+  });
 }
 
 function filterPositions(query) {
@@ -1616,27 +1666,71 @@ function filterPositions(query) {
 function renderPositionsTable(positions) {
   const tbody = $('positionsTableBody');
   $('openCount').textContent = '(' + positions.length + ')';
+
   if (!positions.length) {
     tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:20px;">No open positions</td></tr>';
     return;
   }
-  tbody.innerHTML = positions.map(p => {
-    const up = (p.pnl||0) >= 0;
-    const side = p.side || 'LONG';
+
+  // Clear the "no positions" placeholder if we're transitioning in.
+  if (!tbody.querySelector('tr[data-symbol]')) tbody.innerHTML = '';
+
+  const wanted = new Set(positions.map(p => p.symbol));
+  const existing = {};
+  tbody.querySelectorAll('tr[data-symbol]').forEach(tr => { existing[tr.dataset.symbol] = tr; });
+
+  for (const sym in existing) {
+    if (!wanted.has(sym)) existing[sym].remove();
+  }
+
+  positions.forEach(p => {
+    const up       = (p.pnl || 0) >= 0;
+    const side     = p.side || 'LONG';
     const tagClass = side.includes('SHORT') ? 'tag-sell' : side.includes('SCALP') ? 'tag-filled' : 'tag-buy';
-    const age = p.entry_time ? Math.round((Date.now()-new Date(p.entry_time).getTime())/60000) + 'm' : '--';
-    return `<tr>
-      <td><b>${p.symbol}</b></td>
-      <td><span class="tag ${tagClass}">${side}</span></td>
-      <td class="cell-right">${fmt(p.entry_price)}</td>
-      <td class="cell-right">${fmt(p.current_price)}</td>
-      <td class="cell-right">${p.qty||0}</td>
-      <td class="cell-right ${up?'pnl-pos':'pnl-neg'}">${fmt$(p.pnl||0)}</td>
-      <td class="cell-right ${up?'pnl-pos':'pnl-neg'}">${fmtP(p.pnl_pct||0)}</td>
-      <td class="cell-center">${Math.round(p.confidence||0)}%</td>
-      <td class="cell-center">${age}</td>
-    </tr>`;
-  }).join('');
+    const age      = p.entry_time ? Math.round((Date.now() - new Date(p.entry_time).getTime()) / 60000) + 'm' : '--';
+    const pnlCls   = up ? 'pnl-pos' : 'pnl-neg';
+
+    let tr = existing[p.symbol];
+    if (!tr) {
+      tr = document.createElement('tr');
+      tr.dataset.symbol = p.symbol;
+      tr.innerHTML = `
+        <td data-k="sym"></td>
+        <td data-k="side"></td>
+        <td class="cell-right" data-k="entry"></td>
+        <td class="cell-right" data-k="cur"></td>
+        <td class="cell-right" data-k="qty"></td>
+        <td class="cell-right" data-k="pnl"></td>
+        <td class="cell-right" data-k="pnlp"></td>
+        <td class="cell-center" data-k="conf"></td>
+        <td class="cell-center" data-k="age"></td>`;
+      tbody.appendChild(tr);
+    }
+
+    // Helper: only write to the DOM when the value actually changed.
+    const set = (k, html) => {
+      const el = tr.querySelector(`[data-k="${k}"]`);
+      if (el && el.innerHTML !== html) el.innerHTML = html;
+    };
+    const setCls = (k, cls) => {
+      const el = tr.querySelector(`[data-k="${k}"]`);
+      if (!el) return;
+      // Preserve the base classes (cell-right/cell-center) while swapping pnl color.
+      const base = el.className.replace(/\s*pnl-(pos|neg)/g, '').trim();
+      const next = base + (cls ? ' ' + cls : '');
+      if (el.className !== next) el.className = next;
+    };
+
+    set('sym',   `<b>${p.symbol}</b>`);
+    set('side',  `<span class="tag ${tagClass}">${side}</span>`);
+    set('entry', fmt(p.entry_price));
+    set('cur',   fmt(p.current_price));
+    set('qty',   String(p.qty || 0));
+    set('pnl',   fmt$(p.pnl || 0));       setCls('pnl',  pnlCls);
+    set('pnlp',  fmtP(p.pnl_pct || 0));   setCls('pnlp', pnlCls);
+    set('conf',  Math.round(p.confidence || 0) + '%');
+    set('age',   age);
+  });
 }
 
 function renderTrades(trades) {
@@ -1740,7 +1834,7 @@ const chart = {
 function buildCandlesForTF(snapshots, tf) {
   if (!snapshots || !snapshots.length) return [];
 
-  const msMap = { '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
+  const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
   const bucketMs = msMap[tf] || 3600e3;
 
   const buckets = {};
@@ -1858,7 +1952,8 @@ function _redrawChartImmediate() {
     } else if (chart.tf === '4H') {
       label = `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}h`;
     } else {
-      label = `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+      // 5M/15M/30M/1H all show HH:MM, with date prefix only on day boundaries
+      label = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
     }
     svg.appendChild(svgText(x, H - 8, label, '8.5', 'var(--text-dim)', 'middle'));
   }
