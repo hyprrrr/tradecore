@@ -1725,10 +1725,19 @@ async function syncPortfolio() {
 async function syncPositions() {
   const allPositions = [];
 
+  // Price resolver: Alpaca's current_price is the source of truth when available
+  // (set by reconcileWithAlpaca). Fall back to priceHistory5m for sim mode or
+  // when Alpaca hasn't been polled yet. Entry price is the last resort.
+  const livePrice = (sym, pos) => {
+    if (alpacaLivePrice[sym] > 0) return alpacaLivePrice[sym];
+    const hist = priceHistory5m[sym];
+    if (hist && hist.length) return hist[hist.length - 1];
+    return pos.highWater || pos.entryPrice;
+  };
+
   // Swing longs
   for (const [sym, pos] of Object.entries(positions)) {
-    // Use real-time price — no age guard needed, priceHistory5m is seeded on restore
-    const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.highWater || pos.entryPrice;
+    const cur    = livePrice(sym, pos);
     const qty    = pos.qtyRemaining || pos.qty;
     const pnl    = (cur - pos.entryPrice) * qty;
     const pnlPct = pos.entryPrice > 0 ? ((cur - pos.entryPrice) / pos.entryPrice) * 100 : 0;
@@ -1750,7 +1759,7 @@ async function syncPositions() {
 
   // Swing shorts
   for (const [sym, pos] of Object.entries(shortPositions)) {
-    const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const cur    = livePrice(sym, pos);
     const qty    = pos.qtyRemaining || pos.qty;
     const pnl    = (pos.entryPrice - cur) * qty; // inverted for shorts
     const pnlPct = pos.entryPrice > 0 ? ((pos.entryPrice - cur) / pos.entryPrice) * 100 : 0;
@@ -1772,7 +1781,7 @@ async function syncPositions() {
 
   // Scalp positions
   for (const [sym, pos] of Object.entries(scalpPositions)) {
-    const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const cur    = livePrice(sym, pos);
     const qty    = pos.qty;
     const pnl    = pos.direction === 'long'
       ? (cur - pos.entryPrice) * qty
@@ -2167,12 +2176,21 @@ async function syncPricesOnly() {
         const cur = +ap.current_price;
         if (!cur || cur <= 0) continue;
 
+        // Cache for syncPositions to pick up — this is Alpaca's authoritative
+        // price, always fresher than whatever we have in priceHistory5m.
+        alpacaLivePrice[sym] = cur;
+
         if (!priceHistory5m[sym]) priceHistory5m[sym] = [];
         priceHistory5m[sym].push(cur);
         if (priceHistory5m[sym].length > 60) priceHistory5m[sym].shift();
 
         if (positions[sym]      && cur > positions[sym].highWater)     positions[sym].highWater     = cur;
         if (shortPositions[sym] && cur < shortPositions[sym].lowWater) shortPositions[sym].lowWater = cur;
+      }
+      // Drop cached prices for symbols Alpaca no longer reports open
+      const openSet = new Set(alpacaPos.map(p => p.symbol));
+      for (const sym of Object.keys(alpacaLivePrice)) {
+        if (!openSet.has(sym)) delete alpacaLivePrice[sym];
       }
     }
 
@@ -4409,14 +4427,13 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   await syncAll();
   await syncLog(direction === 'long' ? 'buy' : 'sell', `${direction === 'long' ? '✅ LONG' : '🔴 SHORT'} ${qty}x ${sym} @ $${price.toFixed(2)} conf=${sigInfo.confidence}%`);
 
-  // Fetch live price immediately so dashboard shows P&L right away
-  // Don't wait — fire and forget
-  fetchLatestPrice(sym).then(livePrice => {
-    if (livePrice && livePrice !== price) {
-      priceHistory5m[sym] = [...(priceHistory5m[sym] || [price]), livePrice];
-      syncPositions().catch(() => {});
-    }
-  }).catch(() => {});
+  // Hit Alpaca for the real current_price + unrealized P&L right after entry.
+  // Without this the dashboard can show 0.00% for up to 5s until the next
+  // scheduled reconcile. syncPricesOnly also populates alpacaLivePrice which
+  // syncPositions reads for authoritative pricing.
+  if (!isSimMode() && CONFIG.alpacaKey) {
+    syncPricesOnly().catch(() => {});
+  }
 }
 
 // Cover a short position (buy back the borrowed shares)
@@ -5666,6 +5683,13 @@ async function runScan() {
 
 // Live Alpaca positions — refreshed every scan to prevent duplicate buys
 let alpacaPositions = new Set();
+// Live per-symbol price snapshot from Alpaca's /v2/positions response.
+// syncPositions prefers this over priceHistory5m because Alpaca reports
+// the actual quote even before our websocket feed has pushed a tick —
+// without it, a brand-new position syncs to Supabase with
+// current_price === entry_price and pnl_pct === 0, even when Alpaca
+// already knows the position is -$11.
+const alpacaLivePrice = {};  // { SYM: number }
 let alpacaShorts    = new Set();
 // Shorting controlled via CONFIG.shortsEnabled (dashboard toggle)
 
@@ -6942,12 +6966,14 @@ loadRemoteConfig().then(async () => {
 });
 setTimeout(syncPricesOnly, 5000);
 
-// Sync prices every 10 seconds regardless of market hours
+// Sync prices frequently when positions are open so dashboard pnl_pct
+// reflects the real market, not the stale entry price. 5s when active,
+// nothing when idle (no cost).
 setInterval(async () => {
   if (!isSimMode() && CONFIG.alpacaKey && Object.keys(positions).length + Object.keys(shortPositions).length > 0) {
     await syncPricesOnly();
   }
-}, 20000); // Every 20s (was 10s) — reduces Alpaca rate limit hits
+}, 5000);
 
 // ── OVERNIGHT GUARDIAN — runs every 60 seconds, completely independent of scan loop ──
 // If market is closed and we still have open positions, close them immediately.
