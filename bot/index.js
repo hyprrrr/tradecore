@@ -7361,8 +7361,80 @@ http.createServer(async (req, res) => {
     circuitBreakerOn     = false;
     realDailyStartEquity = realEquity;
     log('risk', '🟢 Circuit breaker reset via /reset-cb');
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    // Also clear in Supabase so dashboard stops showing TRIPPED
+    try { await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+      circuit_breaker: false, updated_at: new Date().toISOString(),
+    }); } catch(e) {}
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ ok: true, message: 'Circuit breaker reset' }));
+    return;
+  }
+
+  // ── GET /exit-all — close every open position without tripping the circuit breaker ──
+  // Dashboard's Exit All button hits this. We close all positions, leave the
+  // bot running, and explicitly clear circuit_breaker in Supabase so the UI
+  // doesn't show "TRIPPED" after the flatten.
+  if (req.method === 'GET' && (url === '/exit-all' || url === '/exitall')) {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    const allSyms = [
+      ...Object.keys(positions),
+      ...Object.keys(shortPositions),
+      ...Object.keys(scalpPositions),
+    ];
+    if (!allSyms.length) {
+      // Still make sure the UI flag is clean — previous implementations may
+      // have left circuit_breaker=true in Supabase with no positions open.
+      try { await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+        circuit_breaker: false, updated_at: new Date().toISOString(),
+      }); } catch(e) {}
+      circuitBreakerOn = false;
+      res.end(JSON.stringify({ ok: true, closed: 0, message: 'No open positions' }));
+      return;
+    }
+
+    let closed = 0, failed = 0, totalPnl = 0;
+    for (const sym of Object.keys(positions)) {
+      try {
+        const pos   = positions[sym];
+        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const pnl   = (price - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
+        await exitPosition(sym, price, 'MANUAL_DISCORD');
+        totalPnl += pnl; closed++;
+      } catch(e) { failed++; }
+    }
+    for (const sym of Object.keys(shortPositions)) {
+      try {
+        const pos   = shortPositions[sym];
+        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const pnl   = (pos.entryPrice - price) * (pos.qtyRemaining || pos.qty);
+        await coverShort(sym, price, 'MANUAL_DISCORD');
+        totalPnl += pnl; closed++;
+      } catch(e) { failed++; }
+    }
+    for (const sym of Object.keys(scalpPositions)) {
+      try {
+        const pos   = scalpPositions[sym];
+        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const pnl   = pos.direction === 'long'
+          ? (price - pos.entryPrice) * pos.qty
+          : (pos.entryPrice - price) * pos.qty;
+        await exitScalp(sym, price, 'SCALP_MANUAL');
+        totalPnl += pnl; closed++;
+      } catch(e) { failed++; }
+    }
+
+    // Explicitly keep circuit breaker OFF — we're manually flattening,
+    // not panic-stopping the bot.
+    circuitBreakerOn = false;
+    try { await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+      circuit_breaker: false, updated_at: new Date().toISOString(),
+    }); } catch(e) {}
+
+    log('risk', `🖐 EXIT ALL via dashboard: closed ${closed}, failed ${failed}, pnl=${totalPnl>=0?'+':''}$${totalPnl.toFixed(2)}`);
+    await syncLog('sys', `🖐 Dashboard Exit All — closed ${closed} pos, pnl ${totalPnl>=0?'+':''}$${totalPnl.toFixed(2)}`);
+    await syncAll();
+
+    res.end(JSON.stringify({ ok: true, closed, failed, totalPnl: +totalPnl.toFixed(2) }));
     return;
   }
 
