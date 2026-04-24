@@ -145,7 +145,7 @@ async function loadRemoteConfig() {
     const s = rows[0];
 
     // Apply remote settings over CONFIG — secrets never overwritten
-    if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase());
+    if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 20); // hard cap 20
     if (s.strategy)         CONFIG.strategy         = s.strategy;
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
     if (s.rsi_oversold)     CONFIG.rsiOversold      = +s.rsi_oversold;
@@ -2590,11 +2590,11 @@ async function loadSimBars(symbols) {
         // Skip pre/after market — they have low volume and mess up indicators
         const mktBars = bars.filter(b => {
           const d = new Date(b.t);
-          const h = d.getUTCHours() - 4; // ET offset (approximate — no DST handling needed for filtering)
+          const h = d.getUTCHours() - 4;
           const m = d.getUTCMinutes();
           const etMins = h * 60 + m;
-          return etMins >= 570 && etMins < 960; // 9:30am-4:00pm = 570-960 mins
-        });
+          return etMins >= 570 && etMins < 960;
+        }).sort((a,b)=>a.t.localeCompare(b.t)); // ascending time
 
         allBars.push(...mktBars);
         nextToken = data?.next_page_token || null;
@@ -2644,7 +2644,9 @@ async function loadSimBars(symbols) {
         try {
           const url = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=5Min&start=${startStr14}&end=${endStr}&limit=1000&adjustment=raw&feed=${getDataFeed()}`;
           const data = await alpacaFetch(url);
-          const bars = (data?.bars||[]).map(b=>({t:b.t,o:b.o,h:b.h,l:b.l,c:b.c,v:b.v||0})).filter(b=>b.c&&b.h&&b.l&&b.o);
+          const bars = (data?.bars||[]).map(b=>({t:b.t,o:b.o,h:b.h,l:b.l,c:b.c,v:b.v||0}))
+        .filter(b=>b.c&&b.h&&b.l&&b.o)
+        .sort((a,b)=>a.t.localeCompare(b.t)); // ensure ascending time order
           if (bars.length >= 20) simState.bars[sym] = bars;
         } catch(e){}
       }));
@@ -4633,13 +4635,19 @@ async function runRecoveryScan() {
   for (const candidate of scanList.slice(0, 8)) { // check up to 8 symbols
     if (openSyms.has(candidate)) continue;
 
+    // In sim mode: use already-loaded sim bars instead of live Alpaca
+    // This prevents rate limit hits and ensures recovery uses same data as sim
     let bars;
-    try {
-      const feed = getDataFeed();
-      const url = `${ALPACA_BASE()}/v2/stocks/${candidate}/bars?timeframe=5Min&limit=60&feed=${feed}`;
-      const data = await alpacaFetch(url);
-      bars = (data?.bars || []).map(b => ({ t:b.t, o:+b.o, h:+b.h, l:+b.l, c:+b.c, v:+b.v }));
-    } catch(e) { continue; }
+    if (isSimMode() && simState.bars[candidate]) {
+      bars = simState.bars[candidate].slice(0, simState.cursor + 1);
+    } else {
+      try {
+        const feed = getDataFeed();
+        const url = `${ALPACA_BASE()}/v2/stocks/${candidate}/bars?timeframe=5Min&limit=60&feed=${feed}`;
+        const data = await alpacaFetch(url);
+        bars = (data?.bars || []).map(b => ({ t:b.t, o:+b.o, h:+b.h, l:+b.l, c:+b.c, v:+b.v }));
+      } catch(e) { continue; }
+    }
 
     if (!bars || bars.length < 20) continue;
 
@@ -5130,7 +5138,12 @@ async function managePosition(sym, price, bars) {
   // ── 1. HARD STOP LOSS — fires unconditionally, no exceptions ──
   // CRITICAL: this must ALWAYS run regardless of breakEvenSet, tp1Hit, etc.
   // Never allow a position to lose more than hardMaxLoss under any circumstance.
-  const hardStop = pos.entryPrice - (posAtr * CONFIG.atrStopMult);
+  // hardStop uses ATR AT ENTRY (not current) — prevents it from expanding during the trade
+  // Also enforce hardMaxLoss % as an absolute floor
+  const entryAtr    = pos.atrAtEntry || posAtr;
+  const atrBasedStop = pos.entryPrice - (entryAtr * CONFIG.atrStopMult);
+  const pctBasedStop = pos.entryPrice * (1 - Math.max(CONFIG.hardMaxLoss || 0.015, 0.01));
+  const hardStop    = Math.max(atrBasedStop, pctBasedStop); // higher = tighter for longs
 
   // Case A: Price below the hard ATR stop (initial stop before break-even)
   if (!pos.breakEvenSet && price <= Math.max(pos.stopPrice, hardStop)) {
@@ -6127,7 +6140,8 @@ async function scalpPositionMonitor() {
       // CRITICAL: Always use LIVE price for scalp decisions
       // NEVER use priceHistory5m — it's the 5m bar close which can be 5 minutes stale
       // A $393 entry with a $363 cached price triggers stop loss immediately (proven bug)
-      let price = await fetchLatestTrade(sym);
+      // In sim mode use the bar close price — don't call Alpaca (causes rate limits)
+      let price = isSimMode() ? simCurrentPrice(sym) : await fetchLatestTrade(sym);
       if (!price || price <= 0) {
         // fetchLatestTrade failed — skip this cycle rather than use stale price
         log('scalp', `⚠ ${sym}: could not get live price — skipping check to avoid false exit`);
