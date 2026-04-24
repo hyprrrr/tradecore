@@ -1205,32 +1205,38 @@ async function fetchEquity() {
     return;
   }
 
-  // Build cumulative equity snapshots
-  // Each snapshot represents the equity AFTER that trade settled
+  // Build cumulative equity snapshots — one snapshot per settled trade.
+  // Previously pushed two points at the same timestamp (before + after pnl)
+  // which inflated OHLC inside a bucket and made mid-bucket equity look
+  // artificially volatile. Now each snapshot is the equity AFTER the trade
+  // settles, which is the only value that actually matters for the curve.
   let equity = startCap;
   const snapshots = [];
 
-  // Add starting point 1 hour before first trade
+  // Starting point 1 hour before first trade (baseline)
   const firstTs = new Date(data[0].created_at).getTime();
   snapshots.push({ value: startCap, created_at: new Date(firstTs - 3600000).toISOString() });
 
   data.forEach(t => {
-    const pnl = +(t.pnl) || 0;
-    // Snapshot at trade open (before pnl)
-    snapshots.push({ value: equity, created_at: t.created_at });
-    equity += pnl;
-    // Snapshot at trade close (after pnl) — same timestamp, tiny offset
+    equity += +(t.pnl) || 0;
     snapshots.push({ value: equity, created_at: t.created_at });
   });
 
   // ── LIVE TAIL ────────────────────────────────────────────────────
-  // Append a live snapshot using portfolio.total_value (which includes
-  // unrealized P&L on open positions). Without this, the chart only moves
-  // when a trade closes — so it visibly lags the header P&L number by
-  // minutes during active trading. With this, the last candle tracks
-  // portfolio value tick-by-tick.
+  // Append a live snapshot using portfolio.total_value (includes unrealized
+  // P&L on open positions). Without this, the chart only moves when a trade
+  // closes, visibly lagging the header P&L by minutes.
+  //
+  // Critical: only append if the value is materially different from the last
+  // settled equity — otherwise we create ghost candles at every poll. Also
+  // align the tail timestamp to the current bucket boundary the chart is on
+  // so it merges into the current candle instead of spawning a fresh bucket.
   if (livePortfolioValue != null && Number.isFinite(livePortfolioValue)) {
-    snapshots.push({ value: livePortfolioValue, created_at: new Date().toISOString() });
+    const lastSettled = snapshots[snapshots.length - 1].value;
+    const drift = Math.abs(livePortfolioValue - lastSettled);
+    if (drift >= 0.01) { // only append on a real change
+      snapshots.push({ value: livePortfolioValue, created_at: new Date().toISOString() });
+    }
   }
 
   state.equitySnapshots = snapshots;
@@ -1861,6 +1867,7 @@ function buildCandlesForTF(snapshots, tf) {
   const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
   const bucketMs = msMap[tf] || 3600e3;
 
+  // Group snapshots into bucket keys.
   const buckets = {};
   snapshots.forEach(s => {
     const t   = new Date(s.created_at).getTime();
@@ -1872,20 +1879,37 @@ function buildCandlesForTF(snapshots, tf) {
   const keys = Object.keys(buckets).map(Number).sort((a, b) => a - b);
   if (keys.length < 1) return [];
 
-  return keys.map((key, i) => {
-    const b    = buckets[key];
-    const v    = b.values;
-    const prev = i > 0 ? buckets[keys[i-1]].values : null;
-    const open = prev ? prev[prev.length - 1] : v[0];
-    return {
-      time:   b.time,
-      open,
-      high:   Math.max(open, ...v),
-      low:    Math.min(open, ...v),
-      close:  v[v.length - 1],
-      volume: v.length,
-    };
-  });
+  // Forward-fill empty buckets between the first and last snapshot so the
+  // chart is continuous. Without fill, a 3-hour gap with no trades meant
+  // the next bucket opened at the old value → phantom gap candle.
+  const filled = [];
+  let lastClose = null;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    // Insert empty buckets for any missing periods between prior key and this one
+    if (i > 0) {
+      const prevKey = keys[i - 1];
+      for (let t = prevKey + bucketMs; t < key; t += bucketMs) {
+        filled.push({
+          time: new Date(t),
+          open: lastClose, high: lastClose, low: lastClose, close: lastClose,
+          volume: 0,
+        });
+      }
+    }
+    const b = buckets[key];
+    const v = b.values;
+    // Open = last close from prior bucket if we have one; otherwise the first
+    // value in this bucket (handles the very first candle).
+    const open  = lastClose != null ? lastClose : v[0];
+    const close = v[v.length - 1];
+    const high  = Math.max(open, close, ...v);
+    const low   = Math.min(open, close, ...v);
+    filled.push({ time: b.time, open, high, low, close, volume: v.length });
+    lastClose = close;
+  }
+
+  return filled;
 }
 
 function setTF(tf) {
