@@ -2346,6 +2346,40 @@ let lastScanTime        = null;
 // have to wait for 15+ trades of a given symbol before deciding it's
 // trash — block at 3 strikes.
 const symbolStats = {};  // { SYM: { lossStreak, winStreak, totalPnl, benchedUntil } }
+
+// Debounced Supabase write — we don't want to write on every trade, coalesce.
+let _symbolStatsDirty = false;
+let _symbolStatsTimer = null;
+function _scheduleSymbolStatsSync() {
+  _symbolStatsDirty = true;
+  if (_symbolStatsTimer) return;
+  _symbolStatsTimer = setTimeout(async () => {
+    _symbolStatsTimer = null;
+    if (!_symbolStatsDirty) return;
+    _symbolStatsDirty = false;
+    try {
+      await sbFetch(tbl('tc_settings')+'?id=eq.1', 'PATCH', {
+        symbol_stats: symbolStats,  // stored as JSONB
+        updated_at: new Date().toISOString(),
+      });
+    } catch(e) { /* non-critical */ }
+  }, 5000);
+}
+
+// Load persisted stats on boot so bench survives restarts.
+// Without this, a crash/redeploy reset SLV's loss streak → trades 3-9 all fired.
+async function loadSymbolStats() {
+  try {
+    const data = await sbFetch(tbl('tc_settings')+'?id=eq.1&select=symbol_stats', 'GET');
+    const row = Array.isArray(data) ? data[0] : data;
+    if (row?.symbol_stats && typeof row.symbol_stats === 'object') {
+      Object.assign(symbolStats, row.symbol_stats);
+      const benched = Object.entries(symbolStats).filter(([s,v]) => v.benchedUntil && Date.now() < v.benchedUntil);
+      log('sys', `📊 Loaded symbol stats for ${Object.keys(symbolStats).length} symbols (${benched.length} still benched)`);
+    }
+  } catch(e) { /* first run, table may not have column yet */ }
+}
+
 function recordSymbolOutcome(sym, pnl) {
   if (!symbolStats[sym]) symbolStats[sym] = { lossStreak: 0, winStreak: 0, totalPnl: 0, benchedUntil: 0 };
   const s = symbolStats[sym];
@@ -2361,6 +2395,7 @@ function recordSymbolOutcome(sym, pnl) {
     s.benchedUntil = Date.now() + hours * 3600 * 1000;
     log('risk', `⛔ BENCH ${sym} for ${hours}h — ${s.lossStreak} losses, cum P&L $${s.totalPnl.toFixed(0)}`);
   }
+  _scheduleSymbolStatsSync();
 }
 function isSymbolBenched(sym) {
   const s = symbolStats[sym];
@@ -4086,52 +4121,109 @@ function generateSignal(sym, bars5m, bars15m) {
 }
 
 // ─────────────────────────────────────────────
-// FILTERS
+// FILTERS — EDGE UPGRADES
 // ─────────────────────────────────────────────
-async function getMarketRegime() {
-  if (!CONFIG.regimeFilter) return true;
+
+// Regime cache — recompute every 60s instead of every entry attempt.
+// Without cache, 161 symbols × multiple scans × SPY fetch = rate limit hell.
+const _regimeCache = { at: 0, state: null };
+
+/**
+ * Market regime classifier. Returns one of:
+ *   'bull'   — SPY in clean uptrend on 5m + daily, low intraday vol
+ *   'chop'   — SPY flat/whipsawing, ATR elevated, no clear direction
+ *   'bear'   — SPY downtrending on daily or sustained 5m selling
+ *   'blowoff' — SPY ATR > 0.6%/bar (rare, usually news-driven panic)
+ *
+ * Separate from the boolean gate so scalp/short/long logic can each
+ * decide how to respond. Bull = longs free, shorts cautious. Bear =
+ * shorts free, longs blocked. Chop = reduce size, require higher conf.
+ */
+async function classifyRegime() {
+  // 60-second cache — SPY doesn't change meaningfully faster than that
+  if (Date.now() - _regimeCache.at < 60000 && _regimeCache.state) return _regimeCache.state;
+
   try {
-    const [dayBars, intraBars] = await Promise.all([
+    const [dayBars, intraBars, vixProxy] = await Promise.all([
       fetchBars('SPY', '1Day', 30),
-      fetchBars('SPY', '5Min', 20),
+      fetchBars('SPY', '5Min', 30),
+      // Use UVXY as a VIX proxy — more actionable than VIX (untradeable index)
+      // UVXY up = fear up. Spike = regime stress.
+      fetchBars('UVXY', '5Min', 20).catch(() => null),
     ]);
 
-    // ── Daily trend check ──
-    if (dayBars && dayBars.length >= 10) {
+    let state = 'bull';       // default optimistic
+    let reasons = [];
+    let spyTrendScore = 0;    // -3 to +3
+    let volScore = 0;         // 0 (calm) to 3 (blowoff)
+
+    // ── Daily trend ──
+    if (dayBars && dayBars.length >= 20) {
       const closes = dayBars.map(b => b.c);
-      const e10 = ema(closes, 10), e30 = ema(closes, Math.min(30, closes.length));
+      const e10 = ema(closes, 10), e20 = ema(closes, 20);
       const latest = closes[closes.length - 1];
-      const hardBearish = latest < e10 && (e10 - e30) / e30 > 0.01;
-      if (hardBearish) {
-        log('regime', `⚠ Market BEARISH — BUYs paused (SPY=$${latest.toFixed(2)})`);
-        return false;
-      }
+      if (latest > e10 && e10 > e20) spyTrendScore += 2;      // strong uptrend
+      else if (latest > e10)         spyTrendScore += 1;
+      else if (latest < e10 && e10 < e20) spyTrendScore -= 2; // downtrend
+      else if (latest < e10)         spyTrendScore -= 1;
     }
 
-    // ── Intraday volatility check — don't trade choppy / high-volatility opens ──
+    // ── Intraday trend (5m) ──
     if (intraBars && intraBars.length >= 10) {
+      const closes = intraBars.map(b => b.c);
+      const last5 = closes.slice(-5);
+      const up    = last5.filter((c, i) => i > 0 && c > last5[i-1]).length;
+      const down  = last5.filter((c, i) => i > 0 && c < last5[i-1]).length;
+      if (up >= 3) spyTrendScore += 1;
+      if (down >= 3) spyTrendScore -= 1;
+
+      // Volatility score
       const spyAtr = atr(intraBars, 10);
-      const spyPrice = intraBars[intraBars.length-1].c;
-      const spyAtrPct = (spyAtr / spyPrice) * 100;
+      const spyAtrPct = (spyAtr / closes[closes.length - 1]) * 100;
+      if (spyAtrPct > 0.6)      { volScore = 3; reasons.push(`SPY ATR ${spyAtrPct.toFixed(2)}%/bar — blowoff`); }
+      else if (spyAtrPct > 0.4) { volScore = 2; reasons.push(`SPY ATR ${spyAtrPct.toFixed(2)}%/bar — elevated`); }
+      else if (spyAtrPct > 0.25){ volScore = 1; }
+    }
 
-      // If SPY is moving more than 0.4% per 5-min bar — too volatile
-      if (spyAtrPct > 0.4) {
-        log('regime', `⚠ SPY too volatile (ATR=${spyAtrPct.toFixed(2)}%/bar) — waiting for calmer market`);
-        return false;
-      }
-
-      // Check if SPY is in a sustained intraday downtrend (3+ consecutive down bars)
-      const last4 = intraBars.slice(-4).map(b => b.c);
-      const spyDowntrend = last4[3] < last4[2] && last4[2] < last4[1] && last4[1] < last4[0];
-      if (spyDowntrend) {
-        log('regime', `⚠ SPY 3-bar downtrend — pausing longs`);
-        return false;
+    // ── UVXY fear spike ──
+    let uvxySpike = false;
+    if (vixProxy && vixProxy.length >= 10) {
+      const uv = vixProxy.map(b => b.c);
+      const uvAvg = uv.slice(0, -3).reduce((a,b) => a+b, 0) / Math.max(1, uv.length - 3);
+      const uvLast = uv[uv.length - 1];
+      if (uvLast > uvAvg * 1.08) { // 8%+ spike in UVXY
+        uvxySpike = true;
+        reasons.push(`UVXY spike ${((uvLast/uvAvg - 1)*100).toFixed(1)}%`);
       }
     }
 
-    log('regime', `✅ Market OK — regime clear, volatility normal`);
-    return true;
-  } catch (e) { return true; }
+    // ── Classify ──
+    if (volScore >= 3 || uvxySpike && volScore >= 2) {
+      state = 'blowoff';
+    } else if (spyTrendScore <= -2) {
+      state = 'bear';
+    } else if (spyTrendScore >= 2 && volScore <= 1) {
+      state = 'bull';
+    } else {
+      state = 'chop';
+      reasons.push(`trendScore=${spyTrendScore} volScore=${volScore}`);
+    }
+
+    const result = { state, spyTrendScore, volScore, uvxySpike, reasons: reasons.join(', ') };
+    _regimeCache.at = Date.now();
+    _regimeCache.state = result;
+    return result;
+  } catch (e) {
+    // On error, assume neutral so we don't unfairly block trades
+    return { state: 'chop', spyTrendScore: 0, volScore: 0, uvxySpike: false, reasons: 'regime fetch failed' };
+  }
+}
+
+// Legacy wrapper — keeps the old boolean getMarketRegime() callers working
+async function getMarketRegime() {
+  if (!CONFIG.regimeFilter) return true;
+  const r = await classifyRegime();
+  return r.state === 'bull' || r.state === 'chop'; // block blowoff + bear for longs
 }
 
 function isCorrelated(symbol) {
@@ -4250,6 +4342,104 @@ function calcQty(symbol, price, bars, confidence = 70) {
 // Short positions tracked separately (sym → { entryPrice, qty, ... })
 let shortPositions = {};
 
+// ─────────────────────────────────────────────
+// EDGE GATE — 5 filters applied before every entry
+// ─────────────────────────────────────────────
+// Returns { pass: boolean, reason?: string, sizeMultiplier?: number }
+// sizeMultiplier lets regime pass entries but at reduced size (e.g. 0.5 in chop)
+async function edgeGate(sym, direction, sigInfo, bars5m) {
+  // ── 1. REGIME ──
+  // Bull = longs full size, shorts at half. Bear = inverse. Chop = half both.
+  // Blowoff = both blocked. This is the single biggest edge: the 3pm-ET
+  // chop period in the CSV (33% WR, -$1,823) would've been caught here.
+  if (CONFIG.regimeFilter) {
+    const regime = await classifyRegime();
+    if (regime.state === 'blowoff') {
+      return { pass: false, reason: `blowoff regime (${regime.reasons})` };
+    }
+    if (direction === 'long' && regime.state === 'bear') {
+      return { pass: false, reason: `bear regime — longs blocked (${regime.reasons})` };
+    }
+    if (direction === 'short' && regime.state === 'bull') {
+      return { pass: false, reason: `bull regime — shorts blocked (${regime.reasons})` };
+    }
+    if (regime.state === 'chop') {
+      return { pass: true, sizeMultiplier: 0.5, reason: `chop — half size` };
+    }
+    // Counter-regime trades (short in bull when regime allows) still allowed at half
+    if ((direction === 'long' && regime.spyTrendScore <= 0) ||
+        (direction === 'short' && regime.spyTrendScore >= 0)) {
+      return { pass: true, sizeMultiplier: 0.6, reason: `counter-trend — 60% size` };
+    }
+  }
+
+  // ── 2. VOLUME CONFIRMATION ──
+  // Reject low-volume breakouts. The 21 STOP_LOSS hits at 0% WR in the CSV
+  // are classic no-demand signals. We require the entry bar to have >=1.5×
+  // the 20-bar average volume. Volume is the only thing that can't be faked.
+  if (CONFIG.volumeFilter && bars5m && bars5m.length >= 20) {
+    const vols = bars5m.slice(-21, -1).map(b => +b.v || 0);  // 20 bars BEFORE current
+    const curVol = +bars5m[bars5m.length - 1].v || 0;
+    const avgVol = vols.reduce((a, b) => a + b, 0) / Math.max(1, vols.length);
+    if (avgVol > 0 && curVol < avgVol * 1.5) {
+      return { pass: false, reason: `volume ${(curVol/avgVol).toFixed(2)}× avg (need 1.5×)` };
+    }
+  }
+
+  // ── 3. MULTI-TIMEFRAME ALIGNMENT ──
+  // Don't take a 5m long if the 15m trend is down (and vice versa).
+  // This catches signals fighting the higher timeframe.
+  const bars15m = priceHistory15m[sym];
+  if (bars15m && bars15m.length >= 6) {
+    const closes15 = bars15m.slice(-6).map(b => +b.c || b);
+    const first    = closes15[0];
+    const last     = closes15[closes15.length - 1];
+    const slope15  = (last - first) / first;
+    if (direction === 'long'  && slope15 < -0.003) { // -0.3% over 1.5h = 15m downtrend
+      return { pass: false, reason: `15m downtrend (${(slope15*100).toFixed(2)}%) blocks long` };
+    }
+    if (direction === 'short' && slope15 >  0.003) {
+      return { pass: false, reason: `15m uptrend (+${(slope15*100).toFixed(2)}%) blocks short` };
+    }
+  }
+
+  // ── 4. ADAPTIVE PER-SYMBOL CONFIDENCE FLOOR ──
+  // Symbols with a bad track record need higher conviction.
+  // Global floor is CONFIG.minConfidence (70). We add:
+  //   +5 for 1 recent loss, +10 for 2, +15 for 3+ (after which bench fires)
+  // After a winning streak we ease back to the global floor.
+  const ss = symbolStats[sym];
+  const sigConf = sigInfo?.confidence || 0;
+  if (ss) {
+    const penalty = Math.min(15, ss.lossStreak * 5);
+    const floor = (CONFIG.minConfidence || 70) + penalty;
+    if (sigConf < floor) {
+      return { pass: false, reason: `${sym} conf ${sigConf} < adaptive floor ${floor} (${ss.lossStreak} recent losses)` };
+    }
+  }
+
+  // ── 5. NO LATE-DAY ENTRIES ──
+  // Last 30min of US session (3:30-4:00 PM ET) has bad entry dynamics:
+  // MOC order flow, liquidity drying, positions that can't complete thesis.
+  // The CSV showed 3:00 hour at 33% WR. Block the last 30 minutes entirely.
+  if (!isSimMode()) {
+    const now  = new Date();
+    // ET time by offset from UTC. Simplified — doesn't do DST edge cases,
+    // but works for the standard 9:30-16:00 ET window in both EDT and EST.
+    const utcH = now.getUTCHours();
+    const utcM = now.getUTCMinutes();
+    const etH  = (utcH - 4 + 24) % 24;   // EDT default. For EST swap -5.
+    const etMinutes = etH * 60 + utcM;
+    const closeMinutes = 16 * 60;        // 4:00pm
+    const cutoffMinutes = closeMinutes - 30;  // 3:30pm
+    if (etMinutes >= cutoffMinutes && etMinutes < closeMinutes) {
+      return { pass: false, reason: `within 30min of close (${etH}:${String(utcM).padStart(2,'0')} ET)` };
+    }
+  }
+
+  return { pass: true };
+}
+
 async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   const isIntlETF = !!ETF_SESSIONS[sym];
   // In sim mode — always allow entries (we're replaying historical market hours)
@@ -4284,6 +4474,23 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   }
   if (direction === 'long'  && isCorrelated(sym)) return;
 
+  // ── EDGE GATE — 5 filters (regime, volume, MTF, adaptive conf, time-of-day) ──
+  const edge = await edgeGate(sym, direction, sigInfo, bars);
+  if (!edge.pass) {
+    // Throttle logging — 161 symbols × frequent scans can flood logs
+    const _k = sym + '_edge_' + direction, _n = Date.now();
+    if (!dupWarnThrottle[_k] || _n - dupWarnThrottle[_k] > 120000) {
+      dupWarnThrottle[_k] = _n;
+      log('edge', `⛔ ${sym} ${direction}: ${edge.reason}`);
+    }
+    return;
+  }
+  // Carry size multiplier through to the sizing step
+  const edgeSizeMult = edge.sizeMultiplier || 1.0;
+  if (edge.sizeMultiplier && edge.reason) {
+    log('edge', `⚖ ${sym} ${direction}: ${edge.reason}`);
+  }
+
   // ── DOLLAR EXPOSURE LIMIT — never deploy more than 90% of starting capital ──
   const deployedNow = Object.entries(positions).reduce((a,[s,pos]) => {
     const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
@@ -4295,7 +4502,15 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     return;
   }
 
-  const qty  = calcQty(sym, price, bars, sigInfo?.confidence || 70);
+  let qty  = calcQty(sym, price, bars, sigInfo?.confidence || 70);
+  // Apply regime-based sizing: chop / counter-trend = smaller position
+  if (edgeSizeMult < 1.0) {
+    const scaled = Math.max(1, Math.floor(qty * edgeSizeMult));
+    if (scaled < qty) {
+      log('edge', `${sym}: qty ${qty}→${scaled} (×${edgeSizeMult.toFixed(2)} edge sizing)`);
+      qty = scaled;
+    }
+  }
   const cost = qty * price;
   if (qty < 1) { log('warn', `Cannot enter ${sym}: qty too small`); return; }
 
@@ -5713,6 +5928,11 @@ async function runScan() {
 
 // Live Alpaca positions — refreshed every scan to prevent duplicate buys
 let alpacaPositions = new Set();
+// Guard against re-restoring a symbol within 60s of a MANUAL_CLOSE.
+// Without this, Alpaca's position list can lag behind a close by a few
+// seconds, letting the restore branch re-add the same symbol and setting
+// up a loop that writes duplicate MANUAL_CLOSE trades. { SYM: closedAtMs }
+const _recentlyClosed = {};
 // Live per-symbol price snapshot from Alpaca's /v2/positions response.
 // syncPositions prefers this over priceHistory5m because Alpaca reports
 // the actual quote even before our websocket feed has pushed a tick —
@@ -5733,35 +5953,69 @@ async function syncAlpacaPositions() {
     const liveSymbols = new Set(data.map(p => p.symbol));
 
     // ── Detect manual closes ──
-    // If we have a position in memory but it's gone from Alpaca → manually closed
+    // If we have a position in memory but it's gone from Alpaca → manually closed.
+    //
+    // CRITICAL DEDUP: previously this loop fired MANUAL_CLOSE trades on every
+    // reconcile when a symbol was in memory but not at Alpaca. A rare race or
+    // state-restoration path caused the SAME TQQQ position to record 30+
+    // MANUAL_CLOSE trades at the same price and qty, inflating total P&L by
+    // +$37k. We now:
+    //   1. Delete from positions{} FIRST, before any async I/O, so a second
+    //      concurrent call to this function sees an empty map.
+    //   2. Keep a short-lived "recently closed" guard so a racing restore
+    //      can't re-add the same symbol within 60s of a close.
     for (const sym of Object.keys(positions)) {
-      if (!liveSymbols.has(sym)) {
-        const pos = positions[sym];
-        // Get the last known price
-        const lastPrice = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
-        const qty       = pos.qtyRemaining || pos.qty;
-        const pnl       = (lastPrice - pos.entryPrice) * qty;
+      if (liveSymbols.has(sym)) continue;
 
-        log('sys', `🖐 Manual close detected: ${sym} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+      // Snapshot the position object, then remove from memory SYNCHRONOUSLY
+      // before any await. This closes the race window completely.
+      const pos = positions[sym];
+      delete positions[sym];
+      alpacaPositions.delete(sym);
+      _recentlyClosed[sym] = Date.now();
 
-        // Update stats
-        pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
-        portfolio += qty * lastPrice;
+      const lastPrice = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const qty       = pos.qtyRemaining || pos.qty;
+      const pnl       = (lastPrice - pos.entryPrice) * qty;
 
-        // Record as trade
-        trades.push({ time: new Date(), sym, side: 'SELL', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
+      log('sys', `🖐 Manual close detected: ${sym} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
 
-        // Remove from memory and Supabase
-        delete positions[sym];
-        alpacaPositions.delete(sym);
+      // Stats + cash
+      pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+      portfolio += qty * lastPrice;
+      trades.push({ time: new Date(), sym, side: 'SELL', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
+
+      // Supabase cleanup + logs (async — safe now that memory is already clean)
+      try {
         await sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE');
-
-        // Log and alert
         await syncTrade({ sym, side: 'SELL', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
         await syncLog('warn', `🖐 Manual close: ${sym} ${qty}x @ ~$${lastPrice.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
         await sendDiscordAlert('manual_close', sym, qty, lastPrice, pnl, 'MANUAL_CLOSE');
         await syncPortfolio();
-      }
+      } catch(e) { log('warn', `MANUAL_CLOSE post-processing error for ${sym}: ${e.message}`); }
+    }
+
+    // Same logic for shorts
+    for (const sym of Object.keys(shortPositions)) {
+      if (liveSymbols.has(sym)) continue;
+      const pos = shortPositions[sym];
+      delete shortPositions[sym];
+      alpacaShorts.delete(sym);
+      _recentlyClosed[sym] = Date.now();
+
+      const lastPrice = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const qty       = pos.qtyRemaining || pos.qty;
+      const pnl       = (pos.entryPrice - lastPrice) * qty; // inverted for short
+
+      log('sys', `🖐 Manual SHORT close detected: ${sym} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+      pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+      trades.push({ time: new Date(), sym, side: 'COVER', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
+      try {
+        await sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE');
+        await syncTrade({ sym, side: 'COVER', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
+        await syncLog('warn', `🖐 Manual SHORT close: ${sym} ${qty}x @ ~$${lastPrice.toFixed(2)}`);
+        await syncPortfolio();
+      } catch(e) {}
     }
 
     // ── Update live set ──
@@ -5771,6 +6025,20 @@ async function syncAlpacaPositions() {
     // ── Restore positions after restart ──
     for (const p of data) {
       const sym       = p.symbol;
+
+      // Guard: skip restoring symbols that were closed within the last 60s.
+      // Alpaca's /v2/positions can lag behind a close by a few seconds
+      // (the position sometimes reappears briefly before fully clearing).
+      // Restoring during that window was the source of the MANUAL_CLOSE
+      // duplicate loop that inflated P&L by $37k.
+      if (_recentlyClosed[sym] && Date.now() - _recentlyClosed[sym] < 60000) {
+        continue;
+      }
+      // Clean up old guard entries while we're here
+      if (_recentlyClosed[sym] && Date.now() - _recentlyClosed[sym] >= 60000) {
+        delete _recentlyClosed[sym];
+      }
+
       const isShort   = p.side === 'short';
       const curPrice  = +p.current_price || +p.avg_entry_price;
       const entryPrice = +p.avg_entry_price;
@@ -6177,6 +6445,19 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
     return;
   }
 
+  // ── EDGE GATE ── (scalps get same regime + volume + time-of-day filters)
+  // bars parameter might not be available here; pass null — MTF check skipped
+  const edge = await edgeGate(sym, direction, sigInfo, null);
+  if (!edge.pass) {
+    const _k = sym + '_scalp_edge_' + direction, _n = Date.now();
+    if (!dupWarnThrottle[_k] || _n - dupWarnThrottle[_k] > 60000) {
+      dupWarnThrottle[_k] = _n;
+      log('edge', `⛔ ${sym} scalp ${direction}: ${edge.reason}`);
+    }
+    return;
+  }
+  const edgeSizeMult = edge.sizeMultiplier || 1.0;
+
   // Position sizing — flat % of portfolio, no ATR sizing for scalps (moves too small)
   // CSV analysis showed scalp SLs averaging -$160 with worst at -$1,086. Shrink.
   // Was 10% of portfolio → now capped at 5%. Also enforce a dollar risk ceiling:
@@ -6186,6 +6467,11 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   const scalpPctCap  = Math.min(0.05, CONFIG.scalpPositionPct);
   const budget       = Math.min(portfolio, startCap) * scalpPctCap;
   let qty            = Math.floor(budget / price);
+  // Edge-based sizing (chop = half size, etc.)
+  if (edgeSizeMult < 1.0 && qty > 1) {
+    qty = Math.max(1, Math.floor(qty * edgeSizeMult));
+    log('edge', `${sym} scalp: qty scaled by ${edgeSizeMult.toFixed(2)} → ${qty}`);
+  }
   if (qty < 1) { log('scalp', `Scalp ${sym}: qty too small (budget=$${budget.toFixed(2)} price=$${price.toFixed(2)})`); return; }
 
   // Initial cash sanity check (will re-check after dollar-risk cap below)
@@ -6837,6 +7123,8 @@ async function prewarmData() {
   log('sys', `Bar cache ready in ${Date.now() - t}ms — first scan will fire immediately`);
   // Load previously learned strategies from Supabase
   await apexLoadStrategies();
+  // Load persisted symbol bench state so it survives restarts
+  await loadSymbolStats();
 }
 
 // ═══════════════════════════════════════════════════════════════════
