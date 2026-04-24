@@ -725,6 +725,86 @@ async function apexAnalyze() {
     }
   }
 
+  // ── DIMENSION 8: R-RATIO TUNING (big-winners-small-losers) ───────
+  // Core goal: avg_win / avg_loss should be >= 1.5. If it's <1.0, we're
+  // running small-winners-big-losers. Directly tune parameters based on
+  // the shape of the outcome distribution rather than just win rate.
+  const wins   = APEX.trades.filter(t => t.won);
+  const losses = APEX.trades.filter(t => !t.won);
+  if (wins.length >= 4 && losses.length >= 3) {
+    const avgWin  = wins.reduce((a, t) => a + Math.abs(t.pnl), 0) / wins.length;
+    const avgLoss = losses.reduce((a, t) => a + Math.abs(t.pnl), 0) / losses.length;
+    const rRatio  = avgWin / avgLoss;
+    const expectancy = (wins.length/APEX.trades.length) * avgWin
+                     - (losses.length/APEX.trades.length) * avgLoss;
+
+    // R < 1.0 = losses dominate winners → cut losers faster AND let winners run longer
+    if (rRatio < 1.0) {
+      // Tighten the hard stop a touch — smaller losers
+      const newMult = Math.max(1.5, (CONFIG.atrStopMult || 2.0) - 0.15);
+      if (newMult < CONFIG.atrStopMult) {
+        CONFIG.atrStopMult = +newMult.toFixed(2);
+        log('apex', `🎯 R-TUNE: avg loss $${avgLoss.toFixed(0)} > avg win $${avgWin.toFixed(0)} (R=${rRatio.toFixed(2)}) — tighten ATR stop to ${newMult}x`);
+      }
+      // Push TP3 higher so runners can compensate — bigger winners
+      if (CONFIG.tp3Pct < (ADAPT_BOUNDS.tp3Pct?.max || 0.10)) {
+        const newTp3 = Math.min(ADAPT_BOUNDS.tp3Pct?.max || 0.10, CONFIG.tp3Pct * 1.15);
+        CONFIG.tp3Pct = +newTp3.toFixed(3);
+        log('apex', `🎯 R-TUNE: TP3 → ${(newTp3*100).toFixed(1)}% — let winners run toward bigger $ outcomes`);
+      }
+      newRules.push({
+        id: 'r_ratio_low',
+        type: 'config_info',
+        name: `R=${rRatio.toFixed(2)} low — tightening stops, extending TP3`,
+        description: `Avg win $${avgWin.toFixed(2)} < avg loss $${avgLoss.toFixed(2)}. Tightening ATR stop and pushing TP3 higher to shift profile toward big-winners-small-losers.`,
+        action: { rRatio: +rRatio.toFixed(2), avgWin: +avgWin.toFixed(2), avgLoss: +avgLoss.toFixed(2), expectancy: +expectancy.toFixed(2) },
+        wr: wins.length / APEX.trades.length, n: APEX.trades.length, edge: 0,
+      });
+    } else if (rRatio > 2.0) {
+      // R > 2.0 = asymmetric profile achieved → can afford slightly wider stops
+      // for better entry survival (fewer premature stop-outs)
+      if (CONFIG.atrStopMult < 2.3) {
+        const newMult = Math.min(2.5, CONFIG.atrStopMult + 0.10);
+        CONFIG.atrStopMult = +newMult.toFixed(2);
+        log('apex', `🎯 R-TUNE: R=${rRatio.toFixed(2)} excellent — loosen ATR stop to ${newMult}x for better entry survival`);
+      }
+      newRules.push({
+        id: 'r_ratio_excellent',
+        type: 'config_info',
+        name: `R=${rRatio.toFixed(2)} excellent — asymmetric profile achieved`,
+        description: `Avg win $${avgWin.toFixed(2)} > 2× avg loss $${avgLoss.toFixed(2)}. Expectancy $${expectancy.toFixed(2)}/trade. Current settings working — slight stop loosening for entry survival.`,
+        action: { rRatio: +rRatio.toFixed(2), avgWin: +avgWin.toFixed(2), avgLoss: +avgLoss.toFixed(2), expectancy: +expectancy.toFixed(2) },
+        wr: wins.length / APEX.trades.length, n: APEX.trades.length, edge: 0,
+      });
+    }
+
+    // ── BREAK_EVEN_STOP analyzer: if BE stops fire as losses, buffer is too
+    // tight or threshold too aggressive. Count toward rule count.
+    if (beExits.length >= 3) {
+      const beAvg = beExits.reduce((a, t) => a + t.pnl, 0) / beExits.length;
+      if (beAvg < -1) { // avg BE exit is actually a small loss
+        newRules.push({
+          id: 'be_leaking',
+          type: 'config_info',
+          name: `BE stops leaking $${Math.abs(beAvg).toFixed(2)}/trade (${beExits.length} exits)`,
+          description: `Break-even stops are averaging ${beAvg < 0 ? 'losses' : 'gains'} of $${beAvg.toFixed(2)}. Buffer above entry may be too small to cover fees+slippage, or BE threshold is arming too early on noise.`,
+          action: { beAvgPnl: +beAvg.toFixed(2), n: beExits.length },
+          wr: 0, n: beExits.length, edge: 0,
+        });
+      }
+    }
+
+    // ── TP distribution: if TP3 never hits, TP3 target is too far ─
+    const tp3Exits = APEX.trades.filter(t => t.exitType === 'TAKE_PROFIT');
+    if (APEX.trades.length >= 15 && tp3Exits.length === 0) {
+      if (CONFIG.tp3Pct > (ADAPT_BOUNDS.tp3Pct?.min || 0.04)) {
+        const newTp3 = Math.max(ADAPT_BOUNDS.tp3Pct?.min || 0.04, CONFIG.tp3Pct * 0.85);
+        CONFIG.tp3Pct = +newTp3.toFixed(3);
+        log('apex', `🎯 TP3 never hit in ${APEX.trades.length} trades — lowering to ${(newTp3*100).toFixed(1)}% to make it reachable`);
+      }
+    }
+  }
+
   // Save to Supabase
   try {
     await sbFetch('tc_settings?id=eq.1', 'PATCH', {
@@ -5181,40 +5261,56 @@ async function managePosition(sym, price, bars) {
 
   const hwChg = (pos.highWater - pos.entryPrice) / pos.entryPrice;
 
-  // Break-even: lock when up 0.5× ATR — stock made a real move, protect it
-  const beThreshold = Math.max(posAtrPct * 0.5, 0.002); // min 0.2%
-  if (!pos.breakEvenSet && chg >= beThreshold) {
-    positions[sym].stopPrice    = pos.entryPrice * 1.0001;
-    positions[sym].breakEvenSet = true;
-    log('risk', `🔒 ${sym} BE @ $${pos.entryPrice.toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
-    await syncLog('sys', `🔒 Break-even: ${sym}`);
-    // Lock 15% of position at break-even — guarantees we never fully scratch
-    // Even if stop hits, we've already taken some off the table
-    const lockQty = Math.max(0, Math.floor((pos.qtyRemaining || pos.qty) * 0.15));
-    if (lockQty >= 1 && !pos.tp1Hit) {
-      log('risk', `🔒 ${sym} locking ${lockQty} shares at BE ($${price.toFixed(2)}) — guaranteed profit`);
-      await partialExit(sym, price, lockQty, 'BE_LOCK');
+  // ── BREAK-EVEN: delayed and buffered ─────────────────────────────
+  // Previous logic: BE at 0.5× ATR (~0.2%) → fired on noise, then price
+  // wiggled back through entry and triggered BREAK_EVEN_STOP below entry
+  // due to fee+slippage. Avg BE stop outcome was -$25 × 6 trades = -$151.
+  //
+  // New logic:
+  //   1. Higher threshold: max(1.0× ATR, 0.4%) — stock must make a real move
+  //   2. Confirmation: hwChg must hold >=0.5× ATR for 2 bars before arming
+  //   3. BE stop set ABOVE entry by fee+slippage buffer (~0.12%) so the
+  //      "break-even stop" is actually slightly green, not slightly red
+  const beThreshold = Math.max(posAtrPct * 1.0, 0.004); // min 0.4% (was 0.2%)
+  const BE_BUFFER   = 0.0012; // 0.12% above entry covers fees+slippage
+  if (!pos.breakEvenSet && chg >= beThreshold && hwChg >= beThreshold) {
+    // Confirm: has price held the gain for at least 1 bar? Avoids wick fakeouts.
+    const confirmed = !bars || bars.length < 2
+      || ((bars[bars.length - 2].c - pos.entryPrice) / pos.entryPrice) >= beThreshold * 0.6;
+    if (confirmed) {
+      positions[sym].stopPrice    = pos.entryPrice * (1 + BE_BUFFER);
+      positions[sym].breakEvenSet = true;
+      log('risk', `🔒 ${sym} BE+buffer @ $${(pos.entryPrice*(1+BE_BUFFER)).toFixed(2)} (+${(chg*100).toFixed(2)}%)`);
+      await syncLog('sys', `🔒 Break-even armed: ${sym}`);
+      // BE_LOCK removed: cheap 15% partials were capturing $4 avg — not worth
+      // the forgone upside. Profits now come from letting the full position
+      // run to TP1/TP2/TP3 where avg exits are $27/$41/$67.
     }
   }
 
-  // ── PRE-TP1 TRAILING: protect gains between BE and TP1 ──────────
-  // Once up 0.8%+ and break-even set, trail 1.2× ATR below high water
-  // This locks partial profits before TP1 fires
-  if (pos.breakEvenSet && !pos.tp1Hit && chg >= 0.005) { // trail from 0.5% (was 0.8%)
-    const preTrail = pos.highWater * (1 - Math.max(posAtrPct * 1.2, 0.004));
+  // ── PRE-TP1 TRAILING: loose trail between BE and TP1 ─────────────
+  // Previous: 1.2× ATR trail from +0.5% → often stopped out before TP1.
+  // New: 1.8× ATR trail, only after +0.8%, never tighter than 0.6%.
+  // Goal: let trades reach TP1 instead of being trailed out mid-move.
+  if (pos.breakEvenSet && !pos.tp1Hit && chg >= 0.008) {
+    const preTrail = pos.highWater * (1 - Math.max(posAtrPct * 1.8, 0.006));
     if (preTrail > positions[sym].stopPrice) {
       positions[sym].stopPrice = preTrail;
-      // Don't log every update — only when stop actually moves up
     }
   }
 
-  // Trailing stop only after TP1 — trail 1× ATR below high water
+  // ── POST-TP1 TRAIL: room for TP2 ─────────────────────────────────
+  // Previous: 1.0× ATR — too tight, cut winners before TP2.
+  // New: 1.5× ATR min 1.0%. TP2 ($41 avg) is worth waiting for.
   if (pos.tp1Hit && !pos.tp2Hit) {
-    const trail = pos.highWater * (1 - Math.max(posAtrPct, 0.008));
+    const trail = pos.highWater * (1 - Math.max(posAtrPct * 1.5, 0.010));
     if (trail > positions[sym].stopPrice) positions[sym].stopPrice = trail;
   }
+  // ── POST-TP2 TRAIL: runner protection ────────────────────────────
+  // Previous: 0.75× ATR — too tight. Goal is to catch the occasional +5-8%
+  // runner since TAKE_PROFIT (TP3) avg is $67. Use 1.2× ATR min 0.7%.
   if (pos.tp1Hit && pos.tp2Hit) {
-    const trail = pos.highWater * (1 - Math.max(posAtrPct * 0.75, 0.005));
+    const trail = pos.highWater * (1 - Math.max(posAtrPct * 1.2, 0.007));
     if (trail > positions[sym].stopPrice) positions[sym].stopPrice = trail;
   }
 
@@ -5271,8 +5367,11 @@ async function managePosition(sym, price, bars) {
   }
 
   // ── Take profit tiers ──
+  // Partial sizing tuned for asymmetric payoff: sell less at TP1, more at TP2,
+  // all remaining at TP3. Historical: TP1 avg $27, TP2 avg $41, TP3 avg $67 —
+  // we want more shares reaching the higher tiers.
   if (!pos.tp1Hit && chg >= effectiveTP1) {
-    const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.33));
+    const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.25)); // was 0.33
     positions[sym].tp1Hit = true;
     log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}% (dyn ${(effectiveTP1*100).toFixed(1)}%): selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
     await partialExit(sym, price, sell, 'TP1');
