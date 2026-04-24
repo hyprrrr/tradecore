@@ -6654,16 +6654,14 @@ async function tick() {
     }
   }
 
-  // ── Live / Paper mode ──
+  // ── Position trading — once per day ──
   if (CONFIG.positionTradingEnabled && !isSimMode() && isMarketOpen()) {
-    const hoursSinceLastPT = (now2 - (tick._lastPTRun||0)) / 3600000;
-    if (hoursSinceLastPT >= 23) { // once per day
-      tick._lastPTRun = now2;
+    const hoursSinceLastPT = (now - (tick._lastPTRun||0)) / 3600000;
+    if (hoursSinceLastPT >= 23) {
+      tick._lastPTRun = now;
       managePositionTrades().catch(e => log('error', `PT scan: ${e.message}`));
     }
   }
-
-  // ── Live / Paper mode ──
 
     // Screener every 3 minutes
     if (isMarketOpen() && (now - lastScreenerRun >= SCREENER_INTERVAL_MS)) {
