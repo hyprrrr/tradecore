@@ -1335,18 +1335,20 @@ function startChart(){
   let _lastRenderVal = 0;
   (function loop(){
     chartRAF = requestAnimationFrame(loop);
-    if (document.hidden) return; // skip when hidden
+    if (document.hidden) return;
 
     const now = Date.now();
-    const valChanged = Math.abs(chartCurrent - _lastRenderVal) > 0.05;
-    const timePassed = (now - _lastRender) > 100; // max 10fps
+    // Only render at 4fps max — data updates every 8s so 4fps is plenty
+    // The live dot pulse runs on a sine of Date.now() so it stays smooth
+    // without us needing to redraw constantly
+    if (now - _lastRender < 250) return; // 4fps cap
+    const valChanged = Math.abs(chartCurrent - _lastRenderVal) > 0.01;
+    const timePassed = (now - _lastRender) > 2000; // force redraw every 2s for dot pulse
+    if (!valChanged && !timePassed) return;
 
-    // Only render if value changed OR 100ms passed (for animations/glow decay)
-    if (valChanged || timePassed) {
-      _lastRender    = now;
-      _lastRenderVal = chartCurrent;
-      renderChart();
-    }
+    _lastRender    = now;
+    _lastRenderVal = chartCurrent;
+    renderChart();
   })();
 }
 
@@ -1415,6 +1417,237 @@ async function loadEquityHistory(){
 }
 
 // Called by poll() when new equity data arrives from Supabase
+function drawChart(){
+  if(!chartRAF) startChart();
+  if(eqHist.length === 0) return;
+  const newTarget = eqHist[eqHist.length-1];
+  if(newTarget > 0 && newTarget !== chartTarget){
+    if(chartTarget !== 0){
+      chartLineGlow = 1.0;   // flash on new data
+      lastDataUpdate = Date.now();
+    }
+    chartTarget = newTarget;
+    if(chartCurrent === 0) chartCurrent = chartTarget;
+  }
+}
+
+// ── Chart render cache ────────────────────────────────────────
+let _chartCache = { minV:0, maxV:0, tStart:0, pts:[], color:'#00d4aa', cap:0 };
+
+function renderChart(){
+  const cv=$('equityChart'); if(!cv||!chartCtx) return;
+  const W=cv.parentElement.offsetWidth, H=cv.parentElement.offsetHeight;
+  if(W<=0||H<=0) return;
+  if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; _chartCache.pts=[]; }
+
+  const now=Date.now(), ctx=chartCtx, cap=getStartingCapital();
+
+  // ── 1. Update chartCurrent (no spring — direct set)
+  // Spring physics caused stutter. Direct assignment is smooth because
+  // real data only changes every 8s, so the line moves in clean steps.
+  if(chartTarget>0) chartCurrent = chartTarget;
+  const displayVal = chartCurrent || cap;
+
+  // ── 2. Push to stream (throttled — only on real change)
+  if(displayVal>0 && !document.hidden){
+    const last=chartStream[chartStream.length-1];
+    const gap=last?(now-last.t):99999;
+    if(last && gap>8000 && gap<600000){
+      // Bridge gap with flat line
+      chartStream.push({t:last.t+gap*0.5, v:last.v});
+      chartStream.push({t:now-1,          v:last.v});
+    }
+    if(!last || Math.abs(displayVal-last.v)>0.10 || gap>2000){
+      const pj=last?Math.abs(displayVal-last.v)/Math.max(last.v,1):0;
+      if(pj<0.03 || chartStream.length<5){
+        chartStream.push({t:now, v:displayVal});
+        if(chartStream.length>STREAM_CAP) chartStream.shift();
+      }
+    }
+  }
+
+  // ── 3. Empty state
+  const empty=$('chartEmpty');
+  if(chartStream.length<4){ if(empty) empty.style.display='flex'; return; }
+  if(empty) empty.style.display='none';
+
+  // ── 4. Visible window
+  const windowMs=WINDOW_SECS*1000;
+  const tEnd=now, tStart=tEnd-windowMs;
+
+  // ── 5. Only recompute layout when data changed
+  // Compare first/last stream timestamps to detect change
+  const streamSig = chartStream.length+'|'+(chartStream[0]?.t||0)+'|'+(chartStream[chartStream.length-1]?.v||0);
+  const needRecompute = streamSig !== _chartCache.sig || W !== _chartCache.W || H !== _chartCache.H;
+
+  if(needRecompute){
+    _chartCache.sig = streamSig;
+    _chartCache.W   = W;
+    _chartCache.H   = H;
+
+    let visible = chartStream.filter(p=>p.t>=tStart);
+    if(visible.length<2){ _chartCache.pts=[]; return; }
+
+    // Downsample to 200 pts max
+    if(visible.length>200){
+      const step=Math.ceil(visible.length/200);
+      visible=visible.filter((_,i)=>i%step===0||i===visible.length-1);
+    }
+
+    const P={t:48,b:28,l:58,r:20};
+    const cW=W-P.l-P.r, cH=H-P.t-P.b;
+
+    // Y-axis range
+    let rawMin=visible[0].v, rawMax=visible[0].v;
+    for(const p of visible){
+      if(p.v<rawMin) rawMin=p.v;
+      if(p.v>rawMax) rawMax=p.v;
+    }
+    const dataRange=rawMax-rawMin;
+    const pad=Math.max(dataRange*0.25,(chartTarget||cap)*0.0004);
+    const minV=rawMin-pad, maxV=rawMax+pad, vRange=maxV-minV||1;
+
+    const tx=t=>P.l+((t-tStart)/windowMs)*cW;
+    const ty=v=>P.t+cH-((v-minV)/vRange)*cH;
+
+    _chartCache = {
+      ..._chartCache,
+      P, cW, cH, minV, maxV, vRange, tStart,
+      pts: visible.map(p=>[tx(p.t), ty(p.v)]),
+      cap, isUp: displayVal >= cap,
+      sig: streamSig, W, H,
+    };
+  }
+
+  const {P,cW,cH,minV,vRange,pts,isUp} = _chartCache;
+  if(!pts||pts.length<2) return;
+
+  // ── 6. Draw ───────────────────────────────────────────────────
+  ctx.clearRect(0,0,W,H);
+
+  const lineCol = isUp ? '#00d4aa' : '#ff4757';
+  const fillCol = isUp ? 'rgba(0,212,170,' : 'rgba(255,71,87,';
+
+  const tx2=t=>P.l+((t-tStart)/windowMs)*cW;
+  const ty2=v=>P.t+cH-((v-minV)/vRange)*cH;
+
+  // Grid
+  ctx.font='10px ui-monospace,monospace';
+  ctx.textAlign='right';
+  for(let i=0;i<=4;i++){
+    const v=minV+(vRange/4)*i;
+    const y=ty2(v);
+    if(y<P.t||y>P.t+cH) continue;
+    ctx.setLineDash([2,8]);
+    ctx.strokeStyle='rgba(255,255,255,0.05)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(P.l,y); ctx.lineTo(W-P.r,y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(255,255,255,0.22)';
+    const lbl = vRange<2000
+      ? '$'+Math.round(v).toLocaleString('en-US')
+      : '$'+(v/1000).toFixed(1)+'k';
+    ctx.fillText(lbl, P.l-6, y+3);
+  }
+
+  // Baseline
+  const baseY=ty2(cap);
+  if(baseY>=P.t && baseY<=P.t+cH){
+    ctx.setLineDash([3,7]);
+    ctx.strokeStyle='rgba(255,255,255,0.12)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Path builder (Catmull-Rom, tension=0.15)
+  function buildPath(p){
+    ctx.moveTo(p[0][0],p[0][1]);
+    for(let i=0;i<p.length-1;i++){
+      const p0=p[Math.max(i-1,0)], p1=p[i], p2=p[i+1], p3=p[Math.min(i+2,p.length-1)];
+      const t=0.15;
+      ctx.bezierCurveTo(
+        p1[0]+(p2[0]-p0[0])*t, p1[1]+(p2[1]-p0[1])*t,
+        p2[0]-(p3[0]-p1[0])*t, p2[1]-(p3[1]-p1[1])*t,
+        p2[0], p2[1]
+      );
+    }
+  }
+
+  // Fill
+  const grad=ctx.createLinearGradient(0,P.t,0,H-P.b);
+  grad.addColorStop(0, fillCol+'0.15)');
+  grad.addColorStop(1, fillCol+'0)');
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], Math.min(H-P.b, ty2(minV)));
+  ctx.lineTo(pts[0][0], pts[0][1]);
+  buildPath(pts);
+  ctx.lineTo(pts[pts.length-1][0], Math.min(H-P.b, ty2(minV)));
+  ctx.closePath();
+  ctx.fillStyle=grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  buildPath(pts);
+  ctx.strokeStyle=lineCol;
+  ctx.lineWidth=2;
+  ctx.lineJoin='round';
+  ctx.lineCap='round';
+  ctx.shadowColor=lineCol;
+  ctx.shadowBlur=4;
+  ctx.stroke();
+  ctx.shadowBlur=0;
+
+  // Live dot
+  const ex=pts[pts.length-1][0], ey=pts[pts.length-1][1];
+  if(ex>=P.l&&ex<=W-P.r&&ey>=P.t&&ey<=P.t+cH){
+    const pulse=0.3+0.25*Math.sin(now*0.003);
+    ctx.beginPath(); ctx.arc(ex,ey,5+pulse*2,0,Math.PI*2);
+    ctx.fillStyle=lineCol.replace('rgb','rgba').replace(')',`,${0.15*pulse})`);
+    ctx.fill();
+    ctx.beginPath(); ctx.arc(ex,ey,3,0,Math.PI*2);
+    ctx.fillStyle=lineCol;
+    ctx.shadowColor=lineCol; ctx.shadowBlur=6;
+    ctx.fill(); ctx.shadowBlur=0;
+  }
+
+  // Hover crosshair
+  if(typeof chartMouseX==='number'&&chartMouseX>=P.l&&chartMouseX<=W-P.r){
+    let closest=pts[0], closestV=chartStream[0]?.v||cap;
+    const visibleFiltered=chartStream.filter(p=>p.t>=tStart);
+    for(let i=0;i<pts.length;i++){
+      if(Math.abs(pts[i][0]-chartMouseX)<Math.abs(closest[0]-chartMouseX)){
+        closest=pts[i];
+        closestV=visibleFiltered[i]?.v||cap;
+      }
+    }
+    ctx.setLineDash([3,5]);
+    ctx.strokeStyle='rgba(255,255,255,0.12)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(closest[0],P.t); ctx.lineTo(closest[0],P.t+cH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(closest[0],closest[1],3.5,0,Math.PI*2);
+    ctx.fillStyle=lineCol; ctx.fill();
+    const diff2=closestV-cap;
+    const pct=(diff2/cap*100).toFixed(2);
+    const sign=diff2>=0?'+':'';
+    const tip=sign+'$'+Math.abs(diff2).toFixed(2)+' ('+sign+pct+'%)';
+    ctx.font='bold 11px ui-monospace,monospace';
+    const tw2=ctx.measureText(tip).width+16;
+    let tipX=closest[0]-tw2/2;
+    tipX=Math.max(P.l,Math.min(W-P.r-tw2,tipX));
+    const tipY=closest[1]-36;
+    ctx.fillStyle='rgba(15,17,21,0.92)';
+    ctx.beginPath(); ctx.roundRect(tipX,tipY,tw2,22,4); ctx.fill();
+    ctx.fillStyle=diff2>=0?'#00d4aa':'#ff4757';
+    ctx.textAlign='center';
+    ctx.fillText(tip,tipX+tw2/2,tipY+14);
+    ctx.textAlign='right';
+  }
+}
+
+
 function drawChart(){
   if(!chartRAF) startChart();
   if(eqHist.length === 0) return;
