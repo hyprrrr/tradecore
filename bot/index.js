@@ -1705,15 +1705,23 @@ async function syncPortfolio() {
     equityValue = realEquity;
   }
   await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
-    cash:            +cashValue.toFixed(2),
-    total_value:     +equityValue.toFixed(2),
-    day_pnl:         +dayPnl.toFixed(2),
-    total_wins:      totalWins,
-    total_losses:    totalLosses,
-    circuit_breaker: circuitBreakerOn,
-    last_scan:       new Date().toISOString(),
-    session:         getCurrentSession(),
-    updated_at:      new Date().toISOString(),
+    cash:             +cashValue.toFixed(2),
+    total_value:      +equityValue.toFixed(2),
+    day_pnl:          +dayPnl.toFixed(2),
+    total_wins:       totalWins,
+    total_losses:     totalLosses,
+    circuit_breaker:  circuitBreakerOn,
+    last_scan:        new Date().toISOString(),
+    session:          getCurrentSession(),
+    // Recovery telemetry — lets dashboard surface whether the engine is
+    // actively hunting or has given up. Without this, there was no way to
+    // tell from the UI whether recovery ever triggered.
+    recovery_active:  !!(recoveryState && recoveryState.active),
+    recovery_enabled: !!CONFIG.recoveryMode,
+    recovery_symbol:  recoveryState?.sym || null,
+    recovery_target:  recoveryState ? +recoveryState.targetPnl.toFixed(2) : 0,
+    recovery_attempts: recoveryState?.attempts || 0,
+    updated_at:       new Date().toISOString(),
   });
 
   // Step 5: Equity snapshot every 30 seconds — this is what the dashboard's
@@ -4766,17 +4774,31 @@ async function runRecoveryScan() {
   }
 
   // Scan the original symbol first, then all other symbols if no signal found
-  // This way recovery isn't stuck waiting for one symbol that may not move
+  // This way recovery isn't stuck waiting for one symbol that may not move.
+  // Benched symbols are excluded — enterPosition would reject them anyway,
+  // so trying them wastes a scan slot.
   const openSyms = new Set([...Object.keys(positions), ...Object.keys(shortPositions)]);
-  const scanList = [sym, ...CONFIG.symbols.filter(s => s !== sym && !openSyms.has(s))];
+  const originalIsBenched = isSymbolBenched(sym);
+  const scanList = [
+    ...(originalIsBenched ? [] : [sym]),
+    ...CONFIG.symbols.filter(s => s !== sym && !openSyms.has(s) && !isSymbolBenched(s))
+  ];
+  if (originalIsBenched) {
+    log('recovery', `Recovery: ${sym} benched — hunting alternative symbols only`);
+  }
+  if (scanList.length === 0) {
+    log('recovery', `⏳ No eligible recovery candidates (all benched or open) — will retry`);
+    return;
+  }
 
   recoveryState.attempts++;
-  log('recovery', `🔄 Recovery scan #${recoveryState.attempts}: scanning ${scanList.length} symbols for opportunity`);
+  log('recovery', `🔄 Recovery scan #${recoveryState.attempts}: scanning ${Math.min(scanList.length, 12)} symbols`);
 
   const MIN_RECOVERY_CONF = 65;
   let bestSig = null, bestSym = null, bestBars = null;
 
-  for (const candidate of scanList.slice(0, 8)) { // check up to 8 symbols
+  // Widened from 8 → 12 since bench exclusions can thin the list significantly
+  for (const candidate of scanList.slice(0, 12)) {
     if (openSyms.has(candidate)) continue;
 
     // In sim mode: use already-loaded sim bars instead of live Alpaca
@@ -4832,7 +4854,7 @@ async function runRecoveryScan() {
   if (direction === 'short' && !CONFIG.shortsEnabled) {
     // Re-scan for a long-only opportunity
     let longSig = null, longSym = null, longBars = null;
-    for (const candidate of scanList.slice(0, 8)) {
+    for (const candidate of scanList.slice(0, 12)) {
       if (openSyms.has(candidate)) continue;
       try {
         const feed = getDataFeed();
