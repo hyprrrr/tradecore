@@ -1624,7 +1624,13 @@ async function syncPortfolio() {
     });
     // Log equity event in sim too for diagnostics
     logEquityEvent(equity, portfolio, 'sim_syncPortfolio', { dayPnl, barPnl: dayPnl });
-    // Sim never writes to tc_equity — equity chart only shows real account history
+    // Write sim_tc_equity so the dashboard chart has data to render in sim mode.
+    // Same cadence as live (30s) — uses the same dedup guard below.
+    const nowSim = Date.now();
+    if (equity > 0 && (nowSim - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
+      lastEquitySnapshot = nowSim;
+      await sbFetch(tbl('tc_equity'), 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+    }
     return;
   }
 
@@ -1710,7 +1716,9 @@ async function syncPortfolio() {
     updated_at:      new Date().toISOString(),
   });
 
-  // Step 5: Equity snapshot every 2 minutes
+  // Step 5: Equity snapshot every 30 seconds — this is what the dashboard's
+  // candle chart reads (not trade pnls, which were getting corrupted by old
+  // test rows and producing impossible $35k/5min candles).
   const now = Date.now();
   if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10
       && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
@@ -6825,7 +6833,7 @@ const FULL_SCAN_INTERVAL_MS = Math.max(
   10000 // never faster than 10s
 );
 const PRICE_SYNC_INTERVAL_MS      = 8000;          // price updates every 8s
-const EQUITY_SNAPSHOT_INTERVAL_MS = 90 * 1000;     // equity curve point every 90s
+const EQUITY_SNAPSHOT_INTERVAL_MS = 30 * 1000;     // equity curve point every 30s (was 90s) — better 5M/15M candle density
 let lastEquitySnapshot = 0;
 
 log('sys', `Full scan every ${FULL_SCAN_INTERVAL_MS/1000}s | Price sync every ${PRICE_SYNC_INTERVAL_MS/1000}s`);
