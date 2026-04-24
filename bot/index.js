@@ -82,7 +82,7 @@ const CONFIG = {
   peakRsiExit:       80,     // RSI level for immediate exit
   fadeMinProfit:     0.020,  // 2% min profit before fade exit
   fadePullback:      0.020,  // 2% pullback from high triggers fade exit
-  hardMaxLoss:       0.015,  // 1.5% max loss per trade (hard ceiling — tightened)
+  hardMaxLoss:       0.010,  // 1.0% max loss per trade (tightened from 1.5% — CSV showed -$1,060 worst)
   initialStopPct:    0.020,  // 2% initial stop before break-even // move SL to entry once up X%
   tp1Pct:            +(process.env.TP1_PCT           || 1.5) / 100, // sell 33% at +1.5%
   tp2Pct:            +(process.env.TP2_PCT           || 3.0) / 100, // sell 33% at +3%
@@ -180,7 +180,7 @@ async function loadRemoteConfig() {
     if (s.peak_rsi_exit)    CONFIG.peakRsiExit       = +s.peak_rsi_exit;
     if (s.fade_min_profit)  CONFIG.fadeMinProfit     = +s.fade_min_profit / 100;
     if (s.fade_pullback)    CONFIG.fadePullback      = +s.fade_pullback / 100;
-    if (s.hard_max_loss !== undefined) CONFIG.hardMaxLoss = Math.max(0.012, +s.hard_max_loss / 100); // min 1.2%
+    if (s.hard_max_loss !== undefined) CONFIG.hardMaxLoss = Math.max(0.008, Math.min(0.015, +s.hard_max_loss / 100)); // 0.8-1.5% range
     if (s.initial_stop_pct) CONFIG.initialStopPct    = +s.initial_stop_pct / 100;
     if (s.atr_stop_mult)    CONFIG.atrStopMult       = Math.min(2.0, Math.max(1.5, +s.atr_stop_mult)); // clamp 1.5-2.0x
     if (s.discord_webhook)  CONFIG.discordWebhook   = s.discord_webhook;
@@ -1552,7 +1552,7 @@ async function exitPositionTrade(sym, price, reason) {
   await placeOrder(sym,pos.qty,'sell');
   portfolio += pos.qty*price;
   delete positionTrades[sym];
-  pnl > 0 ? totalWins++ : totalLosses++;
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
   log('position',`${pnl>0?"✅":"🛑"} PT EXIT ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?"+":""}$${pnl.toFixed(2)} (${reason})`);
   await syncTrade({sym,side:'PT_SELL',qty:pos.qty,price,pnl,reason});
   await syncLog('position',`${pnl>0?"✅":"🛑"} Position Trade Closed: ${sym} P&L=${pnl>=0?"+":""}$${pnl.toFixed(2)} (${reason})`);
@@ -2304,6 +2304,41 @@ let totalLosses         = 0;
 let dailyStartPortfolio = CONFIG.startingCapital;
 let circuitBreakerOn    = false;
 let lastScanTime        = null;
+
+// ─── SYMBOL BLACKLIST ────────────────────────────────────────────────
+// Tracks per-symbol loss streaks. A symbol that's 0-for-3 or losing
+// >2% of starting capital gets benched — the CSV showed SLV at 0/9 for
+// -$3,681 and TSLA scalps averaging -$160. The adaptive engine shouldn't
+// have to wait for 15+ trades of a given symbol before deciding it's
+// trash — block at 3 strikes.
+const symbolStats = {};  // { SYM: { lossStreak, winStreak, totalPnl, benchedUntil } }
+function recordSymbolOutcome(sym, pnl) {
+  if (!symbolStats[sym]) symbolStats[sym] = { lossStreak: 0, winStreak: 0, totalPnl: 0, benchedUntil: 0 };
+  const s = symbolStats[sym];
+  s.totalPnl += pnl;
+  if (pnl > 0) { s.winStreak += 1; s.lossStreak = 0; }
+  else if (pnl < 0) { s.lossStreak += 1; s.winStreak = 0; }
+  // Bench triggers:
+  //   - 3 losses in a row on the symbol, OR
+  //   - cumulative losses on symbol exceed 2% of starting capital
+  const startCap = CONFIG.startingCapital || 100000;
+  if (s.lossStreak >= 3 || s.totalPnl < -0.02 * startCap) {
+    const hours = s.lossStreak >= 5 ? 24 : 4;
+    s.benchedUntil = Date.now() + hours * 3600 * 1000;
+    log('risk', `⛔ BENCH ${sym} for ${hours}h — ${s.lossStreak} losses, cum P&L $${s.totalPnl.toFixed(0)}`);
+  }
+}
+function isSymbolBenched(sym) {
+  const s = symbolStats[sym];
+  if (!s) return false;
+  if (s.benchedUntil && Date.now() < s.benchedUntil) return true;
+  if (s.benchedUntil && Date.now() >= s.benchedUntil) {
+    // Bench expired — reset streak so symbol gets a fresh chance
+    s.lossStreak = 0;
+    s.benchedUntil = 0;
+  }
+  return false;
+}
 
 // Scalp-specific state
 let scalpPositions      = {};   // { SYM: { entryPrice, qty, entryTime, stopPrice, tpPrice, highWater, direction } }
@@ -4190,6 +4225,10 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   }
   if (checkCircuitBreaker()) return;
   if (hasLargeGap(sym, price)) return;
+  if (isSymbolBenched(sym)) {
+    log('risk', `⛔ Blocked ${sym} — benched (loss streak or cum losses > 2% cap)`);
+    return;
+  }
 
   // ── HARD POSITION LIMITS — checked inside enterPosition so they can never be bypassed ──
   const totalNow = Object.keys(positions).length + Object.keys(shortPositions).length + Object.keys(scalpPositions).length;
@@ -4399,7 +4438,7 @@ async function coverShort(sym, price, reason) {
   // Short P&L = (entry - exit) × qty (profit when price drops)
   const pnl = (pos.entryPrice - price) * qty;
   if (isSimMode()) portfolio += pnl; // only track in sim — live uses Alpaca
-  pnl > 0 ? totalWins++ : totalLosses++;
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50,
     atrPct: pos?.atrAtEntry ? pos.atrAtEntry/price : 0,
     session: getCurrentSession(), side: 'short', sym, exitReason: reason,
@@ -4542,7 +4581,7 @@ async function coverPartialShort(sym, price, qty, reason) {
   const pnl = (pos.entryPrice - price) * qty;
   portfolio += pnl;
   shortPositions[sym].qtyRemaining -= qty;
-  pnl > 0 ? totalWins++ : totalLosses++;
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
   if (shortPositions[sym].qtyRemaining <= 0) delete shortPositions[sym];
   log('short', `🎯 PARTIAL COVER ${reason}: ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
   trades.push({ time: new Date(), sym, side: 'COVER', qty, price, pnl, reason });
@@ -4562,7 +4601,7 @@ async function partialExit(sym, price, qtyToSell, reason) {
   if (isSimMode()) portfolio += qtyToSell * price;
   positions[sym].qtyRemaining -= qtyToSell;
   positions[sym].cost = positions[sym].qtyRemaining * avgCost;
-  pnl > 0 ? totalWins++ : totalLosses++;
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
 
   const icons = { TP1: '🎯', TP2: '🎯🎯', TP3: '🎯🎯🎯' };
   const icon = icons[reason] || '🎯';
@@ -4595,7 +4634,7 @@ async function exitPosition(sym, price, reason) {
   // Only update in-memory cash in sim mode — in live mode Alpaca is the source of truth
   // Adding proceeds in live mode causes cash to inflate and diverge from reality
   if (isSimMode()) portfolio += qtyToSell * price;
-  pnl > 0 ? totalWins++ : totalLosses++;
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50,
     atrPct: pos?.atrAtEntry ? pos.atrAtEntry/price : 0,
     session: getCurrentSession(), side: 'long', sym, exitReason: reason,
@@ -5652,7 +5691,7 @@ async function syncAlpacaPositions() {
         log('sys', `🖐 Manual close detected: ${sym} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
 
         // Update stats
-        pnl > 0 ? totalWins++ : totalLosses++;
+        pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
         portfolio += qty * lastPrice;
 
         // Record as trade
@@ -6070,6 +6109,10 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   if (checkCircuitBreaker()) return;
   if (!isMarketOpen()) { log('scalp', `Scalp blocked — market closed`); return; }
   if (scalpPositions[sym]) { log('scalp', `Already in scalp position for ${sym}`); return; }
+  if (isSymbolBenched(sym)) {
+    log('scalp', `⛔ Scalp blocked ${sym} — benched`);
+    return;
+  }
   // Also check Alpaca — in-memory state can diverge from actual positions
   if (alpacaPositions.has(sym) || positions[sym] || shortPositions[sym]) {
     log('scalp', `🚫 ${sym}: Alpaca already has position — blocking scalp entry to prevent duplicate`);
@@ -6081,18 +6124,40 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   }
 
   // Position sizing — flat % of portfolio, no ATR sizing for scalps (moves too small)
-  const budget = portfolio * CONFIG.scalpPositionPct;
-  const qty    = Math.floor(budget / price);
+  // CSV analysis showed scalp SLs averaging -$160 with worst at -$1,086. Shrink.
+  // Was 10% of portfolio → now capped at 5%. Also enforce a dollar risk ceiling:
+  // max $ loss per scalp = 0.5% of STARTING capital (not current, so winning
+  // streaks don't balloon scalp size).
+  const startCap     = CONFIG.startingCapital || 100000;
+  const scalpPctCap  = Math.min(0.05, CONFIG.scalpPositionPct);
+  const budget       = Math.min(portfolio, startCap) * scalpPctCap;
+  let qty            = Math.floor(budget / price);
   if (qty < 1) { log('scalp', `Scalp ${sym}: qty too small (budget=$${budget.toFixed(2)} price=$${price.toFixed(2)})`); return; }
 
-  const cost = qty * price;
-  if (cost > portfolio) { log('scalp', `Scalp ${sym}: insufficient cash`); return; }
+  // Initial cash sanity check (will re-check after dollar-risk cap below)
+  if (qty * price > portfolio) { log('scalp', `Scalp ${sym}: insufficient cash`); return; }
 
   // Tight stops — scalping lives and dies by discipline
-  // Stop = 1× ATR, TP = 2× ATR → guaranteed 2:1 R:R minimum
+  // Stop = 1.2× ATR (was 1×: too tight, triggered on noise), TP = 2.4× ATR → 2:1 R:R
   const atrVal   = sigInfo.atr || price * 0.002;
-  const slDist   = Math.max(atrVal * 1.0, price * 0.001); // 1× ATR, min 0.1%
-  const tpDist   = Math.max(atrVal * 2.0, price * 0.002); // 2× ATR, min 0.2% → always 2:1
+  const slDist   = Math.max(atrVal * 1.2, price * 0.0015); // 1.2× ATR, min 0.15%
+  const tpDist   = Math.max(atrVal * 2.4, price * 0.003);  // 2.4× ATR, min 0.3%
+
+  // ── DOLLAR RISK CAP ──
+  // Max $ loss per scalp = 0.5% of starting capital.
+  // If qty × slDist > cap, shrink qty. This is what was missing from the
+  // prior version — a TSLA scalp at $300 × 30 shares × 1.2% stop = $108 loss
+  // target, but slippage/gaps made actual losses $1,086. Now qty adapts.
+  const maxDollarLoss = startCap * 0.005;
+  const impliedLoss   = qty * slDist;
+  if (impliedLoss > maxDollarLoss) {
+    const safeQty = Math.floor(maxDollarLoss / slDist);
+    if (safeQty < 1) { log('scalp', `⛔ ${sym}: scalp too risky even @1 share (slDist=$${slDist.toFixed(2)})`); return; }
+    log('scalp', `${sym}: scalp qty ${qty}→${safeQty} (implied loss $${impliedLoss.toFixed(0)} > max $${maxDollarLoss.toFixed(0)})`);
+    qty = safeQty;
+  }
+
+  const cost = qty * price;
 
   const stopPrice = direction === 'long'  ? price - slDist : price + slDist;
   const tpPrice   = direction === 'long'  ? price + tpDist : price - tpDist;
@@ -6179,7 +6244,7 @@ async function exitScalp(sym, price, reason) {
     : (entryPrice - price) * qty;
 
   if (isSimMode()) portfolio += direction === 'long' ? qty * price : pnl;
-  pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++);
+  pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++); recordSymbolOutcome(sym, pnl);
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: 50, session: getCurrentSession(), side: pos?.direction||'long', sym, exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*pos.qty) : 0 });
 
   const holdSecs = Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 1000);
