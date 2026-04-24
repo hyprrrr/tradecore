@@ -132,6 +132,7 @@
     gap: 1px;
     background: var(--border);
     overflow: hidden;
+    position: relative;
   }
 
   .panel {
@@ -440,6 +441,97 @@
   @keyframes flashRed { 0%{background:rgba(255,71,87,0.25)} 100%{background:transparent} }
   .flash-up { animation: flashGreen .6s ease-out; }
   .flash-down { animation: flashRed .6s ease-out; }
+
+  /* ═══════════════════════════════════════ TAB OVERLAYS ═══════════════════════════════════════ */
+  .tab-overlay {
+    display: none;
+    position: fixed; top: 52px; left: 0; right: 0; bottom: 0;
+    background: var(--bg-0); z-index: 80; overflow-y: auto;
+    padding: 24px;
+  }
+  .tab-overlay.active { display: block; }
+
+  /* Settings */
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; max-width: 1100px; }
+  .settings-section {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px;
+  }
+  .settings-section-title {
+    font-size: 10px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--text-muted); margin-bottom: 14px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .settings-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 0; border-bottom: 1px solid rgba(42,42,50,0.4);
+  }
+  .settings-row:last-child { border-bottom: none; }
+  .settings-label { font-size: 12px; color: var(--text-muted); }
+  .settings-val { font-family: var(--font-mono); font-size: 12px; color: var(--text); font-weight: 600; }
+  .settings-input {
+    background: var(--bg-2); border: 1px solid var(--border-light); border-radius: var(--radius-sm);
+    padding: 5px 9px; color: var(--text); font-family: var(--font-mono); font-size: 12px;
+    width: 110px; text-align: right; outline: none;
+  }
+  .settings-input:focus { border-color: var(--accent); }
+  .settings-select {
+    background: var(--bg-2); border: 1px solid var(--border-light); border-radius: var(--radius-sm);
+    padding: 5px 9px; color: var(--text); font-family: var(--font); font-size: 12px;
+    width: 100%; outline: none; cursor: pointer; margin-top: 6px;
+  }
+  .settings-save-bar {
+    margin-top: 16px; display: flex; gap: 10px; align-items: center;
+  }
+
+  /* Analytics */
+  .analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .analytics-card {
+    background: var(--bg-1); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .analytics-card-label { font-size: 9.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
+  .analytics-card-value { font-family: var(--font-mono); font-size: 22px; font-weight: 700; }
+  .analytics-card-sub { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+
+  .analytics-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+  .analytics-section {
+    background: var(--bg-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px;
+  }
+  .analytics-section-title {
+    font-size: 10px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--text-muted); margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border);
+  }
+  .analytics-bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 11.5px; }
+  .analytics-bar-label { width: 80px; color: var(--text-muted); flex-shrink: 0; }
+  .analytics-bar-track { flex: 1; height: 6px; background: var(--bg-3); border-radius: 3px; overflow: hidden; }
+  .analytics-bar-fill { height: 100%; border-radius: 3px; transition: width .5s; }
+  .analytics-bar-val { width: 60px; text-align: right; font-family: var(--font-mono); font-weight: 600; color: var(--text); }
+  .analytics-sym-row {
+    display: grid; grid-template-columns: 80px 1fr auto auto;
+    align-items: center; gap: 10px; padding: 6px 0;
+    border-bottom: 1px solid rgba(42,42,50,0.4); font-size: 11.5px;
+  }
+  .analytics-sym-row:last-child { border-bottom: none; }
+
+  /* Logs full panel */
+  .logs-full { font-family: var(--font-mono); font-size: 11px; line-height: 1.7; }
+  .logs-toolbar { display: flex; gap: 8px; margin-bottom: 14px; align-items: center; }
+  .logs-filter-btn {
+    padding: 4px 12px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600;
+    background: var(--bg-2); border: 1px solid var(--border); color: var(--text-muted);
+    cursor: pointer; transition: all .2s;
+  }
+  .logs-filter-btn.active { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+  .log-table { width: 100%; border-collapse: collapse; }
+  .log-table th { text-align: left; padding: 6px 10px; font-size: 10px; color: var(--text-dim); font-weight: 600; text-transform: uppercase; letter-spacing: .4px; background: var(--bg-2); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 2; }
+  .log-table td { padding: 5px 10px; border-bottom: 1px solid rgba(42,42,50,0.3); vertical-align: top; }
+  .log-table tr:hover td { background: var(--bg-2); }
+  .log-msg { color: var(--text-muted); word-break: break-word; max-width: 600px; }
+  .log-msg .pos { color: var(--buy); font-weight: 700; }
+  .log-msg .neg { color: var(--sell); font-weight: 700; }
+  .log-msg .sym { color: var(--accent); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -748,7 +840,214 @@
     <span style="color:var(--border-light)">|</span>
     <span class="conn-time" id="connPing">--ms</span>
   </div>
-</div>
+
+  <!-- ═══════════════════════════════════════ ANALYTICS OVERLAY ═══════════════════════════════════════ -->
+  <div class="tab-overlay" id="overlay-analytics">
+    <div style="max-width:1200px;">
+      <div style="font-size:18px;font-weight:700;color:var(--text);margin-bottom:4px;">Analytics</div>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:20px;">All-time performance metrics from your live + sim sessions</div>
+
+      <div class="analytics-grid" id="analyticsCards">
+        <div class="analytics-card"><div class="analytics-card-label">Total P&L</div><div class="analytics-card-value" id="aTotalPnL" style="color:var(--buy)">--</div><div class="analytics-card-sub" id="aTotalPct">-- all-time</div></div>
+        <div class="analytics-card"><div class="analytics-card-label">Win Rate</div><div class="analytics-card-value" id="aWinRate" style="color:var(--buy)">--</div><div class="analytics-card-sub" id="aWinLoss">-- W / -- L</div></div>
+        <div class="analytics-card"><div class="analytics-card-label">Profit Factor</div><div class="analytics-card-value" id="aProfitFactor" style="color:var(--accent)">--</div><div class="analytics-card-sub">Gross win / gross loss</div></div>
+        <div class="analytics-card"><div class="analytics-card-label">Avg Win / Avg Loss</div><div class="analytics-card-value" id="aAvgWin" style="color:var(--text);font-size:16px;">-- / --</div><div class="analytics-card-sub" id="aRR">Risk:Reward --</div></div>
+        <div class="analytics-card"><div class="analytics-card-label">Day P&L</div><div class="analytics-card-value" id="aDayPnL" style="color:var(--text)">--</div><div class="analytics-card-sub" id="aDayPct">today</div></div>
+        <div class="analytics-card"><div class="analytics-card-label">Total Trades</div><div class="analytics-card-value" id="aTotalTrades" style="color:var(--text)">--</div><div class="analytics-card-sub" id="aScalpTrades">-- scalp / -- swing</div></div>
+        <div class="analytics-card"><div class="analytics-card-label">Largest Win</div><div class="analytics-card-value" id="aLargestWin" style="color:var(--buy)">--</div><div class="analytics-card-sub" id="aLargestWinSym">--</div></div>
+        <div class="analytics-card"><div class="analytics-card-label">Largest Loss</div><div class="analytics-card-value" id="aLargestLoss" style="color:var(--sell)">--</div><div class="analytics-card-sub" id="aLargestLossSym">--</div></div>
+      </div>
+
+      <div class="analytics-row">
+        <div class="analytics-section">
+          <div class="analytics-section-title">P&L by Symbol (top 10)</div>
+          <div id="analyticsSymbols"><div style="color:var(--text-dim);font-size:12px;">Load data to see breakdown</div></div>
+        </div>
+        <div class="analytics-section">
+          <div class="analytics-section-title">P&L by Reason / Exit Type</div>
+          <div id="analyticsReasons"><div style="color:var(--text-dim);font-size:12px;">Load data to see breakdown</div></div>
+        </div>
+      </div>
+
+      <div class="analytics-row">
+        <div class="analytics-section">
+          <div class="analytics-section-title">Session Performance</div>
+          <div id="analyticsSessions"><div style="color:var(--text-dim);font-size:12px;">Load data to see breakdown</div></div>
+        </div>
+        <div class="analytics-section">
+          <div class="analytics-section-title">All Closed Trades (recent 200)</div>
+          <div style="overflow-y:auto;max-height:260px;">
+            <table class="log-table" id="analyticsTradesTable">
+              <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th class="cell-right">Price</th><th class="cell-right">Qty</th><th class="cell-right">P&L</th><th>Reason</th></tr></thead>
+              <tbody id="analyticsTradesBody"><tr><td colspan="7" style="color:var(--text-dim);padding:16px;text-align:center;">No data</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:10px;margin-top:4px;">
+        <button class="btn btn-accent btn-sm" onclick="refreshAnalytics()">↻ Refresh</button>
+        <button class="btn btn-outline btn-sm" onclick="exportAnalyticsCSV()">⤓ Export CSV</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════ SETTINGS OVERLAY ═══════════════════════════════════════ -->
+  <div class="tab-overlay" id="overlay-settings">
+    <div style="max-width:1100px;">
+      <div style="font-size:18px;font-weight:700;color:var(--text);margin-bottom:4px;">Settings</div>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:20px;">Configure your bot strategy, risk parameters, and symbols. Changes save directly to Supabase.</div>
+
+      <div class="settings-grid">
+        <!-- Strategy -->
+        <div class="settings-section">
+          <div class="settings-section-title">⚡ Strategy</div>
+          <div class="settings-row">
+            <span class="settings-label">Strategy</span>
+            <select class="settings-select" id="setStrategy" style="width:auto;">
+              <option value="rsi_macd">RSI + MACD</option>
+              <option value="smc">SMC</option>
+              <option value="ict">ICT</option>
+              <option value="vwap_reversion">VWAP Reversion</option>
+              <option value="order_flow">Order Flow</option>
+              <option value="wyckoff">Wyckoff</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Swing / PT</span>
+            <label class="toggle"><input type="checkbox" id="setSwing" onchange="saveSetting('swing_enabled',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Scalp Mode</span>
+            <label class="toggle"><input type="checkbox" id="setScalp" onchange="saveSetting('scalp_mode',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Shorts Enabled</span>
+            <label class="toggle"><input type="checkbox" id="setShorts" onchange="saveSetting('shorts_enabled',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Recovery Mode</span>
+            <label class="toggle"><input type="checkbox" id="setRecovery" onchange="saveSetting('recovery_mode',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Sim Mode</span>
+            <label class="toggle"><input type="checkbox" id="setSim" onchange="saveSetting('sim_mode',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+
+        <!-- Risk -->
+        <div class="settings-section">
+          <div class="settings-section-title">🛡 Risk & Sizing</div>
+          <div class="settings-row">
+            <span class="settings-label">Starting Capital</span>
+            <input class="settings-input" type="number" id="setStartCap" placeholder="100000">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Max Positions</span>
+            <input class="settings-input" type="number" id="setMaxPos" placeholder="3">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Position Size %</span>
+            <input class="settings-input" type="number" id="setPosPct" placeholder="15">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Hard Max Loss %</span>
+            <input class="settings-input" type="number" id="setMaxLoss" placeholder="3">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">ATR Stop Mult</span>
+            <input class="settings-input" type="number" id="setAtrMult" step="0.1" placeholder="2.0">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Min Confidence %</span>
+            <input class="settings-input" type="number" id="setMinConf" placeholder="55">
+          </div>
+        </div>
+
+        <!-- Signals -->
+        <div class="settings-section">
+          <div class="settings-section-title">📡 Signals & Targets</div>
+          <div class="settings-row">
+            <span class="settings-label">RSI Oversold</span>
+            <input class="settings-input" type="number" id="setRsiOs" placeholder="35">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">RSI Overbought</span>
+            <input class="settings-input" type="number" id="setRsiOb" placeholder="65">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Confirm Count</span>
+            <input class="settings-input" type="number" id="setConfirm" placeholder="1">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">TP1 %</span>
+            <input class="settings-input" type="number" id="setTp1" step="0.1" placeholder="1.5">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">TP2 %</span>
+            <input class="settings-input" type="number" id="setTp2" step="0.1" placeholder="3.0">
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">TP3 %</span>
+            <input class="settings-input" type="number" id="setTp3" step="0.1" placeholder="5.0">
+          </div>
+        </div>
+
+        <!-- Symbols -->
+        <div class="settings-section" style="grid-column: 1 / -1;">
+          <div class="settings-section-title">🎯 Watch Symbols</div>
+          <div id="setSymbolTags" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;"></div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input class="settings-input" type="text" id="setSymbolInput" placeholder="AAPL" style="width:90px;text-align:left;text-transform:uppercase;">
+            <button class="btn btn-outline btn-sm" onclick="addSymbol()">+ Add</button>
+            <span style="color:var(--text-dim);font-size:11px;margin-left:8px;">Current: <span id="setSymbolList" style="color:var(--text-muted);font-family:var(--font-mono);font-size:10px;"></span></span>
+          </div>
+        </div>
+
+        <!-- Connection -->
+        <div class="settings-section" style="grid-column: 1 / -1;">
+          <div class="settings-section-title">🔌 Connection</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end;">
+            <div class="config-field"><label>Bot Base URL (Railway)</label><input type="text" id="setBotUrl" class="settings-input" style="width:100%;text-align:left;" placeholder="https://tradecore.up.railway.app"></div>
+            <div class="config-field"><label>Supabase URL</label><input type="text" id="setSbUrl" class="settings-input" style="width:100%;text-align:left;" placeholder="https://xxxx.supabase.co"></div>
+            <div class="config-field"><label>Supabase Anon Key</label><input type="password" id="setSbKey" class="settings-input" style="width:100%;text-align:left;" placeholder="eyJ..."></div>
+            <button class="btn btn-accent" onclick="saveConnectionSettings()">Connect</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-save-bar">
+        <button class="btn btn-accent" onclick="saveAllSettings()">💾 Save All Settings</button>
+        <button class="btn btn-outline" onclick="fetchSettings()">↻ Reload from DB</button>
+        <span id="settingsSaveStatus" style="font-size:11px;color:var(--text-dim);margin-left:8px;"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════ LOGS OVERLAY ═══════════════════════════════════════ -->
+  <div class="tab-overlay" id="overlay-logs">
+    <div style="max-width:1200px;">
+      <div style="font-size:18px;font-weight:700;color:var(--text);margin-bottom:4px;">Bot Logs</div>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:16px;">Live log stream from your bot. Refreshes every 5s when connected.</div>
+      <div class="logs-toolbar">
+        <span style="font-size:11px;color:var(--text-dim);">Filter:</span>
+        <button class="logs-filter-btn active" data-lf="all">All</button>
+        <button class="logs-filter-btn" data-lf="buy">BUY</button>
+        <button class="logs-filter-btn" data-lf="sell">SELL</button>
+        <button class="logs-filter-btn" data-lf="warn">WARN</button>
+        <button class="logs-filter-btn" data-lf="error">ERROR</button>
+        <button class="logs-filter-btn" data-lf="sim">SIM</button>
+        <button class="logs-filter-btn" data-lf="ai">AI</button>
+        <button class="btn btn-outline btn-sm" style="margin-left:auto;" onclick="fetchLogs()">↻ Refresh</button>
+      </div>
+      <div style="overflow-y:auto;max-height:calc(100vh - 200px);">
+        <table class="log-table" id="logsFullTable">
+          <thead><tr><th style="width:90px;">Time</th><th style="width:70px;">Type</th><th>Message</th></tr></thead>
+          <tbody id="logsFullBody"><tr><td colspan="3" style="color:var(--text-dim);padding:20px;text-align:center;">No logs loaded. Connect first.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 
 <script>
 /* ═══════════════════════════════════════════════════════════════
@@ -1427,17 +1726,30 @@ function updateClock() {
 }
 
 // ═══════════════════════════════════════ TABS ═══════════════════════════════════════
+function switchTab(name) {
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.nav-tab[data-tab="${name}"]`)?.classList.add('active');
+
+  // Hide all overlays
+  document.querySelectorAll('.tab-overlay').forEach(o => o.classList.remove('active'));
+
+  // Hide/show main grid
+  const mainGrid = $('mainGrid');
+  if (name === 'trade') {
+    mainGrid.style.display = '';
+    $('configPanel').classList.remove('open');
+  } else {
+    mainGrid.style.display = 'none';
+    const overlay = $('overlay-' + name);
+    if (overlay) overlay.classList.add('active');
+    if (name === 'analytics') refreshAnalytics();
+    if (name === 'logs') fetchLogs();
+    if (name === 'settings') populateSettingsForm();
+  }
+}
+
 document.querySelectorAll('.nav-tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    const target = tab.dataset.tab;
-    if (target === 'settings') {
-      toggleConfig();
-    } else if (target === 'logs') {
-      fetchLogs();
-    }
-  });
+  tab.addEventListener('click', () => switchTab(tab.dataset.tab));
 });
 
 document.querySelectorAll('.watch-tab').forEach(tab => {
@@ -1459,6 +1771,348 @@ document.querySelectorAll('.tf-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+  });
+});
+
+// ═══════════════════════════════════════ ANALYTICS ═══════════════════════════════════════
+async function refreshAnalytics() {
+  // Fetch all trades (not just 24h)
+  const tbl = state.mode === 'sim' ? 'sim_tc_trades' : 'tc_trades';
+  const data = await sbFetch(`${tbl}?select=*&order=created_at.desc&limit=500`, 'GET');
+  if (!data || !Array.isArray(data)) return;
+  const trades = data;
+
+  const startCap = state.settings.starting_capital || 100000;
+  const eq = state.portfolio?.total_value || startCap;
+
+  // Core metrics
+  const closed = trades.filter(t => t.pnl != null);
+  const wins   = closed.filter(t => (t.pnl||0) > 0);
+  const losses = closed.filter(t => (t.pnl||0) < 0);
+  const totalPnL = closed.reduce((s,t) => s + (t.pnl||0), 0);
+  const grossWin  = wins.reduce((s,t) => s + (t.pnl||0), 0);
+  const grossLoss = Math.abs(losses.reduce((s,t) => s + (t.pnl||0), 0));
+  const wr = closed.length > 0 ? (wins.length / closed.length * 100) : 0;
+  const pf = grossLoss > 0 ? (grossWin / grossLoss) : (grossWin > 0 ? 99 : 0);
+  const avgWin  = wins.length   ? grossWin / wins.length   : 0;
+  const avgLoss = losses.length ? grossLoss / losses.length : 0;
+  const rr = avgLoss > 0 ? avgWin / avgLoss : 0;
+
+  const largestWin  = wins.length   ? wins.reduce((a,b)   => (b.pnl||0) > (a.pnl||0) ? b : a) : null;
+  const largestLoss = losses.length ? losses.reduce((a,b) => (b.pnl||0) < (a.pnl||0) ? b : a) : null;
+
+  const scalps = closed.filter(t => (t.side||'').includes('SCALP') || (t.side||'').includes('scalp'));
+  const swings = closed.filter(t => !((t.side||'').includes('SCALP')));
+
+  const dayPnl = state.portfolio?.day_pnl || 0;
+
+  // Update cards
+  $('aTotalPnL').textContent = (totalPnL >= 0 ? '+$' : '-$') + Math.abs(totalPnL).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  $('aTotalPnL').style.color = totalPnL >= 0 ? 'var(--buy)' : 'var(--sell)';
+  $('aTotalPct').textContent = (totalPnL >= 0 ? '+' : '') + (startCap > 0 ? (totalPnL/startCap*100).toFixed(2) : '0.00') + '% all-time';
+  $('aWinRate').textContent = wr.toFixed(1) + '%';
+  $('aWinRate').style.color = wr >= 50 ? 'var(--buy)' : 'var(--sell)';
+  $('aWinLoss').textContent = wins.length + 'W / ' + losses.length + 'L';
+  $('aProfitFactor').textContent = pf.toFixed(2);
+  $('aProfitFactor').style.color = pf >= 1 ? 'var(--accent)' : 'var(--sell)';
+  $('aAvgWin').textContent = '$' + avgWin.toFixed(2) + ' / $' + avgLoss.toFixed(2);
+  $('aRR').textContent = 'Risk:Reward ' + rr.toFixed(2) + ':1';
+  $('aDayPnL').textContent = (dayPnl >= 0 ? '+$' : '-$') + Math.abs(dayPnl).toFixed(2);
+  $('aDayPnL').style.color = dayPnl >= 0 ? 'var(--buy)' : 'var(--sell)';
+  $('aDayPct').textContent = (dayPnl >= 0 ? '+' : '') + (startCap > 0 ? (dayPnl/startCap*100).toFixed(2) : '0.00') + '% today';
+  $('aTotalTrades').textContent = closed.length;
+  $('aScalpTrades').textContent = scalps.length + ' scalp / ' + swings.length + ' swing';
+  $('aLargestWin').textContent  = largestWin  ? '+$' + largestWin.pnl.toFixed(2)   : '--';
+  $('aLargestWinSym').textContent  = largestWin  ? (largestWin.symbol  || '--') : '--';
+  $('aLargestLoss').textContent = largestLoss ? '-$' + Math.abs(largestLoss.pnl).toFixed(2) : '--';
+  $('aLargestLossSym').textContent = largestLoss ? (largestLoss.symbol || '--') : '--';
+
+  // By symbol
+  const bySymbol = {};
+  closed.forEach(t => {
+    const s = t.symbol || '?';
+    if (!bySymbol[s]) bySymbol[s] = {pnl:0, wins:0, losses:0};
+    bySymbol[s].pnl += (t.pnl||0);
+    if ((t.pnl||0) > 0) bySymbol[s].wins++; else bySymbol[s].losses++;
+  });
+  const sortedSyms = Object.entries(bySymbol).sort((a,b) => Math.abs(b[1].pnl) - Math.abs(a[1].pnl)).slice(0,10);
+  const maxSymPnL = Math.max(...sortedSyms.map(([,v]) => Math.abs(v.pnl)), 1);
+  $('analyticsSymbols').innerHTML = sortedSyms.map(([sym, v]) => {
+    const up = v.pnl >= 0;
+    const pct = (Math.abs(v.pnl) / maxSymPnL * 100).toFixed(0);
+    return `<div class="analytics-sym-row">
+      <span style="font-family:var(--font-mono);font-weight:700;color:var(--text)">${sym}</span>
+      <div class="analytics-bar-track"><div class="analytics-bar-fill" style="width:${pct}%;background:${up?'var(--buy)':'var(--sell)'}"></div></div>
+      <span style="color:${up?'var(--buy)':'var(--sell)'};font-family:var(--font-mono);font-weight:700;font-size:11.5px;">${up?'+':''}$${Math.abs(v.pnl).toFixed(2)}</span>
+      <span style="color:var(--text-dim);font-size:10px;">${v.wins}W/${v.losses}L</span>
+    </div>`;
+  }).join('') || '<div style="color:var(--text-dim)">No data</div>';
+
+  // By reason
+  const byReason = {};
+  closed.forEach(t => {
+    const r = t.reason || 'UNKNOWN';
+    if (!byReason[r]) byReason[r] = {pnl:0, count:0};
+    byReason[r].pnl += (t.pnl||0);
+    byReason[r].count++;
+  });
+  const sortedReasons = Object.entries(byReason).sort((a,b) => b[1].count - a[1].count).slice(0,8);
+  const maxRCount = Math.max(...sortedReasons.map(([,v]) => v.count), 1);
+  $('analyticsReasons').innerHTML = sortedReasons.map(([reason, v]) => {
+    const up = v.pnl >= 0;
+    const pct = (v.count / maxRCount * 100).toFixed(0);
+    return `<div class="analytics-bar-row">
+      <span class="analytics-bar-label" title="${reason}">${reason.slice(0,10)}</span>
+      <div class="analytics-bar-track"><div class="analytics-bar-fill" style="width:${pct}%;background:${up?'var(--buy)':'var(--sell)'}"></div></div>
+      <span class="analytics-bar-val" style="color:${up?'var(--buy)':'var(--sell)'}">${up?'+':''}$${Math.abs(v.pnl).toFixed(0)}</span>
+      <span style="color:var(--text-dim);font-size:10px;width:28px;text-align:right;">${v.count}×</span>
+    </div>`;
+  }).join('') || '<div style="color:var(--text-dim)">No data</div>';
+
+  // By session (using hour of day as proxy)
+  const sessions = {'Pre-Mkt (4-9:30)':[], 'US Open (9:30-12)':[], 'Midday (12-2)':[], 'Close (2-4)':[], 'After (4-8)':[]};
+  closed.forEach(t => {
+    if (!t.created_at) return;
+    const h = new Date(t.created_at).getHours();
+    if (h < 9 || (h === 9 && new Date(t.created_at).getMinutes() < 30)) sessions['Pre-Mkt (4-9:30)'].push(t);
+    else if (h < 12) sessions['US Open (9:30-12)'].push(t);
+    else if (h < 14) sessions['Midday (12-2)'].push(t);
+    else if (h < 16) sessions['Close (2-4)'].push(t);
+    else sessions['After (4-8)'].push(t);
+  });
+  $('analyticsSessions').innerHTML = Object.entries(sessions).map(([name, ts]) => {
+    if (!ts.length) return `<div class="analytics-bar-row"><span class="analytics-bar-label" style="width:130px">${name}</span><span style="color:var(--text-dim);font-size:11px;">No trades</span></div>`;
+    const sp = ts.reduce((s,t) => s+(t.pnl||0), 0);
+    const sw = ts.filter(t=>(t.pnl||0)>0).length;
+    const swr = (sw/ts.length*100).toFixed(0);
+    const up = sp >= 0;
+    return `<div class="analytics-bar-row">
+      <span class="analytics-bar-label" style="width:130px;font-size:10.5px;">${name}</span>
+      <div class="analytics-bar-track"><div class="analytics-bar-fill" style="width:${swr}%;background:${up?'var(--buy)':'var(--sell)'}"></div></div>
+      <span class="analytics-bar-val" style="color:${up?'var(--buy)':'var(--sell)'}">${up?'+':''}$${Math.abs(sp).toFixed(0)}</span>
+      <span style="color:var(--text-dim);font-size:10px;width:50px;text-align:right;">${swr}% WR</span>
+    </div>`;
+  }).join('');
+
+  // Trades table
+  $('analyticsTradesBody').innerHTML = closed.slice(0, 200).map(t => {
+    const up = (t.pnl||0) >= 0;
+    const side = t.side || 'BUY';
+    const tagCls = side.includes('SELL')||side.includes('SHORT')||side.includes('COVER') ? 'tag-sell' : 'tag-buy';
+    const time = t.created_at ? new Date(t.created_at).toLocaleString('en-US',{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '--';
+    return `<tr>
+      <td style="color:var(--text-dim);font-size:10px;">${time}</td>
+      <td><b>${t.symbol||'?'}</b></td>
+      <td><span class="tag ${tagCls}">${side}</span></td>
+      <td class="cell-right">${t.price ? '$'+fmt(t.price) : '--'}</td>
+      <td class="cell-right">${t.qty||'--'}</td>
+      <td class="cell-right ${up?'pnl-pos':'pnl-neg'}">${up?'+':'-'}$${Math.abs(t.pnl||0).toFixed(2)}</td>
+      <td style="font-size:10px;color:var(--text-dim);">${t.reason||'--'}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" style="text-align:center;color:var(--text-dim);padding:16px;">No trades</td></tr>';
+}
+
+function exportAnalyticsCSV() {
+  const tbl = state.mode === 'sim' ? 'sim_tc_trades' : 'tc_trades';
+  sbFetch(`${tbl}?select=*&order=created_at.desc&limit=1000`, 'GET').then(data => {
+    if (!data) return;
+    const rows = [['created_at','symbol','side','price','qty','pnl','reason']];
+    data.forEach(t => rows.push([t.created_at,t.symbol,t.side,t.price,t.qty,t.pnl,t.reason]));
+    const csv = rows.map(r => r.join(',')).join('\n');
+    const a = document.createElement('a');
+    a.href = 'data:text/csv,' + encodeURIComponent(csv);
+    a.download = 'trades_export.csv'; a.click();
+  });
+}
+
+// ═══════════════════════════════════════ SETTINGS FORM ═══════════════════════════════════════
+let _symbols = [];
+
+function populateSettingsForm() {
+  const s = state.settings;
+  if (!s || !Object.keys(s).length) { fetchSettings(); return; }
+
+  // Toggles
+  const set = (id, val) => { const e=$(id); if(e) e.checked = !!val; };
+  set('setSwing',    s.swing_enabled);
+  set('setScalp',    s.scalp_mode);
+  set('setShorts',   s.shorts_enabled);
+  set('setRecovery', s.recovery_mode);
+  set('setSim',      s.sim_mode);
+
+  // Strategy dropdown
+  const strat = $('setStrategy');
+  if (strat && s.strategy) strat.value = s.strategy;
+
+  // Numbers
+  const setN = (id, val) => { const e=$(id); if(e&&val!=null) e.value = val; };
+  setN('setStartCap', s.starting_capital);
+  setN('setMaxPos',   s.max_positions);
+  setN('setPosPct',   s.max_position_pct);
+  setN('setMaxLoss',  s.hard_max_loss);
+  setN('setAtrMult',  s.atr_stop_mult);
+  setN('setMinConf',  s.min_confidence);
+  setN('setRsiOs',    s.rsi_oversold);
+  setN('setRsiOb',    s.rsi_overbought);
+  setN('setConfirm',  s.confirm_count);
+  setN('setTp1',      s.tp1_pct);
+  setN('setTp2',      s.tp2_pct);
+  setN('setTp3',      s.tp3_pct);
+
+  // Symbols
+  if (s.symbols) {
+    _symbols = s.symbols.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean);
+    renderSymbolTags();
+  }
+
+  // Connection fields
+  if($('setBotUrl')) $('setBotUrl').value = CONFIG.botUrl;
+  if($('setSbUrl'))  $('setSbUrl').value  = CONFIG.sbUrl;
+  if($('setSbKey'))  $('setSbKey').value  = CONFIG.sbKey;
+}
+
+function renderSymbolTags() {
+  const wrap = $('setSymbolTags');
+  if (!wrap) return;
+  wrap.innerHTML = _symbols.map(sym => `
+    <span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;background:var(--bg-3);border:1px solid var(--border-light);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:10px;color:var(--text-muted);">
+      ${sym}
+      <span onclick="removeSymbol('${sym}')" style="cursor:pointer;color:var(--text-dim);font-size:13px;line-height:1;" onmouseenter="this.style.color='var(--sell)'" onmouseleave="this.style.color='var(--text-dim)'">×</span>
+    </span>`).join('');
+  const listEl = $('setSymbolList');
+  if (listEl) listEl.textContent = _symbols.join(', ');
+}
+
+function addSymbol() {
+  const inp = $('setSymbolInput');
+  const sym = (inp?.value||'').toUpperCase().trim();
+  if (sym && !_symbols.includes(sym)) {
+    _symbols.push(sym);
+    renderSymbolTags();
+    if (inp) inp.value = '';
+  }
+}
+
+function removeSymbol(sym) {
+  _symbols = _symbols.filter(s => s !== sym);
+  renderSymbolTags();
+}
+
+async function saveSetting(field, value) {
+  const body = { [field]: value, updated_at: new Date().toISOString() };
+  await sbFetch('tc_settings?id=eq.1', 'PATCH', body);
+  // sync right sidebar toggles too
+  if ($('scalpToggle')    && field === 'scalp_mode')     $('scalpToggle').checked    = value;
+  if ($('shortsToggle')   && field === 'shorts_enabled') $('shortsToggle').checked   = value;
+  if ($('swingToggle')    && field === 'swing_enabled')  $('swingToggle').checked    = value;
+  if ($('recoveryToggle') && field === 'recovery_mode')  $('recoveryToggle').checked = value;
+}
+
+async function saveAllSettings() {
+  const statusEl = $('settingsSaveStatus');
+  if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.style.color = 'var(--text-muted)'; }
+
+  const g = id => { const e=$(id); return e ? e.value : null; };
+  const gb = id => { const e=$(id); return e ? e.checked : null; };
+
+  const body = {
+    swing_enabled:     gb('setSwing'),
+    scalp_mode:        gb('setScalp'),
+    shorts_enabled:    gb('setShorts'),
+    recovery_mode:     gb('setRecovery'),
+    sim_mode:          gb('setSim'),
+    strategy:          g('setStrategy'),
+    starting_capital:  +g('setStartCap') || undefined,
+    max_positions:     +g('setMaxPos')   || undefined,
+    max_position_pct:  +g('setPosPct')   || undefined,
+    hard_max_loss:     +g('setMaxLoss')  || undefined,
+    atr_stop_mult:     +g('setAtrMult')  || undefined,
+    min_confidence:    +g('setMinConf')  || undefined,
+    rsi_oversold:      +g('setRsiOs')    || undefined,
+    rsi_overbought:    +g('setRsiOb')    || undefined,
+    confirm_count:     +g('setConfirm')  || undefined,
+    tp1_pct:           +g('setTp1')      || undefined,
+    tp2_pct:           +g('setTp2')      || undefined,
+    tp3_pct:           +g('setTp3')      || undefined,
+    symbols:           _symbols.join(','),
+    updated_at:        new Date().toISOString(),
+  };
+  // Remove undefined fields
+  Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
+
+  const res = await sbFetch('tc_settings?id=eq.1', 'PATCH', body);
+  if (res !== null) {
+    if (statusEl) { statusEl.textContent = '✓ Saved!'; statusEl.style.color = 'var(--buy)'; }
+    await fetchSettings();
+    // Keep sidebar toggles in sync
+    updateSettingsUI(state.settings);
+    setTimeout(() => { if(statusEl) statusEl.textContent = ''; }, 3000);
+  } else {
+    if (statusEl) { statusEl.textContent = '✗ Save failed — check connection'; statusEl.style.color = 'var(--sell)'; }
+  }
+}
+
+function saveConnectionSettings() {
+  CONFIG.botUrl = $('setBotUrl')?.value.trim() || CONFIG.botUrl;
+  CONFIG.sbUrl  = $('setSbUrl')?.value.trim()  || CONFIG.sbUrl;
+  CONFIG.sbKey  = $('setSbKey')?.value.trim()  || CONFIG.sbKey;
+  // Also update hidden config panel fields
+  if($('botUrl')) $('botUrl').value = CONFIG.botUrl;
+  if($('sbUrl'))  $('sbUrl').value  = CONFIG.sbUrl;
+  if($('sbKey'))  $('sbKey').value  = CONFIG.sbKey;
+  localStorage.setItem('botUrl', CONFIG.botUrl);
+  localStorage.setItem('sbUrl',  CONFIG.sbUrl);
+  localStorage.setItem('sbKey',  CONFIG.sbKey);
+  fetchAll();
+  const statusEl = $('settingsSaveStatus');
+  if (statusEl) { statusEl.textContent = '✓ Connecting…'; statusEl.style.color = 'var(--buy)'; }
+}
+
+// ═══════════════════════════════════════ LOGS FULL PANEL ═══════════════════════════════════════
+let _logsFilter = 'all';
+
+async function fetchLogs() {
+  const tbl = state.mode === 'sim' ? 'sim_tc_logs' : 'tc_logs';
+  const data = await sbFetch(`${tbl}?select=type,message,created_at&order=created_at.desc&limit=200`, 'GET');
+  if (data && Array.isArray(data)) {
+    state.logs = data;
+    renderLogs(data);          // mini panel in rightbar
+    renderLogsTable(data);     // full overlay table
+  }
+}
+
+function renderLogsTable(logs) {
+  const tbody = $('logsFullBody');
+  if (!tbody) return;
+
+  const filtered = _logsFilter === 'all' ? logs : logs.filter(l => (l.type||'').toLowerCase() === _logsFilter);
+
+  const colorMap = { buy:'var(--buy)', sell:'var(--sell)', warn:'var(--warn)', error:'var(--sell)', sim:'#9b59b6', ai:'#f1c40f', info:'var(--info)', order:'var(--accent)', adapt:'#f1c40f' };
+
+  tbody.innerHTML = filtered.map(l => {
+    const type = (l.type||'info').toLowerCase();
+    const color = colorMap[type] || 'var(--text-muted)';
+    const time = l.created_at ? new Date(l.created_at).toLocaleString('en-US',{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '--';
+    // Highlight $ amounts and symbols in message
+    const msg = escapeHtml(l.message||'')
+      .replace(/(\+\$[\d,.]+)/g, '<span class="pos">$1</span>')
+      .replace(/(-\$[\d,.]+)/g,  '<span class="neg">$1</span>')
+      .replace(/\b([A-Z]{2,5})\b(?=\s)/g, '<span class="sym">$1</span>');
+    return `<tr>
+      <td style="color:var(--text-dim);font-size:10px;white-space:nowrap;">${time}</td>
+      <td><span style="font-size:10px;font-weight:700;color:${color};font-family:var(--font-mono);">${type.toUpperCase()}</span></td>
+      <td class="log-msg">${msg}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="3" style="text-align:center;color:var(--text-dim);padding:20px;">No logs</td></tr>';
+}
+
+// Log filter buttons
+document.querySelectorAll('.logs-filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.logs-filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    _logsFilter = btn.dataset.lf;
+    renderLogsTable(state.logs);
   });
 });
 
