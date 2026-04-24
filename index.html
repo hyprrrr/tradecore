@@ -1176,36 +1176,42 @@ async function fetchTrades() {
 }
 
 async function fetchEquity() {
-  // The bot doesn't have a tc_equity table - we build the equity curve from
-  // tc_trades.pnl (cumulative) and tc_portfolio.total_value snapshots.
   const tbl = state.mode === 'sim' ? 'sim_tc_trades' : 'tc_trades';
-  const since = new Date(Date.now() - 30*24*60*60*1000).toISOString(); // 30 days
-  const data = await sbFetch(`${tbl}?select=pnl,created_at,symbol,side,price&created_at=gte.${since}&order=created_at.asc&limit=2000`, 'GET');
+  const since = new Date(Date.now() - 30*24*60*60*1000).toISOString();
+  const data = await sbFetch(
+    `${tbl}?select=pnl,created_at&created_at=gte.${since}&order=created_at.asc&limit=2000`,
+    'GET'
+  );
+
+  const startCap = state.settings.starting_capital || 100000;
 
   if (!data || !Array.isArray(data) || data.length === 0) {
-    // No trades yet — draw flat baseline from starting capital
-    const startCap = state.settings.starting_capital || 100000;
+    // No trades — draw flat baseline
     const now = Date.now();
-    const flatData = Array.from({length:10}, (_,i) => ({
+    const flat = Array.from({length: 24}, (_, i) => ({
       value: startCap,
-      created_at: new Date(now - (9-i)*3600*1000).toISOString()
+      created_at: new Date(now - (23 - i) * 3600 * 1000).toISOString(),
     }));
-    renderEquityChart(flatData);
-    renderSparkline(flatData);
+    renderEquityChart(flat);
+    renderSparkline(flat);
     return;
   }
 
-  // Build cumulative equity snapshots from trade PnL
-  const startCap = state.settings.starting_capital || 100000;
+  // Build cumulative equity snapshots
+  // Each snapshot represents the equity AFTER that trade settled
   let equity = startCap;
   const snapshots = [];
 
-  // Add starting point
-  const firstTime = new Date(new Date(data[0].created_at).getTime() - 3600000).toISOString();
-  snapshots.push({ value: startCap, created_at: firstTime });
+  // Add starting point 1 hour before first trade
+  const firstTs = new Date(data[0].created_at).getTime();
+  snapshots.push({ value: startCap, created_at: new Date(firstTs - 3600000).toISOString() });
 
   data.forEach(t => {
-    equity += (+(t.pnl) || 0);
+    const pnl = +(t.pnl) || 0;
+    // Snapshot at trade open (before pnl)
+    snapshots.push({ value: equity, created_at: t.created_at });
+    equity += pnl;
+    // Snapshot at trade close (after pnl) — same timestamp, tiny offset
     snapshots.push({ value: equity, created_at: t.created_at });
   });
 
@@ -1547,32 +1553,83 @@ function updateConnStatus() {
 function renderEquityChart(snapshots) {
   if (!snapshots || snapshots.length < 1) return;
 
-  // Need at least 2 points for a candle — if only 1, duplicate it
-  if (snapshots.length === 1) {
-    const s = snapshots[0];
-    snapshots = [s, { value: s.value, created_at: new Date(new Date(s.created_at).getTime() + 3600000).toISOString() }];
+  // Bucket snapshots by hour — each candle = 1 hour of equity movement
+  // This produces meaningful OHLC instead of tiny per-trade candles
+  const buckets = {};
+  snapshots.forEach(s => {
+    const d = new Date(s.created_at);
+    // Round down to nearest hour
+    d.setMinutes(0, 0, 0);
+    const key = d.getTime();
+    if (!buckets[key]) buckets[key] = { time: new Date(d), values: [] };
+    buckets[key].values.push(+s.value);
+  });
+
+  const keys = Object.keys(buckets).map(Number).sort((a,b) => a-b);
+
+  // Need at least 2 buckets — if only 1, use point-by-point fallback
+  if (keys.length < 2) {
+    // Fewer than 2 hours of data — show each snapshot as a point
+    const vals = snapshots.map(s => +s.value).filter(isFinite);
+    if (!vals.length) return;
+    // Build minimal candles one-per-point
+    const candles = snapshots.map(s => ({
+      time:   new Date(s.created_at),
+      open:   +s.value,
+      high:   +s.value,
+      low:    +s.value,
+      close:  +s.value,
+      volume: 1,
+    }));
+    if (candles.length === 1) candles.push({ ...candles[0], time: new Date(candles[0].time.getTime() + 3600000) });
+    lastEquityChart = candles;
+    drawCandlestickChart(candles);
+    return;
   }
 
-  // Group snapshots into candle periods (max 80 candles for readability)
-  const groupSize = Math.max(1, Math.floor(snapshots.length / 80));
-  const candles = [];
-  for (let i = 0; i < snapshots.length; i += groupSize) {
-    const group = snapshots.slice(i, i + groupSize);
-    const values = group.map(s => +s.value).filter(v => isFinite(v));
-    if (!values.length) continue;
-    candles.push({
-      time:   new Date(group[Math.floor(group.length/2)].created_at),
-      open:   values[0],
-      high:   Math.max(...values),
-      low:    Math.min(...values),
-      close:  values[values.length - 1],
-      volume: group.length,
+  // Build OHLC from hourly buckets
+  const candles = keys.map((key, i) => {
+    const b = buckets[key];
+    const v = b.values;
+    // Open = last close of previous bucket (continuity), or first value
+    const prevKey = keys[i - 1];
+    const prevVals = prevKey ? buckets[prevKey].values : null;
+    const open  = prevVals ? prevVals[prevVals.length - 1] : v[0];
+    const close = v[v.length - 1];
+    const high  = Math.max(open, close, ...v);
+    const low   = Math.min(open, close, ...v);
+    return { time: b.time, open, high, low, close, volume: v.length };
+  });
+
+  // Limit to 120 candles max — aggregate older ones into daily if too many
+  let finalCandles = candles;
+  if (candles.length > 120) {
+    // Aggregate into 4-hour bars
+    const grouped = {};
+    candles.forEach(c => {
+      const d = new Date(c.time);
+      d.setHours(Math.floor(d.getHours() / 4) * 4, 0, 0, 0);
+      const key = d.getTime();
+      if (!grouped[key]) grouped[key] = { time: new Date(d), candles: [] };
+      grouped[key].candles.push(c);
     });
+    finalCandles = Object.values(grouped)
+      .sort((a,b) => a.time - b.time)
+      .map(g => {
+        const cs = g.candles;
+        return {
+          time:   g.time,
+          open:   cs[0].open,
+          high:   Math.max(...cs.map(c => c.high)),
+          low:    Math.min(...cs.map(c => c.low)),
+          close:  cs[cs.length-1].close,
+          volume: cs.reduce((s,c) => s + c.volume, 0),
+        };
+      });
   }
 
-  if (!candles.length) return;
-  lastEquityChart = candles;
-  drawCandlestickChart(candles);
+  lastEquityChart = finalCandles;
+  drawCandlestickChart(finalCandles);
 }
 
 function drawCandlestickChart(candles) {
@@ -1684,11 +1741,18 @@ function drawCandlestickChart(candles) {
     rect.setAttribute('y', bodyTop);
     rect.setAttribute('width', candleW);
     rect.setAttribute('height', bodyH);
-    rect.setAttribute('fill', up ? color : color);
     if (up) {
+      // Bullish: hollow body with colored border
+      rect.setAttribute('fill', color);
+      rect.setAttribute('fill-opacity', '0.25');
       rect.setAttribute('stroke', color);
       rect.setAttribute('stroke-width', '1');
-      rect.setAttribute('fill-opacity', '0.25');
+    } else {
+      // Bearish: solid filled body
+      rect.setAttribute('fill', color);
+      rect.setAttribute('fill-opacity', '0.9');
+      rect.setAttribute('stroke', color);
+      rect.setAttribute('stroke-width', '1');
     }
     rect.setAttribute('rx', '1');
     svg.appendChild(rect);
