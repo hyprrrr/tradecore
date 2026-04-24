@@ -1375,16 +1375,20 @@ function startTieredPollers() {
 
   pollTimers.fast = setInterval(() => {
     if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
+    // Bundle everything visually-coupled to P&L into one tick so the
+    // equity chart updates at the same cadence as the portfolio number.
     fetchBotStatus();
     fetchPortfolio();
     fetchPositions();
+    fetchTrades();
+    fetchEquity();
     fetchLogs();
   }, fastMs);
 
+  // Medium tier reserved for future heavier queries; left running for parity.
   pollTimers.medium = setInterval(() => {
     if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
-    fetchTrades();
-    fetchEquity();
+    // (intentionally empty — equity/trades promoted to fast tier)
   }, mediumMs);
 
   pollTimers.slow = setInterval(() => {
@@ -1444,10 +1448,12 @@ function connectRealtime() {
     const tail = msg.topic.split(':').pop() || '';
     const tableSuffix = tail.replace(prefix, '');
     // Trigger targeted refetches — cheaper than refetching everything.
+    // Portfolio push also refreshes equity so the chart stays visually
+    // locked to the P&L number (they derive from different tables).
     switch (tableSuffix) {
-      case 'portfolio': fetchPortfolio(); break;
+      case 'portfolio': fetchPortfolio(); fetchEquity(); break;
       case 'positions': fetchPositions(); break;
-      case 'trades':    fetchTrades(); fetchEquity(); break;
+      case 'trades':    fetchTrades(); fetchEquity(); fetchPortfolio(); break;
       case 'logs':      fetchLogs(); break;
     }
   });
