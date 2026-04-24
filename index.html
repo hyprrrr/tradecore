@@ -1539,24 +1539,29 @@ async function resetCircuit() {
 }
 
 async function exitAll() {
-  if (!confirm('Exit ALL open positions? This sets the circuit breaker and the bot will close all positions on next scan.')) return;
+  if (!confirm('Exit ALL open positions? Bot will close everything and keep running.')) return;
 
-  // Set circuit_breaker = true in portfolio — bot reads this and exits all
-  const patch = { circuit_breaker: true, updated_at: new Date().toISOString() };
-  const tbl   = state.mode === 'sim' ? 'sim_tc_portfolio' : 'tc_portfolio';
-  const res   = await sbFetch(`${tbl}?id=eq.1`, 'PATCH', patch);
+  if (!CONFIG.botUrl) {
+    addLog('error', 'Exit All needs a Railway bot URL — set it in Config');
+    return;
+  }
 
-  if (res !== null) {
-    addLog('warn', '⚠️ EXIT ALL triggered — circuit breaker set. Bot will close all positions on next scan.');
-    $('statCircuit').textContent = 'TRIPPED';
-    $('statCircuit').style.color = 'var(--sell)';
-    // Also try Railway bot endpoint if configured
-    if (CONFIG.botUrl) {
-      try { await fetch(`${CONFIG.botUrl.replace(/\/$/,'')}/exit-all`); } catch(e) {}
+  try {
+    const r = await fetch(`${CONFIG.botUrl.replace(/\/$/,'')}/exit-all`);
+    const data = await r.json().catch(() => ({}));
+    if (data.ok) {
+      if (data.closed > 0) {
+        addLog('warn', `🖐 Exit All: closed ${data.closed}${data.failed?`, failed ${data.failed}`:''}, pnl ${data.totalPnl>=0?'+':''}$${(data.totalPnl||0).toFixed(2)}`);
+      } else {
+        addLog('info', 'Exit All: no open positions to close');
+      }
+      // Bot self-clears circuit_breaker — just refresh the UI
+      setTimeout(fetchAll, 1500);
+    } else {
+      addLog('error', `Exit All failed: ${data.message || 'unknown'}`);
     }
-    setTimeout(fetchAll, 1500);
-  } else {
-    addLog('error', 'Exit All failed — check connection');
+  } catch(e) {
+    addLog('error', `Exit All failed: ${e.message}`);
   }
 }
 
