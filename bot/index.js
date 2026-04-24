@@ -145,7 +145,7 @@ async function loadRemoteConfig() {
     const s = rows[0];
 
     // Apply remote settings over CONFIG — secrets never overwritten
-    if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 20); // hard cap 20
+    if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 200); // hard cap 200 (was 20)
     if (s.strategy)         CONFIG.strategy         = s.strategy;
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
     if (s.rsi_oversold)     CONFIG.rsiOversold      = +s.rsi_oversold;
@@ -2651,12 +2651,12 @@ async function syncScreenerResults(candidates) {
 
 // Build the final scan list: favorites + screener candidates, deduplicated
 function buildScanList() {
-  const favorites  = CONFIG.symbols.slice(0, 20); // max 20 watchlist symbols
-  // Only take TOP 5 screener picks (by score) — never bloat to 186 symbols
+  const favorites  = CONFIG.symbols.slice(0, 200); // was 20 — large watchlist support
+  // Only take TOP 5 screener picks (by score) — never bloat excessively
   const discovered = screenerCandidates.slice(0, 5);
   const combined   = [...new Set([...favorites, ...discovered])];
   const valid = combined.filter(s => /^[A-Z]{1,5}$/.test(s));
-  return valid.slice(0, 25); // absolute hard cap — 25 symbols max, always
+  return valid.slice(0, 200); // hard cap — 200 symbols max
 }
 
 // ═══════════════════════════════════════════════════════════════════
