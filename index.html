@@ -1321,35 +1321,32 @@ function procEq(raw, cap){
 }
 
 let chartMouseX = null;
+let _lastRender=0, _lastRenderVal=0;
 function startChart(){
   const cv=$('equityChart'); if(!cv||chartRAF) return;
-  chartCtx = cv.getContext('2d');
+  chartCtx=cv.getContext('2d');
   loadEquityHistory();
-  // Mouse tracking for hover tooltip
+
+  // Hover: redraw immediately for responsive crosshair
   cv.addEventListener('mousemove', e=>{
     const r=cv.getBoundingClientRect();
-    chartMouseX = (e.clientX-r.left)*(cv.width/r.width);
-  });
-  cv.addEventListener('mouseleave', ()=>{ chartMouseX=null; });
-  let _lastRender = 0;
-  let _lastRenderVal = 0;
-  (function loop(){
-    chartRAF = requestAnimationFrame(loop);
-    if (document.hidden) return;
-
-    const now = Date.now();
-    // Only render at 4fps max — data updates every 8s so 4fps is plenty
-    // The live dot pulse runs on a sine of Date.now() so it stays smooth
-    // without us needing to redraw constantly
-    if (now - _lastRender < 250) return; // 4fps cap
-    const valChanged = Math.abs(chartCurrent - _lastRenderVal) > 0.01;
-    const timePassed = (now - _lastRender) > 2000; // force redraw every 2s for dot pulse
-    if (!valChanged && !timePassed) return;
-
-    _lastRender    = now;
-    _lastRenderVal = chartCurrent;
+    chartMouseX=(e.clientX-r.left)*(cv.width/r.width);
     renderChart();
-  })();
+  });
+  cv.addEventListener('mouseleave', ()=>{ chartMouseX=null; renderChart(); });
+
+  // setInterval instead of requestAnimationFrame
+  // RAF runs on the main thread at 60fps and causes page jank
+  // setInterval is off the animation pipeline — no jank, no frame blocking
+  chartRAF=setInterval(()=>{
+    if(document.hidden) return;
+    const now=Date.now();
+    const changed=Math.abs(chartCurrent-_lastRenderVal)>0.01;
+    const stale=(now-_lastRender)>4000;
+    if(!changed&&!stale) return;
+    _lastRender=now; _lastRenderVal=chartCurrent;
+    renderChart();
+  }, 1000); // redraw at most once per second
 }
 
 // When tab becomes visible again, flush the stale stream
