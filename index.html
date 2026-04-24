@@ -1187,12 +1187,17 @@ async function fetchEquity() {
   );
 
   const startCap = state.settings.starting_capital || 100000;
+  // Live equity from portfolio (includes unrealized P&L from open positions).
+  // This is what the header shows — we pin the chart's last point to this so
+  // the candles track the header in real time instead of waiting for a close.
+  const livePortfolioValue = state.portfolio ? +state.portfolio.total_value : null;
 
   if (!data || !Array.isArray(data) || data.length === 0) {
-    // No trades — draw flat baseline
+    // No trades — draw flat baseline, but pin the tail to live equity if we have it.
     const now = Date.now();
+    const base = livePortfolioValue || startCap;
     const flat = Array.from({length: 24}, (_, i) => ({
-      value: startCap,
+      value: i === 23 ? base : startCap,
       created_at: new Date(now - (23 - i) * 3600 * 1000).toISOString(),
     }));
     renderEquityChart(flat);
@@ -1217,6 +1222,16 @@ async function fetchEquity() {
     // Snapshot at trade close (after pnl) — same timestamp, tiny offset
     snapshots.push({ value: equity, created_at: t.created_at });
   });
+
+  // ── LIVE TAIL ────────────────────────────────────────────────────
+  // Append a live snapshot using portfolio.total_value (which includes
+  // unrealized P&L on open positions). Without this, the chart only moves
+  // when a trade closes — so it visibly lags the header P&L number by
+  // minutes during active trading. With this, the last candle tracks
+  // portfolio value tick-by-tick.
+  if (livePortfolioValue != null && Number.isFinite(livePortfolioValue)) {
+    snapshots.push({ value: livePortfolioValue, created_at: new Date().toISOString() });
+  }
 
   state.equitySnapshots = snapshots;
   renderEquityChart(snapshots);
@@ -1373,16 +1388,17 @@ function startTieredPollers() {
   const fastMs   = realtimeHealthy ? POLL_INTERVALS.fast.healthy   : POLL_INTERVALS.fast.degraded;
   const mediumMs = realtimeHealthy ? POLL_INTERVALS.medium.healthy : POLL_INTERVALS.medium.degraded;
 
-  pollTimers.fast = setInterval(() => {
+  pollTimers.fast = setInterval(async () => {
     if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
-    // Bundle everything visually-coupled to P&L into one tick so the
-    // equity chart updates at the same cadence as the portfolio number.
+    // Fire most in parallel, but chain portfolio → equity so the chart's
+    // live tail reads the just-updated portfolio.total_value instead of the
+    // one from the previous tick (which caused visible lag).
     fetchBotStatus();
-    fetchPortfolio();
     fetchPositions();
     fetchTrades();
-    fetchEquity();
     fetchLogs();
+    await fetchPortfolio();
+    await fetchEquity();
   }, fastMs);
 
   // Medium tier reserved for future heavier queries; left running for parity.
@@ -1807,9 +1823,11 @@ function renderEquityChart(snapshots) {
   if (!snapshots || !snapshots.length) return;
 
   // Skip redundant rebuilds: if nothing material changed, bail early.
-  // Hash = count + last timestamp + last value (cheap & sufficient).
+  // Hash includes last value + length + tail timestamp. Because we append
+  // a live tail every poll, the hash changes whenever portfolio value does,
+  // which is exactly when we want the chart to repaint.
   const last = snapshots[snapshots.length - 1];
-  const hash = `${snapshots.length}|${last.created_at}|${last.value}`;
+  const hash = `${snapshots.length}|${last.created_at}|${(+last.value).toFixed(2)}`;
   if (hash === state._lastEquityHash && chart.allCandles.length) return;
   state._lastEquityHash = hash;
 
