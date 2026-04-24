@@ -1264,1030 +1264,307 @@ function setStatus(s){
 // ═══════════════════════════════════════
 // 60FPS EQUITY CHART
 // ═══════════════════════════════════════
-let chartCtx=null, chartRAF=null;
-let eqHist=[], stableEq=0, eqResetAt=0;
 
-// ═══════════════════════════════════════════════════════════
-// EQUITY CHART — continuous scrolling time-series
-//
-// How it works:
-//   - chartStream[] is a dense ring buffer of {t, v} points
-//     built 60× per second. The line is always moving forward.
-//   - chartTarget = latest real equity from the server.
-//     chartCurrent glides toward it with spring physics.
-//   - Between real updates, chartCurrent drifts with a tiny
-//     sine wave so the line never looks frozen.
-//   - On a new data point, chartLineGlow spikes → glow flash.
-//   - The chart window is the last WINDOW_SECS of stream data,
-//     mapped left→right so newer data is always on the right.
-// ═══════════════════════════════════════════════════════════
-const WINDOW_SECS  = 1800;  // 30 min default — tight enough to see movement clearly
-const STREAM_CAP   = 500;  // max points in ring buffer
+// ─────────────────────────────────────────────────────
+// EQUITY CHART — dead simple, zero lag
+// Draws only when data changes. No RAF. No spring. No drift.
+// ─────────────────────────────────────────────────────
+let chartCtx = null, chartRAF = null;
+let eqHist = [], stableEq = 0, eqResetAt = 0;
 
-let chartTarget   = 0;      // real equity from server
-let chartCurrent  = 0;      // displayed value, glides toward target
-let chartVelocity = 0;      // spring momentum
-let chartStream   = [];     // [{t, v}] — continuous display stream
-let breathPhase   = 0;
-let lastDataUpdate= 0;
-let chartLineGlow = 0;      // 0-1, spikes on update, decays each frame
+const STREAM_CAP  = 300;
+const WINDOW_SECS = 1800; // 30 min
 
-// Organic micro-drift — Perlin-like random walk, feels human not mechanical
-// Two independent noise oscillators at different primes so they never sync up
-let _n1=0, _n2=0,       // current noise values
-    _v1=0, _v2=0;       // noise velocities (random walk momentum)
+let chartTarget  = 0;
+let chartCurrent = 0;
+let chartStream  = [];
+let chartLineGlow = 0;
+let lastDataUpdate = 0;
+let chartVelocity = 0; // kept for compat refs, unused
+let breathPhase   = 0; // kept for compat refs, unused
+let _n1=0,_n2=0,_v1=0,_v2=0; // kept for compat refs, unused
 
+// ── Spike filter ────────────────────────────────────
 function procEq(raw, cap){
-  if(!raw || raw<=0 || raw>cap*3) return false;
-  const last = eqHist[eqHist.length-1];
+  if(!raw||raw<=0||raw>cap*3) return false;
+  const last=eqHist[eqHist.length-1];
   if(!last){ eqHist.push(raw); stableEq=raw; return true; }
-  const relaxed = (Date.now()-eqResetAt) < 20000;
-  const pctChange = Math.abs((raw-last)/last);
-  // Reject spikes > 1.5% from last value unless relaxed window
-  if(!relaxed && pctChange > 0.015){
-    // Check if this is confirming a gradual move or a sudden spike
-    const pctFromStable = Math.abs((raw-stableEq)/stableEq);
-    // >4% from stable = bad data (Alpaca timeout fallback, sim/live switch etc)
-    if(pctFromStable > 0.04) return false;
+  const relaxed=(Date.now()-eqResetAt)<20000;
+  const pct=Math.abs((raw-last)/last);
+  if(!relaxed&&pct>0.015){
+    if(Math.abs((raw-stableEq)/stableEq)>0.04) return false;
   }
-  // Also hard-reject: value == startingCapital when we have real history
-  // This is the $100k fallback spike pattern
-  if(eqHist.length > 10 && Math.abs(raw - cap) < 1.0 && Math.abs(stableEq - cap) > 100) {
-    return false; // rejecting $100k spike
-  }
-  if(Math.abs(raw-last) < 0.10) return true;
+  if(eqHist.length>10&&Math.abs(raw-cap)<1&&Math.abs(stableEq-cap)>100) return false;
+  if(Math.abs(raw-last)<0.10) return true;
   eqHist.push(raw); if(eqHist.length>400) eqHist.shift();
-  stableEq = raw; return true;
+  stableEq=raw; return true;
 }
 
-let chartMouseX = null;
-let _lastRender=0, _lastRenderVal=0;
-function startChart(){
-  const cv=$('equityChart'); if(!cv||chartRAF) return;
-  chartCtx=cv.getContext('2d');
-  loadEquityHistory();
-
-  // Hover: redraw immediately for responsive crosshair
-  cv.addEventListener('mousemove', e=>{
-    const r=cv.getBoundingClientRect();
-    chartMouseX=(e.clientX-r.left)*(cv.width/r.width);
-    renderChart();
-  });
-  cv.addEventListener('mouseleave', ()=>{ chartMouseX=null; renderChart(); });
-
-  // setInterval instead of requestAnimationFrame
-  // RAF runs on the main thread at 60fps and causes page jank
-  // setInterval is off the animation pipeline — no jank, no frame blocking
-  chartRAF=setInterval(()=>{
-    if(document.hidden) return;
-    const now=Date.now();
-    const changed=Math.abs(chartCurrent-_lastRenderVal)>0.01;
-    const stale=(now-_lastRender)>4000;
-    if(!changed&&!stale) return;
-    _lastRender=now; _lastRenderVal=chartCurrent;
-    renderChart();
-  }, 1000); // redraw at most once per second
-}
-
-// When tab becomes visible again, flush the stale stream
-// and reseed from current value so the chart starts fresh
-document.addEventListener('visibilitychange', () => {
-  if(!document.hidden){
-    const now = Date.now();
-    // DON'T wipe chartStream — keep full history
-    // Just remove the gap that built up while tab was hidden
-    // by bridging: add a flat line from last known point to now
-    const lastPt = chartStream[chartStream.length-1];
-    if(lastPt && chartCurrent > 0){
-      const gapMs = now - lastPt.t;
-      if(gapMs > 5000){
-        // Fill gap with flat line at last known value
-        // This prevents the cliff/spike from the discontinuity
-        const steps = Math.min(20, Math.floor(gapMs / 1000));
-        for(let i=1; i<=steps; i++){
-          chartStream.push({ t: lastPt.t + (gapMs/steps)*i, v: lastPt.v });
-        }
-        chartStream.push({ t: now, v: chartCurrent });
-        if(chartStream.length > STREAM_CAP) chartStream.splice(0, chartStream.length-STREAM_CAP);
-      }
-    } else if(chartStream.length < 3 && chartCurrent > 0){
-      // Empty stream — reload history from server
-      loadEquityHistory();
-    }
-    // Reset animation state
-    chartLineGlow = 0;
-    chartVelocity = 0;
-  }
-});
-
-// Load historical equity from tc_equity table and seed chartStream
+// ── Load history from tc_equity ─────────────────────
 async function loadEquityHistory(){
-  try {
-    const SB=getSbUrl(), KEY=getSbKey();
-    if(!SB||!KEY) return;
-    // Fetch last 4 hours of equity snapshots
-    const since = new Date(Date.now() - 4*60*60*1000).toISOString();
-    const url = `${SB}/rest/v1/tc_equity?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=500`;
-    const res = await fetch(url, { headers:{'apikey':KEY,'Authorization':'Bearer '+KEY} });
+  try{
+    const SB=getSbUrl(),KEY=getSbKey(); if(!SB||!KEY) return;
+    const since=new Date(Date.now()-4*60*60*1000).toISOString();
+    const res=await fetch(`${SB}/rest/v1/tc_equity?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=300`,
+      {headers:{'apikey':KEY,'Authorization':'Bearer '+KEY}});
     if(!res.ok) return;
-    const rows = await res.json();
-    if(!rows||!rows.length) return;
-
-    // Seed chartStream with historical points
-    const cap = chartTarget > 0 ? chartTarget * 1.5 : 150000; // upper sanity bound
-    let seeded = 0;
+    const rows=await res.json(); if(!rows?.length) return;
+    const cap=chartTarget>0?chartTarget*2:200000;
     for(const row of rows){
-      const t = new Date(row.created_at).getTime();
-      const v = +row.value;
-      if(!v||v<=0||v>cap*2) continue; // skip bad values
-      // Only add if meaningfully different from last point (avoid flat line spam)
-      const last = chartStream[chartStream.length-1];
-      if(!last || Math.abs(v-last.v)>0.5 || (t-last.t)>60000){
-        chartStream.push({t, v});
-        seeded++;
-      }
+      const t=new Date(row.created_at).getTime(), v=+row.value;
+      if(!v||v<=0||v>cap) continue;
+      const last=chartStream[chartStream.length-1];
+      if(!last||Math.abs(v-last.v)>0.5||(t-last.t)>60000) chartStream.push({t,v});
     }
-    // Cap at STREAM_CAP
-    if(chartStream.length > STREAM_CAP) chartStream.splice(0, chartStream.length-STREAM_CAP);
-    if(seeded > 0) console.log(`[chart] Seeded ${seeded} historical equity points`);
-  } catch(e) { console.warn('[chart] History load failed:', e.message); }
+    if(chartStream.length>STREAM_CAP) chartStream.splice(0,chartStream.length-STREAM_CAP);
+    _chartDirty=true; _doRender();
+  }catch(e){}
 }
 
-// Called by poll() when new equity data arrives from Supabase
+// ── drawChart: called by poll when new equity arrives ─
 function drawChart(){
   if(!chartRAF) startChart();
-  if(eqHist.length === 0) return;
-  const newTarget = eqHist[eqHist.length-1];
-  if(newTarget > 0 && newTarget !== chartTarget){
-    if(chartTarget !== 0){
-      chartLineGlow = 1.0;   // flash on new data
-      lastDataUpdate = Date.now();
-    }
-    chartTarget = newTarget;
-    if(chartCurrent === 0) chartCurrent = chartTarget;
+  if(!eqHist.length) return;
+  const nv=eqHist[eqHist.length-1];
+  if(nv>0){
+    chartTarget=nv;
+    chartCurrent=nv;
+    _pushStreamPoint(nv); // add to stream
+    _doRender();
   }
 }
 
-// ── Chart render cache ────────────────────────────────────────
-let _chartCache = { minV:0, maxV:0, tStart:0, pts:[], color:'#00d4aa', cap:0 };
+// ── Render state ─────────────────────────────────────
+let _chartDirty  = false;
+let _chartHoverX = null;
+let _renderPending = false;
 
-function renderChart(){
+// Single render function — called only when dirty or hover changes
+function _doRender(){
+  if(_renderPending) return; // already scheduled
+  _renderPending=true;
+  // Use a minimal timeout to batch rapid calls (e.g. multiple pushes in one tick)
+  setTimeout(_actualRender, 16);
+}
+
+function _actualRender(){
+  _renderPending=false;
+  _chartDirty=false;
+
   const cv=$('equityChart'); if(!cv||!chartCtx) return;
-  // offsetWidth can be 0 when panel is partially hidden — use clientWidth fallback
-  const W=cv.parentElement.offsetWidth||cv.parentElement.clientWidth||cv.getBoundingClientRect().width||800;
-  const H=cv.parentElement.offsetHeight||cv.parentElement.clientHeight||cv.getBoundingClientRect().height||300;
-  if(W<50||H<50) return; // genuinely too small — skip
-  if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; _chartCache.pts=[]; }
 
-  const now=Date.now(), ctx=chartCtx, cap=getStartingCapital();
+  // Size — read once, no reflow-triggering methods in the draw loop
+  const W=cv.width, H=cv.height;
+  if(W<50||H<50) return;
 
-  // ── 1. Update chartCurrent (no spring — direct set)
-  // Spring physics caused stutter. Direct assignment is smooth because
-  // real data only changes every 8s, so the line moves in clean steps.
-  if(chartTarget>0) chartCurrent = chartTarget;
-  const displayVal = chartCurrent || cap;
-
-  // ── 2. Push to stream (throttled — only on real change)
-  if(displayVal>0 && !document.hidden){
-    const last=chartStream[chartStream.length-1];
-    const gap=last?(now-last.t):99999;
-    if(last && gap>8000 && gap<600000){
-      // Bridge gap with flat line
-      chartStream.push({t:last.t+gap*0.5, v:last.v});
-      chartStream.push({t:now-1,          v:last.v});
-    }
-    if(!last || Math.abs(displayVal-last.v)>0.10 || gap>2000){
-      const pj=last?Math.abs(displayVal-last.v)/Math.max(last.v,1):0;
-      if(pj<0.03 || chartStream.length<5){
-        chartStream.push({t:now, v:displayVal});
-        if(chartStream.length>STREAM_CAP) chartStream.shift();
-      }
-    }
-  }
-
-  // ── 3. Empty state
-  const empty=$('chartEmpty');
-  if(chartStream.length<4){ if(empty) empty.style.display='flex'; return; }
-  if(empty) empty.style.display='none';
-
-  // ── 4. Visible window
+  const cap=getStartingCapital();
+  const now=Date.now();
   const windowMs=WINDOW_SECS*1000;
-  const tEnd=now, tStart=tEnd-windowMs;
+  const tStart=now-windowMs;
 
-  // ── 5. Only recompute layout when data changed
-  // Compare first/last stream timestamps to detect change
-  const streamSig = chartStream.length+'|'+(chartStream[0]?.t||0)+'|'+(chartStream[chartStream.length-1]?.v||0);
-  const needRecompute = streamSig !== _chartCache.sig || W !== _chartCache.W || H !== _chartCache.H;
+  // Build visible points
+  const raw=chartStream.filter(p=>p.t>=tStart);
+  if(raw.length<2){ chartCtx.clearRect(0,0,W,H); return; }
 
-  if(needRecompute){
-    _chartCache.sig = streamSig;
-    _chartCache.W   = W;
-    _chartCache.H   = H;
-
-    let visible = chartStream.filter(p=>p.t>=tStart);
-    if(visible.length<2){ _chartCache.pts=[]; return; }
-
-    // Downsample to 200 pts max
-    if(visible.length>200){
-      const step=Math.ceil(visible.length/200);
-      visible=visible.filter((_,i)=>i%step===0||i===visible.length-1);
-    }
-
-    const P={t:48,b:28,l:58,r:20};
-    const cW=W-P.l-P.r, cH=H-P.t-P.b;
-
-    // Y-axis range
-    let rawMin=visible[0].v, rawMax=visible[0].v;
-    for(const p of visible){
-      if(p.v<rawMin) rawMin=p.v;
-      if(p.v>rawMax) rawMax=p.v;
-    }
-    const dataRange=rawMax-rawMin;
-    const pad=Math.max(dataRange*0.25,(chartTarget||cap)*0.0004);
-    const minV=rawMin-pad, maxV=rawMax+pad, vRange=maxV-minV||1;
-
-    const tx=t=>P.l+((t-tStart)/windowMs)*cW;
-    const ty=v=>P.t+cH-((v-minV)/vRange)*cH;
-
-    _chartCache = {
-      ..._chartCache,
-      P, cW, cH, minV, maxV, vRange, tStart,
-      pts: visible.map(p=>[tx(p.t), ty(p.v)]),
-      cap, isUp: displayVal >= cap,
-      sig: streamSig, W, H,
-    };
+  // Downsample — max 150 pts, simple stride
+  let vis=raw;
+  if(raw.length>150){
+    const step=Math.ceil(raw.length/150);
+    vis=[]; for(let i=0;i<raw.length;i+=step) vis.push(raw[i]);
+    if(vis[vis.length-1]!==raw[raw.length-1]) vis.push(raw[raw.length-1]);
   }
 
-  const {P,cW,cH,minV,vRange,pts,isUp} = _chartCache;
-  if(!pts||pts.length<2) return;
+  // Y range
+  let lo=vis[0].v, hi=vis[0].v;
+  for(const p of vis){ if(p.v<lo)lo=p.v; if(p.v>hi)hi=p.v; }
+  const rng=hi-lo||1;
+  const pad=Math.max(rng*0.2,cap*0.0003);
+  const minV=lo-pad, maxV=hi+pad, vRng=maxV-minV;
 
-  // ── 6. Draw ───────────────────────────────────────────────────
+  // Layout
+  const pl=58,pr=20,pt=40,pb=24;
+  const cW=W-pl-pr, cH=H-pt-pb;
+
+  // Pixel mappers — precompute as simple inline math (no closures)
+  const txFn = t => pl + (t-tStart)/windowMs*cW;
+  const tyFn = v => pt + cH - (v-minV)/vRng*cH;
+
+  const ctx=chartCtx;
   ctx.clearRect(0,0,W,H);
 
-  const lineCol = isUp ? '#00d4aa' : '#ff4757';
-  const fillCol = isUp ? 'rgba(0,212,170,' : 'rgba(255,71,87,';
+  const isUp=(chartCurrent||cap)>=cap;
+  const lineCol=isUp?'#00d4aa':'#ff4757';
 
-  const tx2=t=>P.l+((t-tStart)/windowMs)*cW;
-  const ty2=v=>P.t+cH-((v-minV)/vRange)*cH;
-
-  // Grid
+  // Grid lines — precomputed, no dynamic calls inside loop
   ctx.font='10px ui-monospace,monospace';
   ctx.textAlign='right';
+  ctx.lineWidth=1;
   for(let i=0;i<=4;i++){
-    const v=minV+(vRange/4)*i;
-    const y=ty2(v);
-    if(y<P.t||y>P.t+cH) continue;
+    const v=minV+(vRng/4)*i;
+    const y=tyFn(v);
+    if(y<pt||y>pt+cH) continue;
     ctx.setLineDash([2,8]);
     ctx.strokeStyle='rgba(255,255,255,0.05)';
-    ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(P.l,y); ctx.lineTo(W-P.r,y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pl,y); ctx.lineTo(W-pr,y); ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle='rgba(255,255,255,0.22)';
-    const lbl = vRange<2000
-      ? '$'+Math.round(v).toLocaleString('en-US')
-      : '$'+(v/1000).toFixed(1)+'k';
-    ctx.fillText(lbl, P.l-6, y+3);
+    ctx.fillText(vRng<2000?'$'+Math.round(v).toLocaleString('en-US'):'$'+(v/1000).toFixed(1)+'k', pl-6, y+3);
   }
 
   // Baseline
-  const baseY=ty2(cap);
-  if(baseY>=P.t && baseY<=P.t+cH){
+  const baseY=tyFn(cap);
+  if(baseY>=pt&&baseY<=pt+cH){
     ctx.setLineDash([3,7]);
-    ctx.strokeStyle='rgba(255,255,255,0.12)';
-    ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke();
+    ctx.strokeStyle='rgba(255,255,255,0.10)';
+    ctx.beginPath(); ctx.moveTo(pl,baseY); ctx.lineTo(W-pr,baseY); ctx.stroke();
     ctx.setLineDash([]);
   }
 
-  // Path builder (Catmull-Rom, tension=0.15)
-  function buildPath(p){
-    ctx.moveTo(p[0][0],p[0][1]);
-    for(let i=0;i<p.length-1;i++){
-      const p0=p[Math.max(i-1,0)], p1=p[i], p2=p[i+1], p3=p[Math.min(i+2,p.length-1)];
-      const t=0.15;
-      ctx.bezierCurveTo(
-        p1[0]+(p2[0]-p0[0])*t, p1[1]+(p2[1]-p0[1])*t,
-        p2[0]-(p3[0]-p1[0])*t, p2[1]-(p3[1]-p1[1])*t,
-        p2[0], p2[1]
-      );
-    }
+  // Build pixel arrays once
+  const xs=new Float32Array(vis.length);
+  const ys=new Float32Array(vis.length);
+  for(let i=0;i<vis.length;i++){
+    xs[i]=txFn(vis[i].t);
+    ys[i]=tyFn(vis[i].v);
   }
 
   // Fill
-  const grad=ctx.createLinearGradient(0,P.t,0,H-P.b);
-  grad.addColorStop(0, fillCol+'0.15)');
-  grad.addColorStop(1, fillCol+'0)');
+  const grad=ctx.createLinearGradient(0,pt,0,H-pb);
+  grad.addColorStop(0,isUp?'rgba(0,212,170,0.14)':'rgba(255,71,87,0.12)');
+  grad.addColorStop(1,'rgba(0,0,0,0)');
   ctx.beginPath();
-  ctx.moveTo(pts[0][0], Math.min(H-P.b, ty2(minV)));
-  ctx.lineTo(pts[0][0], pts[0][1]);
-  buildPath(pts);
-  ctx.lineTo(pts[pts.length-1][0], Math.min(H-P.b, ty2(minV)));
+  ctx.moveTo(xs[0], H-pb);
+  ctx.lineTo(xs[0], ys[0]);
+  for(let i=1;i<vis.length;i++) ctx.lineTo(xs[i],ys[i]);
+  ctx.lineTo(xs[vis.length-1], H-pb);
   ctx.closePath();
   ctx.fillStyle=grad;
   ctx.fill();
 
-  // Line
+  // Line — polyline, NO bezier (bezier is the main perf killer)
   ctx.beginPath();
-  buildPath(pts);
+  ctx.moveTo(xs[0],ys[0]);
+  for(let i=1;i<vis.length;i++) ctx.lineTo(xs[i],ys[i]);
   ctx.strokeStyle=lineCol;
   ctx.lineWidth=2;
   ctx.lineJoin='round';
   ctx.lineCap='round';
-  ctx.shadowColor=lineCol;
-  ctx.shadowBlur=4;
+  ctx.shadowBlur=0; // no shadow — shadow is extremely expensive
   ctx.stroke();
-  ctx.shadowBlur=0;
 
-  // Live dot
-  const ex=pts[pts.length-1][0], ey=pts[pts.length-1][1];
-  if(ex>=P.l&&ex<=W-P.r&&ey>=P.t&&ey<=P.t+cH){
-    const pulse=0.3+0.25*Math.sin(now*0.003);
-    ctx.beginPath(); ctx.arc(ex,ey,5+pulse*2,0,Math.PI*2);
-    ctx.fillStyle=lineCol.replace('rgb','rgba').replace(')',`,${0.15*pulse})`);
-    ctx.fill();
-    ctx.beginPath(); ctx.arc(ex,ey,3,0,Math.PI*2);
-    ctx.fillStyle=lineCol;
-    ctx.shadowColor=lineCol; ctx.shadowBlur=6;
-    ctx.fill(); ctx.shadowBlur=0;
-  }
-
-  // Hover crosshair
-  if(typeof chartMouseX==='number'&&chartMouseX>=P.l&&chartMouseX<=W-P.r){
-    let closest=pts[0], closestV=chartStream[0]?.v||cap;
-    const visibleFiltered=chartStream.filter(p=>p.t>=tStart);
-    for(let i=0;i<pts.length;i++){
-      if(Math.abs(pts[i][0]-chartMouseX)<Math.abs(closest[0]-chartMouseX)){
-        closest=pts[i];
-        closestV=visibleFiltered[i]?.v||cap;
-      }
-    }
-    ctx.setLineDash([3,5]);
-    ctx.strokeStyle='rgba(255,255,255,0.12)';
-    ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(closest[0],P.t); ctx.lineTo(closest[0],P.t+cH); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.beginPath(); ctx.arc(closest[0],closest[1],3.5,0,Math.PI*2);
+  // Live dot — just a simple circle
+  const ex=xs[xs.length-1], ey=ys[ys.length-1];
+  if(ex>=pl&&ex<=W-pr&&ey>=pt&&ey<=pt+cH){
+    ctx.beginPath(); ctx.arc(ex,ey,4,0,Math.PI*2);
     ctx.fillStyle=lineCol; ctx.fill();
-    const diff2=closestV-cap;
-    const pct=(diff2/cap*100).toFixed(2);
-    const sign=diff2>=0?'+':'';
-    const tip=sign+'$'+Math.abs(diff2).toFixed(2)+' ('+sign+pct+'%)';
-    ctx.font='bold 11px ui-monospace,monospace';
-    const tw2=ctx.measureText(tip).width+16;
-    let tipX=closest[0]-tw2/2;
-    tipX=Math.max(P.l,Math.min(W-P.r-tw2,tipX));
-    const tipY=closest[1]-36;
-    ctx.fillStyle='rgba(15,17,21,0.92)';
-    ctx.beginPath(); ctx.roundRect(tipX,tipY,tw2,22,4); ctx.fill();
-    ctx.fillStyle=diff2>=0?'#00d4aa':'#ff4757';
-    ctx.textAlign='center';
-    ctx.fillText(tip,tipX+tw2/2,tipY+14);
-    ctx.textAlign='right';
   }
-}
 
-
-function drawChart(){
-  if(!chartRAF) startChart();
-  if(eqHist.length === 0) return;
-  const newTarget = eqHist[eqHist.length-1];
-  if(newTarget > 0 && newTarget !== chartTarget){
-    if(chartTarget !== 0){
-      chartLineGlow = 1.0;   // flash on new data
-      lastDataUpdate = Date.now();
+  // Hover crosshair — only if mouse is over chart
+  if(_chartHoverX!==null&&_chartHoverX>=pl&&_chartHoverX<=W-pr){
+    // Find closest x
+    let ci=0, cd=Math.abs(xs[0]-_chartHoverX);
+    for(let i=1;i<xs.length;i++){
+      const d=Math.abs(xs[i]-_chartHoverX);
+      if(d<cd){cd=d;ci=i;}
     }
-    chartTarget = newTarget;
-    if(chartCurrent === 0) chartCurrent = chartTarget;
-  }
-}
-
-function renderChart(){
-  const cv=$('equityChart'); if(!cv||!chartCtx) return;
-  const W=cv.parentElement.offsetWidth, H=cv.parentElement.offsetHeight;
-  if(W<=0||H<=0) return;
-  if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; }
-
-  const now=Date.now(), ctx=chartCtx, cap=getStartingCapital();
-  ctx.clearRect(0,0,W,H);
-
-  // ── 1. SPRING: glide toward target ───────────────────────────
-  if(chartTarget>0 && chartCurrent>0){
-    const diff=chartTarget-chartCurrent;
-    chartVelocity+=diff*0.06;
-    chartVelocity*=0.80;
-    chartCurrent+=chartVelocity;
-    if(Math.abs(diff)<0.01 && Math.abs(chartVelocity)<0.01){
-      chartCurrent=chartTarget; chartVelocity=0;
-    }
-  }
-
-  // ── 2. NO MICRO-DRIFT — Robinhood style is clean flat between ticks
-  const displayVal = chartCurrent || cap;
-
-  // ── 3. STREAM POINT ──────────────────────────────────────────
-  if(displayVal>0 && !document.hidden){
-    const last=chartStream[chartStream.length-1];
-    const gap = last ? (now-last.t) : 99999;
-    // Bridge gaps (tab switch etc) with flat line instead of cliff
-    if(last && gap>8000 && gap<600000){
-      // insert flat bridge points
-      const steps=Math.min(10, Math.floor(gap/2000));
-      for(let i=1;i<=steps;i++) chartStream.push({t:last.t+(gap/steps)*i, v:last.v});
-    }
-    if(!last || Math.abs(displayVal-last.v)>0.10 || gap>1000){
-      // Spike guard: reject single-frame jumps >3% of equity (bad data)
-      const _pj = last ? Math.abs(displayVal-last.v)/Math.max(last.v,1) : 0;
-      if(_pj < 0.03 || chartStream.length < 5){
-        chartStream.push({t:now, v:displayVal});
-        if(chartStream.length>STREAM_CAP) chartStream.shift();
-      }
-    }
-  }
-
-  // ── 4. GLOW DECAY ────────────────────────────────────────────
-  chartLineGlow=Math.max(0, chartLineGlow-0.015);
-
-  // ── 5. EMPTY STATE ───────────────────────────────────────────
-  const empty=$('chartEmpty');
-  if(chartStream.length<4){ if(empty) empty.style.display='flex'; return; }
-  if(empty) empty.style.display='none';
-
-  // ── 6. VISIBLE WINDOW ────────────────────────────────────────
-  const windowMs=WINDOW_SECS*1000;
-  const tEnd=now, tStart=tEnd-windowMs;
-  let visible=chartStream.filter(p=>p.t>=tStart);
-  if(visible.length<2) return;
-
-  // ── 7. DOWNSAMPLE to max 300 pts for performance ─────────────
-  if(visible.length>300){
-    const step=Math.ceil(visible.length/300);
-    visible=visible.filter((_,i)=>i%step===0||i===visible.length-1);
-  }
-
-  // ── 8. LAYOUT ────────────────────────────────────────────────
-  const P={t:48,b:28,l:58,r:20};
-  const cW=W-P.l-P.r, cH=H-P.t-P.b;
-
-  // ── 9. DYNAMIC Y-AXIS ─────────────────────────────────────────
-  const vals=visible.map(p=>p.v);
-  const rawMin=Math.min(...vals);
-  const rawMax=Math.max(...vals);
-  const dataRange=rawMax-rawMin;
-  // Padding: 25% of range, min = 0.04% of equity so tiny moves show clearly
-  const pad=Math.max(dataRange*0.25, (chartTarget||cap)*0.0004);
-  const minV=rawMin-pad, maxV=rawMax+pad;
-  const vRange=maxV-minV||1;
-
-  const tx=t=>P.l+((t-tStart)/windowMs)*cW;
-  const ty=v=>P.t+cH-((v-minV)/vRange)*cH;
-
-  // ── 10. GRID LINES ───────────────────────────────────────────
-  ctx.font='10px ui-monospace,monospace';
-  ctx.textAlign='right';
-  const steps=4;
-  for(let i=0;i<=steps;i++){
-    const v=minV+(vRange/steps)*i;
-    const y=ty(v);
-    if(y<P.t||y>P.t+cH) continue;
-    ctx.setLineDash([2,8]);
-    ctx.strokeStyle='rgba(255,255,255,0.05)';
-    ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(P.l,y); ctx.lineTo(W-P.r,y); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle='rgba(255,255,255,0.22)';
-    // Robinhood style: show dollar value with smart formatting
-    const diff=v-cap;
-    let lbl;
-    if(vRange<2000) lbl='$'+Math.round(v).toLocaleString('en-US');
-    else lbl='$'+(v/1000).toFixed(1)+'k';
-    ctx.fillText(lbl, P.l-6, y+3);
-  }
-
-  // Baseline (starting capital / day start)
-  const baseY=ty(cap);
-  if(baseY>=P.t && baseY<=P.t+cH){
-    ctx.setLineDash([3,7]);
-    ctx.strokeStyle='rgba(255,255,255,0.12)';
-    ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke();
-    ctx.setLineDash([]);
-  }
-
-  // ── 11. COLOR LOGIC ──────────────────────────────────────────
-  // Color based on current value vs cap (green = up, red = down)
-  const isUp=displayVal>=cap;
-  const lineCol=isUp?'#00d4aa':'#ff4757';
-  const fillCol=isUp?'rgba(0,212,170,':'rgba(255,71,87,';
-
-  // ── 12. BUILD PATH ────────────────────────────────────────────
-  const pts=visible.map(p=>[tx(p.t), ty(p.v)]);
-
-  // Smooth bezier path — Robinhood style
-  function buildPath(){
-    ctx.moveTo(pts[0][0], pts[0][1]);
-    for(let i=0;i<pts.length-1;i++){
-      const p0=pts[Math.max(i-1,0)];
-      const p1=pts[i];
-      const p2=pts[i+1];
-      const p3=pts[Math.min(i+2,pts.length-1)];
-      const tension=0.15; // lower = smoother/less wiggly
-      const cp1x=p1[0]+(p2[0]-p0[0])*tension;
-      const cp1y=p1[1]+(p2[1]-p0[1])*tension;
-      const cp2x=p2[0]-(p3[0]-p1[0])*tension;
-      const cp2y=p2[1]-(p3[1]-p1[1])*tension;
-      ctx.bezierCurveTo(cp1x,cp1y,cp2x,cp2y,p2[0],p2[1]);
-    }
-  }
-
-  // ── 13. GRADIENT FILL ─────────────────────────────────────────
-  const grad=ctx.createLinearGradient(0,P.t,0,H-P.b);
-  grad.addColorStop(0,   fillCol+'0.18)');
-  grad.addColorStop(0.5, fillCol+'0.06)');
-  grad.addColorStop(1,   fillCol+'0)');
-  ctx.beginPath();
-  ctx.moveTo(pts[0][0], Math.min(H-P.b, Math.max(P.t, ty(minV-1))));
-  ctx.lineTo(pts[0][0], pts[0][1]);
-  buildPath();
-  ctx.lineTo(pts[pts.length-1][0], Math.min(H-P.b, Math.max(P.t, ty(minV-1))));
-  ctx.closePath();
-  ctx.fillStyle=grad;
-  ctx.fill();
-
-  // ── 14. LINE ─────────────────────────────────────────────────
-  ctx.beginPath();
-  buildPath();
-  ctx.strokeStyle=lineCol;
-  ctx.lineWidth=2;
-  ctx.lineJoin='round';
-  ctx.lineCap='round';
-  ctx.shadowColor=lineCol;
-  ctx.shadowBlur=chartLineGlow*12+3;
-  ctx.stroke();
-  ctx.shadowBlur=0;
-
-  // ── 15. LIVE DOT ─────────────────────────────────────────────
-  const ex=pts[pts.length-1][0];
-  const ey=pts[pts.length-1][1];
-  if(ex>=P.l && ex<=W-P.r && ey>=P.t && ey<=P.t+cH){
-    const pulse=0.4+0.3*Math.sin(now*0.003);
-    ctx.beginPath();
-    ctx.arc(ex,ey,6+pulse*3,0,Math.PI*2);
-    ctx.fillStyle=lineCol.replace(')',`,${0.15*pulse})`).replace('rgb','rgba');
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(ex,ey,3,0,Math.PI*2);
-    ctx.fillStyle=lineCol;
-    ctx.shadowColor=lineCol;
-    ctx.shadowBlur=8;
-    ctx.fill();
-    ctx.shadowBlur=0;
-  }
-
-  // ── 16. HOVER TOOLTIP ────────────────────────────────────────
-  if(typeof chartMouseX==='number' && chartMouseX>=P.l && chartMouseX<=W-P.r){
-    // Find closest point
-    let closest=pts[0], closestVal=visible[0].v;
-    for(let i=0;i<pts.length;i++){
-      if(Math.abs(pts[i][0]-chartMouseX)<Math.abs(closest[0]-chartMouseX)){
-        closest=pts[i]; closestVal=visible[i].v;
-      }
-    }
-    // Vertical crosshair
+    const hx=xs[ci], hy=ys[ci], hv=vis[ci].v;
     ctx.setLineDash([3,5]);
-    ctx.strokeStyle='rgba(255,255,255,0.15)';
+    ctx.strokeStyle='rgba(255,255,255,0.10)';
     ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(closest[0],P.t); ctx.lineTo(closest[0],P.t+cH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(hx,pt); ctx.lineTo(hx,pt+cH); ctx.stroke();
     ctx.setLineDash([]);
-    // Dot on line
-    ctx.beginPath(); ctx.arc(closest[0],closest[1],3.5,0,Math.PI*2);
+    ctx.beginPath(); ctx.arc(hx,hy,3,0,Math.PI*2);
     ctx.fillStyle=lineCol; ctx.fill();
     // Tooltip
-    const diff2=closestVal-cap;
-    const diffPct=(diff2/cap*100).toFixed(2);
-    const tip=(diff2>=0?'+':'')+"$"+Math.abs(diff2).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+" ("+(diff2>=0?'+':'')+diffPct+"%)";
+    const diff=hv-cap, pct=(diff/cap*100).toFixed(2);
+    const tip=(diff>=0?'+':'')+`$${Math.abs(diff).toFixed(2)} (${diff>=0?'+':''}${pct}%)`;
     ctx.font='bold 11px ui-monospace,monospace';
-    const tw2=ctx.measureText(tip).width+16;
-    let tx2=closest[0]-tw2/2;
-    tx2=Math.max(P.l,Math.min(W-P.r-tw2,tx2));
-    const ty2=closest[1]-36;
-    ctx.fillStyle='rgba(15,17,21,0.92)';
-    ctx.beginPath();
-    ctx.roundRect(tx2,ty2,tw2,22,4);
-    ctx.fill();
-    ctx.fillStyle=diff2>=0?'#00d4aa':'#ff4757';
-    ctx.textAlign='center';
-    ctx.fillText(tip,tx2+tw2/2,ty2+14);
-    ctx.textAlign='right';
+    const tw=ctx.measureText(tip).width+16;
+    let tx=hx-tw/2; tx=Math.max(pl,Math.min(W-pr-tw,tx));
+    const ty=Math.max(pt+4,hy-36);
+    ctx.fillStyle='rgba(12,14,18,0.95)';
+    ctx.beginPath(); if(ctx.roundRect) ctx.roundRect(tx,ty,tw,22,4); else ctx.rect(tx,ty,tw,22); ctx.fill();
+    ctx.fillStyle=diff>=0?'#00d4aa':'#ff4757';
+    ctx.textAlign='center'; ctx.fillText(tip,tx+tw/2,ty+14); ctx.textAlign='right';
   }
 }
 
-
-function drawChart(){
-  if(!chartRAF) startChart();
-  if(eqHist.length === 0) return;
-  const newTarget = eqHist[eqHist.length-1];
-  if(newTarget > 0 && newTarget !== chartTarget){
-    if(chartTarget !== 0){
-      chartLineGlow = 1.0;   // flash on new data
-      lastDataUpdate = Date.now();
-    }
-    chartTarget = newTarget;
-    if(chartCurrent === 0) chartCurrent = chartTarget;
+// ── Resize handler ────────────────────────────────────
+function _resizeChart(){
+  const cv=$('equityChart'); if(!cv) return;
+  const parent=cv.parentElement; if(!parent) return;
+  const W=parent.clientWidth||parent.offsetWidth||800;
+  const H=parent.clientHeight||parent.offsetHeight||300;
+  if(W>50&&H>50&&(cv.width!==W||cv.height!==H)){
+    cv.width=W; cv.height=H; _chartDirty=true; _doRender();
   }
 }
 
-function renderChart(){
-  const cv=$('equityChart'); if(!cv||!chartCtx) return;
-  const W = cv.parentElement.offsetWidth;
-  const H = cv.parentElement.offsetHeight;
-  if(W<=0||H<=0) return;
-  if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; }
+// ── startChart ────────────────────────────────────────
+function startChart(){
+  const cv=$('equityChart'); if(!cv||chartRAF) return;
+  chartCtx=cv.getContext('2d');
 
-  const now = Date.now();
-  const cap = getStartingCapital();
-  const ctx = chartCtx;
-  ctx.clearRect(0,0,W,H);
+  // Size canvas immediately
+  _resizeChart();
 
-  // ── 1. SPRING PHYSICS: glide chartCurrent → chartTarget ──────
-  if(chartTarget > 0 && chartCurrent > 0){
-    const diff = chartTarget - chartCurrent;
-    chartVelocity += diff * 0.04;   // spring force — slower = smoother
-    chartVelocity *= 0.85;          // damping — less overshoot
-    chartCurrent  += chartVelocity;
-    if(Math.abs(diff)<0.005 && Math.abs(chartVelocity)<0.005){
-      chartCurrent  = chartTarget;
-      chartVelocity = 0;
-    }
-  }
+  // Load history
+  loadEquityHistory();
 
-  // ── 2. ORGANIC MICRO-DRIFT ────────────────────────────────────
-  // Two random-walk noise oscillators at coprime update rates.
-  // Each frame: nudge velocity by tiny random amount, apply to value,
-  // then softly pull back toward zero so it never wanders far.
-  // Result: looks like real market microstructure, not a sine wave.
-  const settled = Math.abs(chartVelocity) < 0.02;
-  let drift = 0;
-  if(settled && chartCurrent > 0){
-    // Max amplitude: 0.008% of equity — barely visible, just alive
-    const maxAmp = chartCurrent * 0.00008;
-
-    // Noise 1: faster jitter (updates every frame)
-    _v1 += (Math.random() - 0.5) * 0.18;   // random kick
-    _v1 *= 0.88;                             // friction
-    _n1 += _v1;
-    _n1 *= 0.97;                             // mean-reversion — pull toward 0
-
-    // Noise 2: slower drift (lower frequency component)
-    _v2 += (Math.random() - 0.5) * 0.06;
-    _v2 *= 0.94;
-    _n2 += _v2;
-    _n2 *= 0.992;
-
-    // Clamp both to [-1, 1] and combine
-    _n1 = Math.max(-1, Math.min(1, _n1));
-    _n2 = Math.max(-1, Math.min(1, _n2));
-    drift = (_n1 * 0.65 + _n2 * 0.35) * maxAmp;
-
-    // Suppress drift while actively gliding to new target
-    const glideFactor = Math.max(0, 1 - chartLineGlow * 3);
-    drift *= glideFactor;
-  } else {
-    // Reset noise state when not settled so it starts fresh each time
-    _n1 *= 0.9; _n2 *= 0.9; _v1 *= 0.5; _v2 *= 0.5;
-  }
-  const displayVal = (chartCurrent || cap) + drift;
-
-  // ── 3. STREAM: only track the live animated tip ──────────────
-  // We store ONE timed sample per 2-second poll interval.
-  // The rest of the line comes from eqHist (real server data).
-  // This prevents the chart from building fake micro-oscillations
-  // into the historical shape — only the live end animates.
-  if(displayVal > 0){
-    const lastPt = chartStream[chartStream.length-1];
-    // Reject if: tab was hidden and last point is very old (avoids cliff on resume)
-    const staleCutoff = document.hidden ? true : (lastPt && (now - lastPt.t) > 10000);
-    if(staleCutoff && lastPt) {
-      // Gap detected — don't push, let visibilitychange handler clean up
-    } else if(!lastPt || Math.abs(displayVal - lastPt.v) > 0.5 || (now - lastPt.t) > 500){
-      chartStream.push({ t: now, v: displayVal });
-      if(chartStream.length > STREAM_CAP) chartStream.shift();
-    }
-  }
-
-  // ── 4. GLOW DECAY ─────────────────────────────────────────────
-  chartLineGlow = Math.max(0, chartLineGlow - 0.018); // ~55 frame fade
-
-  // ── 5. EMPTY STATE ────────────────────────────────────────────
-  const empty = $('chartEmpty');
-  if(chartStream.length < 10){
-    if(empty) empty.style.display='flex';
-    return;
-  }
-  if(empty) empty.style.display='none';
-
-  // ── 6. SLICE VISIBLE WINDOW ───────────────────────────────────
-  const windowMs = WINDOW_SECS * 1000;
-  const tEnd   = now;
-  const tStart = tEnd - windowMs;
-  const visible = chartStream.filter(p => p.t >= tStart);
-  if(visible.length < 2) return;
-
-  // ── 7. LAYOUT ─────────────────────────────────────────────────
-  const P = { t:56, b:22, l:50, r:16 };
-  const cW = W - P.l - P.r;
-
-  // Dynamic Y-axis: zoom to actual data range + 20% padding
-  // This prevents the "flat stick" look when equity barely moves
-  const cH = H - P.t - P.b;
-
-  // Value range — DYNAMIC zoom to actual data, not anchored to cap
-  const vals = visible.map(p=>p.v);
-  // Don't include cap in min/max — that forces a flat line on small moves
-  const rawMin = Math.min(...vals);
-  const rawMax = Math.max(...vals);
-  const rangeRaw = rawMax - rawMin;
-  // Zoom padding: 30% of actual range, minimum 0.05% of equity (not 0.5%)
-  // This makes +$128 on $100k actually visible as real movement
-  const padding = Math.max(rangeRaw * 0.30, (chartTarget||cap) * 0.0003);
-  const minV = rawMin - padding;
-  const maxV = rawMax + padding;
-  const range = maxV - minV || 1;
-
-  // Map time→x, value→y
-  const tx = t  => P.l + ((t  - tStart) / windowMs) * cW;
-  const ty = v  => P.t + cH - ((v - minV) / range) * cH;
-  const baseY = ty(cap);
-
-  // ── 8. GRID ───────────────────────────────────────────────────
-  ctx.font = '9px JetBrains Mono,monospace';
-  ctx.textAlign = 'right';
-  const steps = 4;
-  for(let i=0; i<=steps; i++){
-    const v = minV + (range/steps)*i;
-    const y = ty(v);
-    ctx.setLineDash([2,6]);
-    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(P.l,y); ctx.lineTo(W-P.r,y); ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,0.20)';
-    // Smart label: show full value when zoomed in (<$1k range), else show Xk
-    const label = range < 1000
-      ? '$' + v.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0})
-      : '$' + (v/1000).toFixed(1) + 'k';
-    ctx.fillText(label, P.l-5, y+3);
-  }
-  ctx.setLineDash([]);
-
-  // Baseline (starting capital)
-  if(baseY >= P.t && baseY <= P.t+cH){
-    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4,8]);
-    ctx.beginPath(); ctx.moveTo(P.l,baseY); ctx.lineTo(W-P.r,baseY); ctx.stroke();
-    ctx.setLineDash([]);
-  }
-
-  // ── 9. BUILD PIXEL PATH ───────────────────────────────────────
-  // Map stream points → pixel coords
-  const pts = visible.map(p => [tx(p.t), ty(p.v)]);
-
-  // Catmull-Rom spline for smooth curves through all points
-  function drawSpline(pts){
-    if(pts.length < 2) return;
-    ctx.moveTo(pts[0][0], pts[0][1]);
-    for(let i=0; i<pts.length-1; i++){
-      const p0 = pts[Math.max(i-1,0)];
-      const p1 = pts[i];
-      const p2 = pts[i+1];
-      const p3 = pts[Math.min(i+2, pts.length-1)];
-      ctx.bezierCurveTo(
-        p1[0]+(p2[0]-p0[0])/6, p1[1]+(p2[1]-p0[1])/6,
-        p2[0]-(p3[0]-p1[0])/6, p2[1]-(p3[1]-p1[1])/6,
-        p2[0], p2[1]
-      );
-    }
-  }
-
-  // ── 10. COLORS ────────────────────────────────────────────────
-  const isUp = displayVal >= cap;
-  const cGreen = '#00d4aa', cRed = '#ff4757';
-  const lineColor = isUp ? cGreen : cRed;
-  const glowBlur  = 5 + chartLineGlow * 20;
-
-  // ── 11. AREA FILL ─────────────────────────────────────────────
-  const grad = ctx.createLinearGradient(0, P.t, 0, H-P.b);
-  if(isUp){
-    grad.addColorStop(0,   'rgba(0,212,170,0.16)');
-    grad.addColorStop(0.6, 'rgba(0,212,170,0.04)');
-    grad.addColorStop(1,   'rgba(0,212,170,0)');
-  } else {
-    grad.addColorStop(0,   'rgba(255,71,87,0.13)');
-    grad.addColorStop(0.6, 'rgba(255,71,87,0.03)');
-    grad.addColorStop(1,   'rgba(255,71,87,0)');
-  }
-  ctx.beginPath();
-  ctx.moveTo(pts[0][0], H-P.b);
-  ctx.lineTo(pts[0][0], pts[0][1]);
-  drawSpline(pts);
-  ctx.lineTo(pts[pts.length-1][0], H-P.b);
-  ctx.closePath();
-  ctx.fillStyle = grad;
-  ctx.fill();
-
-  // ── 12. LINE ──────────────────────────────────────────────────
-  ctx.beginPath();
-  drawSpline(pts);
-  ctx.strokeStyle = lineColor;
-  ctx.lineWidth   = 1.5;
-  ctx.lineJoin    = 'round';
-  ctx.lineCap     = 'round';
-  ctx.shadowColor = lineColor;
-  ctx.shadowBlur  = glowBlur;
-  ctx.stroke();
-  ctx.shadowBlur  = 0;
-
-  // ── 13. LIVE END DOT ──────────────────────────────────────────
-  const ex = pts[pts.length-1][0];
-  const ey = pts[pts.length-1][1];
-
-  // Outer pulse ring — slow idle breathe
-  // Dot pulse uses its own simple timer so it doesn't depend on breathPhase
-  const pulse = 0.3 + 0.3*Math.sin(now * 0.002);
-  ctx.beginPath(); ctx.arc(ex, ey, 9, 0, Math.PI*2);
-  ctx.strokeStyle = lineColor;
-  ctx.lineWidth   = 1;
-  ctx.shadowColor = lineColor;
-  ctx.shadowBlur  = 8;
-  ctx.globalAlpha = pulse * 0.25 + chartLineGlow * 0.4;
-  ctx.stroke();
-  ctx.globalAlpha = 1;
-  ctx.shadowBlur  = 0;
-
-  // Inner dot — solid, expands slightly on update
-  const dotR = 3.5 + chartLineGlow * 2;
-  ctx.beginPath(); ctx.arc(ex, ey, dotR, 0, Math.PI*2);
-  ctx.fillStyle   = lineColor;
-  ctx.shadowColor = lineColor;
-  ctx.shadowBlur  = 10 + chartLineGlow*12;
-  ctx.fill();
-  ctx.shadowBlur  = 0;
-
-  // ── 14. PRICE LABEL ───────────────────────────────────────────
-  const diff = displayVal - cap;
-  const pct  = (diff/cap*100).toFixed(2);
-  const label = `$${Math.round(displayVal).toLocaleString()} (${diff>=0?'+':''}${pct}%)`;
-  ctx.font        = 'bold 10px JetBrains Mono,monospace';
-  ctx.fillStyle   = lineColor;
-  ctx.textAlign   = 'right';
-  ctx.shadowColor = lineColor;
-  ctx.shadowBlur  = 3 + chartLineGlow*5;
-  const labelX = Math.min(ex+2, W-P.r-2);
-  const labelY = Math.max(ey-14, P.t+12);
-  ctx.fillText(label, labelX, labelY);
-  ctx.shadowBlur = 0;
-}
-
-// ═══════════════════════════════════════
-// POLL
-// ═══════════════════════════════════════
-let pollN=0, lastTradeN=0, lastLogTs='', _posRenderCache='';
-// lastKnownPositions removed — bot handles immediate DB cleanup on close
-
-async function poll(){
-  pollN++;
-  const fetchTrades=pollN%4===0;
-  const simOn = $('simEnabled')?.checked;
-  const [port,rawPositions,trades,logs]=await Promise.all([
-    sbGet(dtbl('tc_portfolio'),'?id=eq.1'),
-    sbGet(dtbl('tc_positions'),'?order=updated_at.desc'),
-    fetchTrades?sbGet(dtbl('tc_trades'),'?order=created_at.desc&limit=50'):Promise.resolve(null),
-    sbGet(dtbl('tc_logs'),'?order=created_at.desc&limit=100'),
-  ]);
-  // If sim mode active but main table empty, try sim table (handles race on page load)
-  let positions = rawPositions;
-  if(simOn && (!rawPositions || rawPositions.length===0)) {
-    const simPos = await sbGet('sim_tc_positions','?order=updated_at.desc');
-    if(simPos && simPos.length>0) positions = simPos;
-  }
-  if(!port||!port.length){ setStatus('offline'); return; }
-  setStatus('live');
-
-  const p=port[0], posData=positions||[], cap=getStartingCapital();
-
-  // Equity
-  const dbT=+p.total_value||0;
-  const dbCash=+p.cash||0;
-  // Use total_value from Alpaca (written by syncPricesOnly every 10s)
-  // This is always correct — ignore computed cash which can be stale
-  // Sanity: total_value must be within 50% of starting capital
-  const raw = (dbT > cap*0.5 && dbT < cap*1.5) ? dbT : (dbCash > cap*0.5 ? dbCash : cap);
-  // Always accept the value if eqHist is empty OR if it's reasonable
-  // Never show blank chart — seed immediately from whatever we have
-  if(eqHist.length===0 && raw>0) {
-    eqHist.push(raw); stableEq=raw;
-    chartTarget=raw; chartCurrent=raw; chartVelocity=0; chartStream=[];
-  } else if(raw>0) {
-    procEq(raw, cap);
-  }
-  // If still empty after procEq rejected it, force seed anyway
-  if(eqHist.length===0 && raw>0) {
-    eqHist.push(raw); stableEq=raw; chartTarget=raw; chartCurrent=raw; chartVelocity=0; chartStream=[];
-  }
-  const eq = stableEq || raw || cap;
-  const diff=eq-cap, dayPnl=+p.day_pnl||0;
-  const tw=+p.total_wins||0, tl=+p.total_losses||0;
-  const wr=tw+tl>0?Math.round(tw/(tw+tl)*100):0;
-
-  // Left sidebar KPIs
-  setVal('kpiPortfolio', fmt$(eq), cc(diff));
-  setVal('kpiDayPnl', fmtSign(dayPnl), cc(dayPnl));
-  if($('kpiDayPct')) $('kpiDayPct').textContent=(dayPnl>=0?'+':'')+(cap>0?(dayPnl/cap*100).toFixed(2):'0.00')+'%';
-  // Use Alpaca's day_pnl directly — it's the only reliable source
-  // day_pnl = (current equity - start of day equity) from Alpaca account API
-  // Never sum tc_trades — that table has old/bad data from previous sessions
-  const realPnl = dayPnl; // dayPnl already comes from p.day_pnl (Alpaca-sourced)
-  if($('kpiRealizedSub')) $('kpiRealizedSub').textContent = 'vs day start $'+fmt$(eq-dayPnl).replace('$','');
-  const unrealPnl=posData.reduce((a,x)=>{
-    const entry=+x.entry_price||0,cur=+x.current_price||0,qty=Math.abs(+x.qty||0);
-    if(!entry||!cur||!qty) return a; // skip invalid rows
-    const sh=x.side?.includes('SHORT');
-    const pnl=cur>0&&entry>0?(sh?(entry-cur)*qty:(cur-entry)*qty):(+x.pnl||0);
-    // Sanity: single position unrealized shouldn't exceed 20% of equity
-    if(Math.abs(pnl) > (eq||100000)*0.20) return a;
-    return a+pnl;
-  },0);
-  setVal('kpiRealized', fmtSign(realPnl), cc(realPnl));
-  setVal('kpiUnrealized', fmtSign(unrealPnl), cc(unrealPnl));
-  if($('kpiAllTime')) $('kpiAllTime').textContent='All time: '+fmtSign(diff);
-  setVal('kpiWinRate', wr+'%', wr>=55?'up':wr>=45?'neu':'dn');
-  if($('kpiWL')) $('kpiWL').textContent=`${tw}W / ${tl}L`;
-  if($('kpiSession')) $('kpiSession').textContent=(p.session||'—').replace('🎮 ','');
-  if($('kpiStatus')) $('kpiStatus').textContent=p.circuit_breaker?'⏸ Paused':'Trading active';
-
-  // Adaptive
-  if($('aConf')) $('aConf').textContent=(p.min_confidence||55)+'%';
-  if($('aRsi')) $('aRsi').textContent='≤'+(p.rsi_oversold||35);
-  if($('aPos')) $('aPos').textContent=(p.max_position_pct||15)+'%';
-  if($('aAtr')) $('aAtr').textContent=(p.atr_stop_mult||2)+'×';
-
-  // Center stat bar
-  setVal('scPortfolio', fmt$(eq), cc(diff));
-  if($('scPortfolioSub')&&p.last_scan) $('scPortfolioSub').textContent='Last scan: '+new Date(p.last_scan).toLocaleTimeString();
-  setVal('scDayPnl', fmtSign(dayPnl), cc(dayPnl));
-  if($('scDayPct')) $('scDayPct').textContent=(dayPnl>=0?'+':'')+(cap>0?(dayPnl/cap*100).toFixed(2):'0.00')+'% today';
-  if($('scPositions')) $('scPositions').textContent=posData.length;
-  if($('scPosStatus')) $('scPosStatus').textContent=p.circuit_breaker?'⏸ Paused':'Trading active';
-  setVal('scWR', wr+'%', wr>=55?'up':wr>=45?'neu':'dn');
-  if($('scWL')) $('scWL').textContent=`${tw}W / ${tl}L · ${tw+tl} trades`;
-
-  // Stat cell accent
-  ['sc-portfolio','sc-daypnl','sc-wr'].forEach(id=>{
-    const el=document.getElementById(id); if(!el) return;
-    el.classList.remove('up','dn');
+  // Hover — only schedule a render, don't call renderChart directly
+  cv.addEventListener('mousemove',e=>{
+    const r=cv.getBoundingClientRect();
+    _chartHoverX=(e.clientX-r.left)*(cv.width/r.width);
+    _doRender();
   });
-  if(diff>0) document.getElementById('sc-portfolio')?.classList.add('up');
-  else if(diff<0) document.getElementById('sc-portfolio')?.classList.add('dn');
-  if(dayPnl>0) document.getElementById('sc-daypnl')?.classList.add('up');
-  else if(dayPnl<0) document.getElementById('sc-daypnl')?.classList.add('dn');
+  cv.addEventListener('mouseleave',()=>{ _chartHoverX=null; _doRender(); });
 
-  // Chart overlay
-  if($('chartVal')) $('chartVal').textContent=fmt$(eq);
-  if($('chartVal')) $('chartVal').style.color=diff>=0?'var(--green)':diff<0?'var(--red)':'var(--text-1)';
-  const sub=$('chartSub');
-  if(sub){ sub.textContent=`${fmtSign(diff)} (${diff>=0?'+':''}${(diff/cap*100).toFixed(2)}%)`; sub.style.color=diff>=0?'rgba(0,212,170,0.6)':diff<0?'rgba(255,71,87,0.6)':'var(--text-3)'; }
-  if(p.last_scan&&$('lastScan')) $('lastScan').textContent='Updated '+new Date(p.last_scan).toLocaleTimeString();
-
-  // Bottom bar
-  if($('cbAdapt')) $('cbAdapt').textContent=tw+tl>0?`${wr}% WR · ${tw+tl} trades`:'Waiting for trades';
-
-  // Sync time
-  if($('syncInfo')) $('syncInfo').textContent='Updated '+new Date().toLocaleTimeString();
-
-  // Render positions only when data actually changes (prevents flicker)
-  const posHash=JSON.stringify(posData.map(x=>x.symbol+'|'+(+x.pnl||0).toFixed(2)+'|'+(+x.current_price||0).toFixed(2)+'|'+x.qty+'|'+x.side));
-  if(posHash!==_posRenderCache){ _posRenderCache=posHash; renderPositions(posData); }
-  if($('posCountBadge')) $('posCountBadge').textContent=posData.length;
-  if($('scPositions')) $('scPositions').textContent=posData.length;
-
-  // Trades — only re-render when count changes
-  if(trades!==null && trades.length!==lastTradeN){
-    lastTradeN=trades.length;
-    renderTrades(trades);
-    if($('tradesBadge')) $('tradesBadge').textContent=trades.length;
-    if($('feedCount')) $('feedCount').textContent=trades.length;
+  // Resize observer — more reliable than window resize
+  if(window.ResizeObserver){
+    const ro=new ResizeObserver(()=>{ _resizeChart(); });
+    ro.observe(cv.parentElement);
+  } else {
+    window.addEventListener('resize',_resizeChart);
   }
 
-  // Logs — only re-render if new entries arrived (prevents constant DOM reflow)
-  if(logs!==null){
-    const lt=logs[0]?.created_at||'';
-    const lcount=logs.length;
-    if(lt!==lastLogTs || lcount!==lastTradeN){ lastLogTs=lt; renderLogs(logs); }
-  }
-
-  // Screener
-  renderScreener(p);
-  drawChart();
+  // chartRAF is kept as a truthy sentinel so startChart doesn't re-run
+  chartRAF=true;
 }
+
+// ── Tab visibility ────────────────────────────────────
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden){
+    const now=Date.now();
+    const last=chartStream[chartStream.length-1];
+    if(last&&now-last.t>5000){
+      // Bridge gap with flat line so no cliff
+      chartStream.push({t:now,v:last.v});
+      if(chartStream.length>STREAM_CAP) chartStream.shift();
+    } else if(!chartStream.length&&chartCurrent>0){
+      loadEquityHistory();
+    }
+    _chartDirty=true; _doRender();
+  }
+});
+
+// Also push a stream point when new equity arrives from poll
+// (stream was previously built inside renderChart — move it here)
+function _pushStreamPoint(val){
+  if(!val||val<=0) return;
+  const now=Date.now();
+  const last=chartStream[chartStream.length-1];
+  if(last){
+    const pj=Math.abs(val-last.v)/Math.max(last.v,1);
+    if(pj>0.03&&chartStream.length>5) return; // spike reject
+  }
+  if(!last||Math.abs(val-(last?.v||0))>0.10||(now-(last?.t||0))>2000){
+    chartStream.push({t:now,v:val});
+    if(chartStream.length>STREAM_CAP) chartStream.shift();
+    _chartDirty=true;
+  }
+}
+
+
 
 // ═══════════════════════════════════════
 // RENDER POSITIONS
@@ -2621,15 +1898,15 @@ function onModeChange(){
   const upd=(id,on,cls)=>{ const e=$(id); if(!e) return; e.className='mode-chip'+(on?' '+cls:''); };
   upd('swingChip',sw,'on'); upd('scalpChip',sc,'on'); upd('shortsChip',sh,'on-red'); upd('recovChip',rc,'on'); upd('simChip',sim,'on-blue');
 
-  // Reset log cache so new mode's logs animate in fresh
+  // Reset log cache
   _renderedLogIds.clear();
-  _logAnimDelay = 0;
-  lastLogTs = '';
-  lastTradeN = 0;
+  _logAnimDelay=0;
+  lastLogTs=''; lastTradeN=0;
 
-  // Clear chart and equity history on mode switch
+  // Reset chart state on mode switch
   eqHist=[]; stableEq=0; eqResetAt=Date.now();
-  chartTarget=0; chartCurrent=0; chartVelocity=0; chartStream=[];
+  chartTarget=0; chartCurrent=0; chartStream=[];
+  _chartCache={minV:0,maxV:0,tStart:0,pts:[],color:'#00d4aa',cap:0};
 
   if(sim){
     // Switched TO sim — clear live chart, show clean start
