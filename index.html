@@ -695,6 +695,11 @@
           <span class="stat-card-value" id="statCircuit" style="color:var(--sell)">OFF</span>
           <span class="stat-card-sub" id="statUptime">Up --m</span>
         </div>
+        <div class="stat-card">
+          <span class="stat-card-label">Recovery</span>
+          <span class="stat-card-value" id="statRecovery" style="color:var(--text-dim)">IDLE</span>
+          <span class="stat-card-sub" id="statRecoverySub">--</span>
+        </div>
       </div>
 
       <!-- Bot Controls -->
@@ -1569,6 +1574,28 @@ function updatePortfolioUI(p) {
   $('statTotalPnL').style.color = (p.total_value - (p.starting_capital||100000)) >= 0 ? 'var(--buy)' : 'var(--sell)';
   $('statCircuit').textContent = p.circuit_breaker ? 'TRIPPED' : 'OFF';
   $('statCircuit').style.color = p.circuit_breaker ? 'var(--sell)' : 'var(--buy)';
+
+  // Recovery state — three distinct states:
+  //   OFF:   recovery mode disabled in config
+  //   IDLE:  enabled but no active recovery (no recent loss to chase)
+  //   HUNT:  actively scanning for a recovery opportunity
+  const recEl = $('statRecovery');
+  const recSub = $('statRecoverySub');
+  if (recEl && recSub) {
+    if (p.recovery_enabled === false) {
+      recEl.textContent = 'OFF';
+      recEl.style.color = 'var(--text-dim)';
+      recSub.textContent = 'disabled';
+    } else if (p.recovery_active) {
+      recEl.textContent = 'HUNT';
+      recEl.style.color = 'var(--sell)';
+      recSub.textContent = `${p.recovery_symbol || '--'} $${(p.recovery_target || 0).toFixed(0)} · ${p.recovery_attempts || 0}×`;
+    } else {
+      recEl.textContent = 'IDLE';
+      recEl.style.color = 'var(--buy)';
+      recSub.textContent = 'ready';
+    }
+  }
   $('chartBadge').textContent = state.mode === 'sim' ? 'SIM' : 'LIVE';
   $('chartBadge').style.background = state.mode === 'sim' ? 'rgba(155,89,182,0.2)' : 'var(--accent-dim)';
   $('chartBadge').style.color = state.mode === 'sim' ? '#9b59b6' : 'var(--accent)';
