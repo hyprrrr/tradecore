@@ -350,10 +350,17 @@ body::before {
   padding: 5px 14px;
   border-bottom: 1px solid rgba(255,255,255,0.03);
   align-items: flex-start;
-  transition: background var(--transition);
-  animation: feed-in 0.2s ease;
+  transition: background 0.15s ease;
+  animation: feed-in 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
-@keyframes feed-in { from { opacity: 0; transform: translateX(-4px); } to { opacity: 1; transform: none; } }
+@keyframes feed-in {
+  from { opacity: 0; transform: translateX(-18px); max-height: 0; }
+  to   { opacity: 1; transform: translateX(0);     max-height: 60px; }
+}
+.feed-item {
+  will-change: transform, opacity;
+  overflow: hidden;
+}
 .feed-item:hover { background: rgba(255,255,255,0.02); }
 .feed-time { font-size: 9px; color: var(--text-4); font-family: var(--font-mono); white-space: nowrap; padding-top: 1px; flex-shrink: 0; }
 .feed-tag {
@@ -1216,7 +1223,11 @@ async function sbPatch(table,q,body){
     await fetch(`${u}/rest/v1/${table}${q}`,{method:'PATCH',headers:{'apikey':k,'Authorization':`Bearer ${k}`,'Content-Type':'application/json','Prefer':'return=minimal'},body:JSON.stringify(body)});
   }catch{}
 }
-function dtbl(n){ return $('simEnabled')?.checked?`sim_${n}`:n; }
+function dtbl(n){
+  // Always check the live checkbox state — not a cached value
+  const simOn = document.getElementById('simEnabled')?.checked;
+  return simOn ? 'sim_'+n : n;
+}
 async function testConnection(){
   const u=getSbUrl(), k=getSbKey();
   if(!u||!k){ setStatus('offline'); openModal(); return; }
@@ -2108,23 +2119,80 @@ function renderTrades(trades){
 // ═══════════════════════════════════════
 // RENDER LOGS
 // ═══════════════════════════════════════
+// Track which log IDs have been rendered to avoid full re-renders
+const _renderedLogIds = new Set();
+let   _logAnimDelay   = 0;
+
 function renderLogs(logs){
-  const feed=$('botFeed'); if(!feed) return;
-  const tagMap={buy:'buy',sell:'sell',sys:'sys',sim:'info',risk:'warn',scalp:'scalp',ai:'ai',info:'info',warn:'warn',price:'sys',signal:'info',stream:'info',pos:'sys',acct:'sys',recovery:'recov',tp:'buy',size:'sys'};
-  feed.innerHTML=logs.map(l=>{
-    const tag=l.type||'sys', cls=tagMap[tag]||'sys';
-    const raw=l.message||'';
-    const msg=raw
-      .replace(/\+\$[\d,.]+/g,m=>`<span class="pos">${m}</span>`)
-      .replace(/-\$[\d,.]+/g,m=>`<span class="neg">${m}</span>`)
-      .replace(/\$[\d,.]+/g,m=>`<span class="hi">${m}</span>`)
-      .replace(/\b(\d+\.?\d*%)/g,m=>`<span class="yl">${m}</span>`);
-    return `<div class="feed-item">
-      <span class="feed-time">${new Date(l.created_at).toLocaleTimeString()}</span>
-      <span class="feed-tag tag-${cls}">${tag.toUpperCase().slice(0,4)}</span>
-      <span class="feed-msg">${msg}</span>
-    </div>`;
-  }).join('');
+  const feed = $('botFeed'); if(!feed) return;
+  const tagMap = {
+    buy:'buy', sell:'sell', sys:'sys', sim:'info', risk:'warn',
+    scalp:'scalp', ai:'ai', info:'info', warn:'warn', price:'sys',
+    signal:'info', stream:'info', pos:'sys', acct:'sys',
+    recovery:'recov', tp:'buy', size:'sys', apex:'ai',
+  };
+
+  function formatMsg(raw){
+    return (raw||'')
+      .replace(/\+\$[\d,.]+/g, m=>`<span class="pos">${m}</span>`)
+      .replace(/-\$[\d,.]+/g,  m=>`<span class="neg">${m}</span>`)
+      .replace(/\$[\d,.]+/g,   m=>`<span class="hi">${m}</span>`)
+      .replace(/\b(\d+\.?\d*%)/g, m=>`<span class="yl">${m}</span>`);
+  }
+
+  function makeId(l){ return l.id || (l.created_at+'|'+l.message?.slice(0,30)); }
+
+  // First render: populate everything instantly (no animation)
+  if (_renderedLogIds.size === 0) {
+    _renderedLogIds.clear();
+    _logAnimDelay = 0;
+    feed.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    logs.slice().reverse().forEach(l => {
+      const id = makeId(l);
+      _renderedLogIds.add(id);
+      const tag = l.type||'sys', cls = tagMap[tag]||'sys';
+      const div = document.createElement('div');
+      div.className = 'feed-item';
+      div.style.animation = 'none'; // no animation on initial load
+      div.innerHTML = `<span class="feed-time">${new Date(l.created_at).toLocaleTimeString()}</span>`
+        + `<span class="feed-tag tag-${cls}">${tag.toUpperCase().slice(0,4)}</span>`
+        + `<span class="feed-msg">${formatMsg(l.message)}</span>`;
+      frag.appendChild(div);
+    });
+    feed.appendChild(frag);
+    return;
+  }
+
+  // Subsequent renders: only add NEW entries at top with slide-in
+  const newLogs = logs.filter(l => !_renderedLogIds.has(makeId(l)));
+  if (!newLogs.length) return;
+
+  _logAnimDelay = 0;
+  newLogs.forEach(l => {
+    const id = makeId(l);
+    _renderedLogIds.add(id);
+    const tag = l.type||'sys', cls = tagMap[tag]||'sys';
+    const div = document.createElement('div');
+    div.className = 'feed-item';
+    // Stagger animation delay so entries slide in sequentially
+    div.style.animationDelay = (_logAnimDelay * 60) + 'ms';
+    _logAnimDelay++;
+    div.innerHTML = `<span class="feed-time">${new Date(l.created_at).toLocaleTimeString()}</span>`
+      + `<span class="feed-tag tag-${cls}">${tag.toUpperCase().slice(0,4)}</span>`
+      + `<span class="feed-msg">${formatMsg(l.message)}</span>`;
+    // Prepend (newest at top)
+    feed.insertBefore(div, feed.firstChild);
+  });
+
+  // Cap DOM at 200 entries to prevent memory bloat
+  while (feed.children.length > 200) {
+    const removed = feed.lastChild;
+    if (removed) {
+      _renderedLogIds.delete(makeId({message: removed.querySelector('.feed-msg')?.textContent}));
+      feed.removeChild(removed);
+    }
+  }
 }
 
 // ═══════════════════════════════════════
@@ -2303,8 +2371,27 @@ function onModeChange(){
   const sim=gc('simEnabled'),sw=gc('swingEnabled'),sc=gc('scalpEnabled'),sh=gc('shortsEnabled'),rc=gc('recoveryEnabled');
   const upd=(id,on,cls)=>{ const e=$(id); if(!e) return; e.className='mode-chip'+(on?' '+cls:''); };
   upd('swingChip',sw,'on'); upd('scalpChip',sc,'on'); upd('shortsChip',sh,'on-red'); upd('recovChip',rc,'on'); upd('simChip',sim,'on-blue');
-  if(!sim){ eqHist=[]; stableEq=0; eqResetAt=Date.now(); let fp=0; const fi=setInterval(async()=>{ await poll(); if(++fp>=15) clearInterval(fi); },1000); }
-  else{ eqHist=[]; stableEq=0; eqResetAt=Date.now(); chartTarget=0; chartCurrent=0; chartVelocity=0; chartStream=[]; }
+
+  // Reset log cache so new mode's logs animate in fresh
+  _renderedLogIds.clear();
+  _logAnimDelay = 0;
+  lastLogTs = '';
+  lastTradeN = 0;
+
+  // Clear chart and equity history on mode switch
+  eqHist=[]; stableEq=0; eqResetAt=Date.now();
+  chartTarget=0; chartCurrent=0; chartVelocity=0; chartStream=[];
+
+  if(sim){
+    // Switched TO sim — clear live chart, show clean start
+    const feed=$('botFeed'); if(feed) feed.innerHTML='';
+    showToast('Switched to Sim mode — loading historical bars…','info');
+  } else {
+    // Switched TO live — rapid re-poll to get current state quickly
+    showToast('Switched to Live mode','');
+    let fp=0; const fi=setInterval(async()=>{ await poll(); if(++fp>=15) clearInterval(fi); },1000);
+  }
+
   saveSettings().catch(()=>{});
 }
 
