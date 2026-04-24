@@ -3702,18 +3702,16 @@ function generateSignal(sym, bars5m, bars15m) {
   const macdBull  = e8 > e21;
   const macdCross = (pe8 < pe21 && e8 > e21) || (pe8 > pe21 && e8 < e21);
   const macdAgrees = (direction === 'buy' && macdBull) || (direction === 'sell' && !macdBull);
+  let macdScore = 0; // declared here so score formula below can always reference it
   if (!macdAgrees) {
-    // MACD hard disagrees — block the signal
-    // Exception: RSI is extremely oversold (<25) or overbought (>75) — momentum
-    // extreme can override a lagging MACD in fast-moving markets
     const rsiExtreme = (direction === 'buy' && r < 25) || (direction === 'sell' && r > 75);
     if (!rsiExtreme) {
       return { signal:'HOLD', confidence:0, score:0,
-        reasons:[...reasons, `MACD disagrees with ${direction} (e8=${e8.toFixed(2)} vs e21=${e21.toFixed(2)}) — blocked`], rsi:r };
+        reasons:[...reasons, `MACD disagrees with ${direction} — blocked`], rsi:r };
     }
-    reasons.push(`MACD disagrees but RSI extreme (${r.toFixed(1)}) — allowed`);
+    reasons.push(`MACD disagrees but RSI extreme (${r.toFixed(1)}) — proceeding`);
   } else {
-    const macdScore = macdCross ? 2 : 1;
+    macdScore = macdCross ? 2 : 1;
     if (macdCross) reasons.push(`MACD crossover ${direction==='buy'?'↑':'↓'} ✅`);
     else reasons.push(`MACD aligned ✅`);
     passedGates++;
