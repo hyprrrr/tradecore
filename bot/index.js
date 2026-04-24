@@ -73,8 +73,8 @@ const CONFIG = {
   trailT2At:         0.010,  // trail 0.8% once up 1%
   trailT3At:         0.020,  // trail 1.5% once up 2%
   trailT4At:         0.040,  // trail 2.0% once up 4%
-  minConfidence:     60,
-  adaptTargetWR:     0.60,
+  minConfidence:     70,    // was 60 — don't take mediocre setups
+  adaptTargetWR:     0.75,  // was 0.60 — target 75% WR
   adaptEmergencyWR:  0.40,
   confirmCount:      1,  // 1 scan = 15s delay — fast enough for open market moves
   peakMinProfit:     0.020,  // 2% min profit before peak detection runs
@@ -105,7 +105,7 @@ const CONFIG = {
   scalpMode:           process.env.SCALP_MODE === 'true',
   shortsEnabled:       process.env.ENABLE_SHORTS === 'true',
   recoveryMode:        process.env.RECOVERY_MODE === 'true',
-  minConfidence:       +(process.env.MIN_CONFIDENCE || 60), // adaptive — auto-adjusted by learning engine
+  minConfidence:       +(process.env.MIN_CONFIDENCE || 70), // adaptive — auto-adjusted by learning engine (was 60)
   scalpSymbols:        (process.env.SCALP_SYMBOLS || 'NVDA,TSLA,MSTR,COIN,AMD,META,AAPL,SPY,QQQ').split(',').map(s => s.trim().toUpperCase()),
   scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.3)  / 100, // 0.3% TP (2x ATR)
   scalpSlPct:          +(process.env.SCALP_SL_PCT        || 0.15) / 100, // 0.15% SL (1x ATR)
@@ -355,14 +355,14 @@ const CORRELATION_GROUPS = [
 //   - Emergency mode triggers instantly if win rate drops below 40%
 // ═══════════════════════════════════════════════════════════════════
 
-const ADAPT_TARGET_WR   = CONFIG.adaptTargetWR || 0.60; // target win rate
+const ADAPT_TARGET_WR   = CONFIG.adaptTargetWR || 0.75; // target win rate (raised from 0.60)
 const ADAPT_EMERGENCY   = CONFIG.adaptEmergencyWR || 0.40; // emergency mode threshold
 const ADAPT_ALPHA       = 0.3;  // EMA weight for recent trades (higher = more reactive)
 
 const ADAPT_DEFAULTS = {
   rsiOversold:    35,
   rsiOverbought:  65,
-  minConfidence:  60,
+  minConfidence:  70,        // was 60 — adaptive default (floor also raised)
   atrStopMult:    2.0,
   maxPositionPct: 0.15,
   tp1Pct:         0.015,
@@ -374,7 +374,7 @@ const ADAPT_DEFAULTS = {
 const ADAPT_BOUNDS = {
   rsiOversold:    { min: 18, max: 45 },
   rsiOverbought:  { min: 55, max: 82 },
-  minConfidence:  { min: 45, max: 90 },
+  minConfidence:  { min: 60, max: 92 },   // was 45-90 — floor raised so engine can't slip to mediocre setups
   atrStopMult:    { min: 1.5, max: 2.5 }, // hard cap — 3.5x caused $2900 loss
   maxPositionPct: { min: 0.03, max: 0.25 },
   tp1Pct:         { min: 0.010, max: 0.030 },
@@ -823,7 +823,7 @@ function apexFilter(sig, ctx = {}) {
   if (!APEX.rules.length) return sig;
   let confBoost = 0;
   let blocked   = null;
-  let minConf   = CONFIG.minConfidence || 65;
+  let minConf   = CONFIG.minConfidence || 70;
   const hour    = new Date().getHours();
   const hourBand = hour < 10 ? 'open' : hour < 12 ? 'mid-am' : hour < 14 ? 'lunch' : hour < 16 ? 'pm' : 'after';
 
