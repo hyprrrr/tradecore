@@ -2554,7 +2554,7 @@ const simState = {
 
 // Load historical 5-minute bars for all symbols to replay
 async function loadSimBars(symbols) {
-  log('sim', `🎮 Loading 60 days of bar history for ${symbols.length} symbols…`);
+  log('sim', `🎮 Loading bar history for ${symbols.length} symbols (up to 60 trading days)…`);
   simState.bars    = {};
   simState.cursor  = 0;
   simState.loaded  = false;
@@ -2563,7 +2563,9 @@ async function loadSimBars(symbols) {
   // 60 days × 6.5 trading hours × 12 bars/hour = ~4,680 bars per symbol
   // We paginate with next_page_token until we have all bars or hit 60 days
   const end   = new Date();
-  const start = new Date(end.getTime() - 60 * 24 * 60 * 60 * 1000);
+  // Try 60 days first, fallback to 14 if Alpaca rate limits
+  const DAYS  = 60;
+  const start = new Date(end.getTime() - DAYS * 24 * 60 * 60 * 1000);
   const startStr = start.toISOString().split('.')[0] + 'Z';
   const endStr   = end.toISOString().split('.')[0] + 'Z';
 
@@ -2624,8 +2626,31 @@ async function loadSimBars(symbols) {
     if (i + 3 < symbols.length) await new Promise(r => setTimeout(r, 300));
   }
 
-  const loaded = Object.keys(simState.bars);
+  let loaded = Object.keys(simState.bars);
   log('sim', `🎮 Loaded ${loaded.length}/${symbols.length} symbols`);
+
+  // Fallback: if too few bars loaded (rate limit hit), try shorter window
+  const avgBars = loaded.length ? Object.values(simState.bars).reduce((a,b)=>a+b.length,0)/loaded.length : 0;
+  if (avgBars < 50 && DAYS > 14) {
+    log('sim', `🎮 Only got ${avgBars.toFixed(0)} avg bars — retrying with 14 days…`);
+    simState.bars = {};
+    const start14 = new Date(end.getTime() - 14 * 24 * 60 * 60 * 1000);
+    const startStr14 = start14.toISOString().split('.')[0] + 'Z';
+    for (let i = 0; i < symbols.length; i += 3) {
+      const batch = symbols.slice(i, i + 3);
+      await Promise.allSettled(batch.map(async sym => {
+        try {
+          const url = `${ALPACA_DATA_BASE}/v2/stocks/${sym}/bars?timeframe=5Min&start=${startStr14}&end=${endStr}&limit=1000&adjustment=raw&feed=${getDataFeed()}`;
+          const data = await alpacaFetch(url);
+          const bars = (data?.bars||[]).map(b=>({t:b.t,o:b.o,h:b.h,l:b.l,c:b.c,v:b.v||0})).filter(b=>b.c&&b.h&&b.l&&b.o);
+          if (bars.length >= 20) simState.bars[sym] = bars;
+        } catch(e){}
+      }));
+      if (i + 3 < symbols.length) await new Promise(r=>setTimeout(r,200));
+    }
+    loaded = Object.keys(simState.bars);
+    log('sim', `🎮 Fallback: ${loaded.length} symbols with 14-day data`);
+  }
 
   const lengths = Object.values(simState.bars).map(b => b.length);
   if (lengths.length === 0) {
