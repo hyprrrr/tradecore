@@ -180,7 +180,7 @@ async function loadRemoteConfig() {
     if (s.peak_rsi_exit)    CONFIG.peakRsiExit       = +s.peak_rsi_exit;
     if (s.fade_min_profit)  CONFIG.fadeMinProfit     = +s.fade_min_profit / 100;
     if (s.fade_pullback)    CONFIG.fadePullback      = +s.fade_pullback / 100;
-    if (s.hard_max_loss)    CONFIG.hardMaxLoss       = Math.max(0.01, +s.hard_max_loss / 100); // min 1% hard stop
+    if (s.hard_max_loss !== undefined) CONFIG.hardMaxLoss = Math.max(0.012, +s.hard_max_loss / 100); // min 1.2%
     if (s.initial_stop_pct) CONFIG.initialStopPct    = +s.initial_stop_pct / 100;
     if (s.atr_stop_mult)    CONFIG.atrStopMult       = Math.min(2.0, Math.max(1.5, +s.atr_stop_mult)); // clamp 1.5-2.0x
     if (s.discord_webhook)  CONFIG.discordWebhook   = s.discord_webhook;
@@ -2502,10 +2502,12 @@ async function syncScreenerResults(candidates) {
 
 // Build the final scan list: favorites + screener candidates, deduplicated
 function buildScanList() {
-  const favorites  = CONFIG.symbols; // always included — from dashboard watchlist
-  const discovered = screenerCandidates;
+  const favorites  = CONFIG.symbols.slice(0, 20); // max 20 watchlist symbols
+  // Only take TOP 5 screener picks (by score) — never bloat to 186 symbols
+  const discovered = screenerCandidates.slice(0, 5);
   const combined   = [...new Set([...favorites, ...discovered])];
-  return combined.filter(s => /^[A-Z]{1,5}$/.test(s)); // strip invalid symbols
+  const valid = combined.filter(s => /^[A-Z]{1,5}$/.test(s));
+  return valid.slice(0, 25); // absolute hard cap — 25 symbols max, always
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -4165,10 +4167,12 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     // So initial stop should be just wide enough to avoid normal noise
     const atrVal14  = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
     // Stop = 2× ATR below entry — wide enough to avoid noise, tight enough to limit loss
-    const atrStop   = price - (atrVal14 * 2);
-    // Hard cap: never risk more than 1.5% on initial stop
-    const capStop   = price * 0.985;
-    const stopPrice = Math.max(atrStop, capStop);
+    // Stop = min(2×ATR, hardMaxLoss%) — whichever is TIGHTER (higher price)
+    // This enforces R:R: if ATR is wide, stop still respects hardMaxLoss
+    const hardMaxPct = CONFIG.hardMaxLoss || 0.015;
+    const atrStop   = price - (atrVal14 * CONFIG.atrStopMult);
+    const capStop   = price * (1 - hardMaxPct);
+    const stopPrice = Math.max(atrStop, capStop); // higher = tighter for longs
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       // For live mode — verify Alpaca doesn't already have this position
@@ -4252,8 +4256,9 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     // SHORT — borrow shares to sell, profit if price falls
     // Stop loss ABOVE entry for shorts — 2× ATR, capped at 1.5%
     const atrVal14s = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
-    const atrStopS  = price + (atrVal14s * 2);
-    const capStopS  = price * 1.015;
+    const hardMaxPctS = CONFIG.hardMaxLoss || 0.015;
+    const atrStopS  = price + (atrVal14s * CONFIG.atrStopMult);
+    const capStopS  = price * (1 + hardMaxPctS);
     const stopPrice = Math.min(atrStopS, capStopS);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
@@ -6664,7 +6669,9 @@ async function tick() {
     // Screener every 3 minutes
     if (isMarketOpen() && (now - lastScreenerRun >= SCREENER_INTERVAL_MS)) {
       lastScreenerRun    = now;
-      screenerCandidates = await runMarketScreener();
+      const _raw = await runMarketScreener();
+      // Only keep top 5 by score — never add 186 symbols to scan list
+      screenerCandidates = Array.isArray(_raw) ? _raw.slice(0, 5) : [];
     }
 
     // Scalp scan every 5s
@@ -6744,7 +6751,7 @@ cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' 
 loadRemoteConfig().then(async () => {
   await updateDayBias();
   if (isMarketOpen()) {
-    screenerCandidates = await runMarketScreener();
+    screenerCandidates = (await runMarketScreener()).slice(0, 5);
     lastScreenerRun    = Date.now();
   }
   await prewarmData();
