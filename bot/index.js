@@ -2704,8 +2704,30 @@ async function placeOrder(symbol, qty, side) {
     method: 'POST',
     body: JSON.stringify({ symbol, qty: String(qty), side, type: 'market', time_in_force: 'day' }),
   });
-  if (data.id) { log('order', `${side.toUpperCase()} order placed: ${qty}x ${symbol} | ID: ${data.id}`); return data; }
-  throw new Error(data.message || JSON.stringify(data));
+  if (!data.id) throw new Error(data.message || JSON.stringify(data));
+  log('order', `${side.toUpperCase()} order placed: ${qty}x ${symbol} | ID: ${data.id}`);
+
+  // ── Poll for fill so we get the real fill price, not the stale bar close ──
+  // Market orders typically fill in well under 1s, but we wait up to 3s.
+  // This is CRITICAL for entryPrice accuracy — before this fix, bot stored
+  // the pre-order snapshot as entryPrice. Example: MCHP snapshot $76.01
+  // but filled at $89.14, so every P&L calc was $13/share off forever.
+  for (let i = 0; i < 15; i++) {
+    await new Promise(r => setTimeout(r, 200));
+    try {
+      const o = await alpacaFetch(`${ALPACA_BASE()}/v2/orders/${data.id}`);
+      if (o?.status === 'filled' && +o.filled_avg_price > 0) {
+        return { ...data, status: 'filled', filled_avg_price: o.filled_avg_price, filled_qty: o.filled_qty };
+      }
+      if (o?.status === 'rejected' || o?.status === 'canceled' || o?.status === 'expired') {
+        log('warn', `Order ${data.id} ${o.status}: ${o.reason || ''}`);
+        return data;
+      }
+    } catch(e) { /* keep polling */ }
+  }
+  // Didn't fill in 3s — return what we have; caller falls back to pre-order price
+  log('warn', `Order ${data.id} not filled within 3s — using pre-order price`);
+  return data;
 }
 
 // ─────────────────────────────────────────────
@@ -4529,7 +4551,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   const srLevels  = calcSRLevels(bars || []);
 
   if (direction === 'long') {
-    const finalCost = finalQty * price;
+    let finalCost = finalQty * price;
     if (finalCost > portfolio) { log('warn', `Not enough cash for ${sym}`); return; }
 
     // With immediate trailing stops, we use a tighter initial stop
@@ -4557,7 +4579,20 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
           }
         } catch(e) { /* 404 = no position, that's fine */ }
       }
-      try { await placeSmartOrder(sym, finalQty, 'buy', false); }
+      try {
+        const orderRes = await placeSmartOrder(sym, finalQty, 'buy', false);
+        // Use the actual fill price from Alpaca (falls back to pre-order
+        // price only if we couldn't confirm a fill — prior bug: always
+        // using pre-order price gave MCHP entry of $76 when it filled at $89)
+        if (orderRes?.filled_avg_price && +orderRes.filled_avg_price > 0) {
+          const fillPrice = +orderRes.filled_avg_price;
+          if (Math.abs(fillPrice - price) / price > 0.001) {
+            log('order', `${sym} fill correction: $${price.toFixed(2)} → $${fillPrice.toFixed(2)} (${((fillPrice-price)/price*100).toFixed(2)}% diff)`);
+          }
+          price = fillPrice;
+          finalCost = finalQty * price;
+        }
+      }
       catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
     }
     if (isSimMode()) portfolio -= finalCost; // live mode: Alpaca tracks cash
@@ -4632,7 +4667,16 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     const stopPrice = Math.min(atrStopS, capStopS);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
-      try { await placeSmartOrder(sym, qty, 'sell', false); } // sell to open short
+      try {
+        const orderRes = await placeSmartOrder(sym, qty, 'sell', false); // sell to open short
+        if (orderRes?.filled_avg_price && +orderRes.filled_avg_price > 0) {
+          const fillPrice = +orderRes.filled_avg_price;
+          if (Math.abs(fillPrice - price) / price > 0.001) {
+            log('order', `${sym} SHORT fill correction: $${price.toFixed(2)} → $${fillPrice.toFixed(2)}`);
+          }
+          price = fillPrice;
+        }
+      }
       catch (e) { log('error', `SHORT failed ${sym}: ${e.message}`); return; }
     }
     shortPositions[sym] = {
@@ -6047,6 +6091,22 @@ async function syncAlpacaPositions() {
       // Seed price history immediately so P&L is correct on first poll
       priceHistory5m[sym] = [curPrice];
 
+      // ── ENTRY PRICE DRIFT CORRECTION ──
+      // If we already have this position tracked but our stored entry
+      // diverges from Alpaca's avg_entry_price by more than 0.5%, trust
+      // Alpaca. This fixes pre-fix positions that were recorded with the
+      // stale pre-order snapshot price (e.g. MCHP stored at $76, actual
+      // fill $89). Also catches any future drift from partial fills.
+      const memPos = isShort ? shortPositions[sym] : positions[sym];
+      if (memPos && entryPrice > 0) {
+        const drift = Math.abs(memPos.entryPrice - entryPrice) / entryPrice;
+        if (drift > 0.005) {
+          log('acct', `🔧 ${sym} entry correction: $${memPos.entryPrice.toFixed(2)} → $${entryPrice.toFixed(2)} (${(drift*100).toFixed(2)}% drift)`);
+          memPos.entryPrice = entryPrice;
+          memPos.cost       = entryPrice * (memPos.qtyRemaining || memPos.qty);
+        }
+      }
+
       if (isShort && !shortPositions[sym]) {
         shortPositions[sym] = {
           entryPrice, qty, qtyRemaining: qty,
@@ -6514,33 +6574,47 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   // Place order
   const side = direction === 'long' ? 'buy' : 'sell';
   if (isSimMode() || (CONFIG.alpacaKey && CONFIG.mode === 'alpaca')) {
-    try { await placeOrder(sym, qty, side); }
+    try {
+      const orderRes = await placeOrder(sym, qty, side);
+      if (orderRes?.filled_avg_price && +orderRes.filled_avg_price > 0) {
+        const fillPrice = +orderRes.filled_avg_price;
+        if (Math.abs(fillPrice - price) / price > 0.001) {
+          log('scalp', `${sym} scalp fill correction: $${price.toFixed(2)} → $${fillPrice.toFixed(2)}`);
+          // Recompute SL/TP around actual fill, not stale pre-order price
+          price = fillPrice;
+        }
+      }
+    }
     catch(e) { log('error', `Scalp order failed ${sym}: ${e.message}`); return; }
   }
+  // Recompute stop/tp using corrected price (in case of slippage)
+  const stopPriceFinal = direction === 'long'  ? price - slDist : price + slDist;
+  const tpPriceFinal   = direction === 'long'  ? price + tpDist : price - tpDist;
+  const costFinal      = qty * price;
 
-  if (isSimMode()) portfolio -= direction === 'long' ? cost : 0;
+  if (isSimMode()) portfolio -= direction === 'long' ? costFinal : 0;
 
   scalpPositions[sym] = {
-    entryPrice: price, qty, cost,
+    entryPrice: price, qty, cost: costFinal,
     direction,
     entryTime:  new Date(),
     highWater:  price,
     lowWater:   price,
-    stopPrice,
-    tpPrice,
+    stopPrice:  stopPriceFinal,
+    tpPrice:    tpPriceFinal,
     atrAtEntry: atrVal,
     trailingActive: false,
     sigInfo,
   };
 
-  const slPct = ((Math.abs(price - stopPrice) / price) * 100).toFixed(2);
-  const tpPct = ((Math.abs(tpPrice - price)   / price) * 100).toFixed(2);
-  log('scalp', `⚡ ${direction.toUpperCase()} SCALP ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)}(-${slPct}%) TP=$${tpPrice.toFixed(2)}(+${tpPct}%) | conf=${sigInfo.confidence}%`);
+  const slPct = ((Math.abs(price - stopPriceFinal) / price) * 100).toFixed(2);
+  const tpPct = ((Math.abs(tpPriceFinal - price)   / price) * 100).toFixed(2);
+  log('scalp', `⚡ ${direction.toUpperCase()} SCALP ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPriceFinal.toFixed(2)}(-${slPct}%) TP=$${tpPriceFinal.toFixed(2)}(+${tpPct}%) | conf=${sigInfo.confidence}%`);
 
   trades.push({ time: new Date(), sym, side: direction === 'long' ? 'SCALP_BUY' : 'SCALP_SHORT', qty, price, pnl: null, reason: 'SCALP', confidence: sigInfo.confidence });
   await syncTrade({ sym, side: direction === 'long' ? 'SCALP_BUY' : 'SCALP_SHORT', qty, price, pnl: null, reason: 'SCALP', confidence: sigInfo.confidence });
-  await sendDiscordAlert('scalp_entry', sym, qty, price, undefined, direction, sigInfo, { stopPrice, tpPrice, atrVal });
-  await syncLog('buy', `⚡ SCALP ${direction.toUpperCase()} ${qty}x ${sym} @ $${price.toFixed(2)} SL=$${stopPrice.toFixed(2)} TP=$${tpPrice.toFixed(2)} conf=${sigInfo.confidence}%`);
+  await sendDiscordAlert('scalp_entry', sym, qty, price, undefined, direction, sigInfo, { stopPrice: stopPriceFinal, tpPrice: tpPriceFinal, atrVal });
+  await syncLog('buy', `⚡ SCALP ${direction.toUpperCase()} ${qty}x ${sym} @ $${price.toFixed(2)} SL=$${stopPriceFinal.toFixed(2)} TP=$${tpPriceFinal.toFixed(2)} conf=${sigInfo.confidence}%`);
 }
 
 /**
