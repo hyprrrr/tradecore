@@ -1433,8 +1433,10 @@ let _chartCache = { minV:0, maxV:0, tStart:0, pts:[], color:'#00d4aa', cap:0 };
 
 function renderChart(){
   const cv=$('equityChart'); if(!cv||!chartCtx) return;
-  const W=cv.parentElement.offsetWidth, H=cv.parentElement.offsetHeight;
-  if(W<=0||H<=0) return;
+  // offsetWidth can be 0 when panel is partially hidden — use clientWidth fallback
+  const W=cv.parentElement.offsetWidth||cv.parentElement.clientWidth||cv.getBoundingClientRect().width||800;
+  const H=cv.parentElement.offsetHeight||cv.parentElement.clientHeight||cv.getBoundingClientRect().height||300;
+  if(W<50||H<50) return; // genuinely too small — skip
   if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; _chartCache.pts=[]; }
 
   const now=Date.now(), ctx=chartCtx, cap=getStartingCapital();
