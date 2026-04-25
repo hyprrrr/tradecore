@@ -1267,30 +1267,28 @@ async function fetchSettings() {
 }
 
 async function fetchBotStatus() {
-  // Primary: check Supabase portfolio - this is our real connectivity indicator
-  const tbl = state.mode === 'sim' ? 'sim_tc_portfolio' : 'tc_portfolio';
-  const portData = await sbFetch(`${tbl}?id=eq.1&select=*`, 'GET');
-  if (portData && portData[0]) {
-    state.connected = true;
-  } else if (CONFIG.sbUrl && CONFIG.sbKey) {
-    // Supabase creds set but fetch failed - still try
-    state.connected = false;
-  }
-
-  // sim_mode toggle still lives in tc_settings — read just that
+  // STEP 1: determine mode FIRST — reading portfolio from the wrong table
+  // (live vs sim) means the dashboard shows stale $100k forever when bot
+  // is actually running sim. Previously mode was read AFTER the portfolio
+  // fetch, causing a one-cycle lag / permanent mismatch on first load.
   const settingsData = await sbFetch('tc_settings?id=eq.1&select=sim_mode', 'GET');
   if (settingsData && settingsData[0]) {
     const s = settingsData[0];
     const simOn = !!s.sim_mode;
     state.mode = simOn ? 'sim' : 'alpaca';
-
-    // Update mode pill and sim button
     $('modeText').textContent = simOn ? 'SIM' : 'LIVE';
     $('modeDot').className    = 'status-dot ' + (simOn ? 'paused' : 'live');
     $('simBtn').textContent   = simOn ? 'Exit Sim' : 'Enter Sim';
-
-    // Sync settings tab toggle
     if ($('setSim')) $('setSim').checked = simOn;
+  }
+
+  // STEP 2: now read portfolio from the correct table
+  const tbl = state.mode === 'sim' ? 'sim_tc_portfolio' : 'tc_portfolio';
+  const portData = await sbFetch(`${tbl}?id=eq.1&select=*`, 'GET');
+  if (portData && portData[0]) {
+    state.connected = true;
+  } else if (CONFIG.sbUrl && CONFIG.sbKey) {
+    state.connected = false;
   }
 
   // Wins/losses live in tc_portfolio (the bot actually writes them there).
@@ -1396,10 +1394,12 @@ function startTieredPollers() {
 
   pollTimers.fast = setInterval(async () => {
     if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
-    // Fire most in parallel, but chain portfolio → equity so the chart's
-    // live tail reads the just-updated portfolio.total_value instead of the
-    // one from the previous tick (which caused visible lag).
-    fetchBotStatus();
+    // Await fetchBotStatus first — it sets state.mode (sim vs live) which
+    // downstream fetches use to pick the right table (sim_tc_* vs tc_*).
+    // Firing it without await meant mode could lag behind for one cycle,
+    // so dashboard read tc_portfolio while bot wrote sim_tc_portfolio
+    // → equity stuck at $100k, wins stuck at 0.
+    await fetchBotStatus();
     fetchPositions();
     fetchTrades();
     fetchLogs();
