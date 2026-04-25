@@ -1257,23 +1257,12 @@ async function fetchSettings() {
     $('modeDot').className    = 'status-dot ' + (simOn ? 'paused' : 'live');
     $('simBtn').textContent   = simOn ? 'Exit Sim' : 'Enter Sim';
 
-    // Session pill from settings
+    // Session pill from settings (if present)
     if (s.session && $('sessionPill')) $('sessionPill').textContent = s.session;
 
-    // Win/loss from settings
-    const tw = s.total_wins   || 0;
-    const tl = s.total_losses || 0;
-    if ($('mainWL'))     $('mainWL').textContent     = tw + 'W / ' + tl + 'L';
-    if ($('statWinLoss')) $('statWinLoss').textContent = tw + 'W / ' + tl + 'L';
-    const wr = tw+tl > 0 ? (tw/(tw+tl)*100).toFixed(1) : '0.0';
-    if ($('statWinRate')) {
-      $('statWinRate').textContent = wr + '%';
-      $('statWinRate').style.color = +wr >= 50 ? 'var(--buy)' : 'var(--sell)';
-    }
-    const sw = s.scalp_wins   || 0;
-    const sl = s.scalp_losses || 0;
-    if ($('statScalpWL'))  $('statScalpWL').textContent  = sw + ' / ' + sl;
-    if ($('statScalpRate')) $('statScalpRate').textContent = (sw+sl > 0 ? (sw/(sw+sl)*100).toFixed(1) : '0.0') + '% WR';
+    // Note: wins/losses are NOT read from tc_settings — they come from
+    // tc_portfolio via fetchBotStatus(). The bot writes them to portfolio,
+    // not settings, so reading them here would always show stale 0/0.
   }
 }
 
@@ -1288,8 +1277,8 @@ async function fetchBotStatus() {
     state.connected = false;
   }
 
-  // Also read sim_mode from settings to keep mode in sync
-  const settingsData = await sbFetch('tc_settings?id=eq.1&select=sim_mode,session,total_wins,total_losses,scalp_wins,scalp_losses,uptime_min,open_positions,short_positions,scalp_positions', 'GET');
+  // sim_mode toggle still lives in tc_settings — read just that
+  const settingsData = await sbFetch('tc_settings?id=eq.1&select=sim_mode', 'GET');
   if (settingsData && settingsData[0]) {
     const s = settingsData[0];
     const simOn = !!s.sim_mode;
@@ -1302,6 +1291,26 @@ async function fetchBotStatus() {
 
     // Sync settings tab toggle
     if ($('setSim')) $('setSim').checked = simOn;
+  }
+
+  // Wins/losses live in tc_portfolio (the bot actually writes them there).
+  // Previously dashboard pulled them from tc_settings, where they were
+  // never written → WR + Scalp W/L cards stuck at 0/0.
+  if (portData && portData[0]) {
+    const p = portData[0];
+    const tw = p.total_wins   || 0;
+    const tl = p.total_losses || 0;
+    if ($('mainWL'))     $('mainWL').textContent     = tw + 'W / ' + tl + 'L';
+    if ($('statWinLoss')) $('statWinLoss').textContent = tw + 'W / ' + tl + 'L';
+    const wr = tw+tl > 0 ? (tw/(tw+tl)*100).toFixed(1) : '0.0';
+    if ($('statWinRate')) {
+      $('statWinRate').textContent = wr + '%';
+      $('statWinRate').style.color = +wr >= 50 ? 'var(--buy)' : 'var(--sell)';
+    }
+    const sw = p.scalp_wins   || 0;
+    const sl = p.scalp_losses || 0;
+    if ($('statScalpWL'))  $('statScalpWL').textContent  = sw + ' / ' + sl;
+    if ($('statScalpRate')) $('statScalpRate').textContent = (sw+sl > 0 ? (sw/(sw+sl)*100).toFixed(1) : '0.0') + '% WR';
   }
 
   // Secondary: try Railway bot for richer status (optional - won't block)
