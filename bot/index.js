@@ -7282,7 +7282,7 @@ const FULL_SCAN_INTERVAL_MS = Math.max(
   10000 // never faster than 10s
 );
 const PRICE_SYNC_INTERVAL_MS      = 8000;          // price updates every 8s
-const EQUITY_SNAPSHOT_INTERVAL_MS = 30 * 1000;     // equity curve point every 30s (was 90s) — better 5M/15M candle density
+const EQUITY_SNAPSHOT_INTERVAL_MS = 5 * 1000;      // equity curve point every 5s — TradingView-like update density
 let lastEquitySnapshot = 0;
 
 log('sys', `Full scan every ${FULL_SCAN_INTERVAL_MS/1000}s | Price sync every ${PRICE_SYNC_INTERVAL_MS/1000}s`);
