@@ -295,14 +295,23 @@ async function loadRemoteConfig() {
           simState.loaded  = false;
           simState.cursor  = 0;
           simState.bars    = {};
+          // Reset cycle counters so a fresh sim doesn't show "CYCLE 5" right away
+          simState._loopCount = 0;
+          simState._loopSummaryLogged = false;
+          // Clear adaptive stats too — fresh sim = fresh learning
+          for (const k of Object.keys(symbolStats)) delete symbolStats[k];
+          lastEquitySnapshot = 0;
+          _lastForceEquityMs = 0;
 
           // Wipe sim Supabase tables so dashboard shows clean state
           await sbFetch('sim_tc_positions?symbol=neq.____NONE____', 'DELETE').catch(()=>{});
           await sbFetch('sim_tc_trades?id=gt.0', 'DELETE').catch(()=>{});
           await sbFetch('sim_tc_logs?id=gt.0', 'DELETE').catch(()=>{});
+          await sbFetch('sim_tc_equity?id=gt.0', 'DELETE').catch(()=>{}); // chart history
           await sbFetch('sim_tc_portfolio?id=eq.1', 'PATCH', {
             cash: CONFIG.startingCapital, total_value: CONFIG.startingCapital,
             day_pnl: 0, total_wins: 0, total_losses: 0,
+            scalp_wins: 0, scalp_losses: 0,
             circuit_breaker: false, session: '🎮 SIM LOADING…',
             updated_at: new Date().toISOString(),
           }).catch(()=>{});
