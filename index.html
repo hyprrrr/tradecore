@@ -1410,11 +1410,15 @@ async function fetchAll() {
 //   medium → trades, equity
 //   slow   → settings
 
-const pollTimers = { fast: null, medium: null, slow: null };
+const pollTimers = { fast: null, medium: null, slow: null, liveTick: null };
 const POLL_INTERVALS = {
   fast:   { healthy: 2000, degraded: 1000 },
   medium: { healthy: 5000, degraded: 3000 },
   slow:   30000,
+  // liveTick updates the "current" candle from state.portfolio in-memory —
+  // no Supabase fetch needed. This gives TradingView-smooth animation of
+  // the right-most candle between the slower fetchEquity polls.
+  liveTick: 500,
 };
 let realtimeChannel = null;
 let realtimeHealthy = false;
@@ -1455,6 +1459,17 @@ function startTieredPollers() {
     if (!CONFIG.sbUrl || !CONFIG.sbKey) return;
     fetchSettings();
   }, POLL_INTERVALS.slow);
+
+  // ── LIVE TICK ── (500ms)
+  // Between the 2-5s data polls, keep the right-most candle animating in
+  // real time from state.portfolio.total_value. No Supabase fetch needed —
+  // just update the last candle's high/low/close in place and repaint.
+  // This is what gives TradingView its "live breathing" feel.
+  pollTimers.liveTick = setInterval(() => {
+    if (!state.portfolio || !state.equitySnapshots?.length) return;
+    if (chart.isDragging) return; // don't animate while user is panning
+    tickLiveCandle();
+  }, POLL_INTERVALS.liveTick);
 }
 
 // ── Supabase Realtime via raw WebSocket (no SDK needed) ──────────────────────
@@ -2047,6 +2062,62 @@ const chart = {
 };
 
 // Rebuild candles at a given timeframe from raw snapshots
+// ── LIVE CANDLE TICK ─────────────────────────────────────────────
+// Updates the current (right-most) candle in place using the latest
+// portfolio.total_value, then repaints. No Supabase round-trip.
+//
+// Logic per tick:
+//   1. Find which bucket "now" falls into at the active timeframe.
+//   2. If the last candle's time matches → extend it (update close, high, low).
+//   3. If we've crossed into a new bucket → start a fresh candle with
+//      open = prior close, then extend. This is exactly how TradingView
+//      rolls forward at bucket boundaries.
+//   4. Keep the user's viewport stable: if they were pinned to the right
+//      edge, slide with the new candle; otherwise don't touch the view.
+function tickLiveCandle() {
+  const v = state.portfolio ? +state.portfolio.total_value : null;
+  if (!Number.isFinite(v) || v <= 0) return;
+  if (!chart.allCandles?.length) return;
+
+  const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
+  const bucketMs = msMap[chart.tf] || 3600e3;
+  const now   = Date.now();
+  const key   = Math.floor(now / bucketMs) * bucketMs;
+
+  const last      = chart.allCandles[chart.allCandles.length - 1];
+  const lastKey   = last.time instanceof Date ? last.time.getTime() : +last.time;
+  const wasAtEdge = (chart.viewStart + chart.viewCount >= chart.allCandles.length - 1);
+
+  if (key === lastKey) {
+    // Same bucket — extend the current candle in place
+    if (v === last.close) return; // nothing changed, skip render
+    last.close = v;
+    if (v > last.high) last.high = v;
+    if (v < last.low)  last.low  = v;
+  } else if (key > lastKey) {
+    // Crossed a bucket boundary — start a new candle
+    const openPrice = last.close;
+    chart.allCandles.push({
+      time:   new Date(key),
+      open:   openPrice,
+      high:   Math.max(openPrice, v),
+      low:    Math.min(openPrice, v),
+      close:  v,
+      volume: 1,
+      live:   true,
+    });
+    // If user was tracking the right edge, slide viewport with the new candle
+    if (wasAtEdge) {
+      chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
+    }
+  } else {
+    // key < lastKey → clock skew, ignore
+    return;
+  }
+
+  redrawChart();
+}
+
 function buildCandlesForTF(snapshots, tf) {
   if (!snapshots || !snapshots.length) return [];
 
