@@ -2361,8 +2361,10 @@ function _scheduleSymbolStatsSync() {
     if (!_symbolStatsDirty) return;
     _symbolStatsDirty = false;
     try {
-      await sbFetch(tbl('tc_settings')+'?id=eq.1', 'PATCH', {
-        symbol_stats: symbolStats,  // stored as JSONB
+      // Always tc_settings (no sim_tc_settings table exists). Symbol stats
+      // are global learning data — same data benefits live + sim equally.
+      await sbFetch('tc_settings?id=eq.1', 'PATCH', {
+        symbol_stats: symbolStats,
         updated_at: new Date().toISOString(),
       });
     } catch(e) { /* non-critical */ }
@@ -2373,7 +2375,7 @@ function _scheduleSymbolStatsSync() {
 // Without this, a crash/redeploy reset SLV's loss streak → trades 3-9 all fired.
 async function loadSymbolStats() {
   try {
-    const data = await sbFetch(tbl('tc_settings')+'?id=eq.1&select=symbol_stats', 'GET');
+    const data = await sbFetch('tc_settings?id=eq.1&select=symbol_stats', 'GET');
     const row = Array.isArray(data) ? data[0] : data;
     if (row?.symbol_stats && typeof row.symbol_stats === 'object') {
       Object.assign(symbolStats, row.symbol_stats);
@@ -3141,6 +3143,21 @@ async function runSimScan() {
       updated_at:      new Date().toISOString(),
     }),
   ]);
+
+  // ── EQUITY SNAPSHOT for chart ──
+  // Sim scan was writing tc_portfolio every cycle but NOT tc_equity, so the
+  // dashboard chart had no historical data to bucket into candles → just one
+  // giant green candle for the whole sim. Write a fresh tc_equity row each
+  // sim cycle (every 5 bars / ~3s) timestamped to wall-clock now() so the
+  // dashboard's bucket-by-real-time logic forms candles correctly.
+  const nowMs = Date.now();
+  if (equity > 0 && (nowMs - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
+    lastEquitySnapshot = nowMs;
+    sbFetch(tbl('tc_equity'), 'POST', {
+      value: +equity.toFixed(2),
+      created_at: new Date().toISOString(),
+    }).catch(()=>{});
+  }
   // Log async — don't block the next bar
   syncLog('sim', `🎮 SIM bar ${simState.cursor}/${simState.totalBars} | Equity=$${equity.toFixed(2)} P&L=${dayPnl>=0?'+':''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`).catch(()=>{});
 }
