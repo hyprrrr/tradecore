@@ -2385,6 +2385,25 @@ async function loadSymbolStats() {
   } catch(e) { /* first run, table may not have column yet */ }
 }
 
+// ── EQUITY SNAPSHOT helper ──
+// Pushes a tc_equity / sim_tc_equity row immediately. Used after every trade
+// close so the chart sees discrete P&L jumps in real time, not waiting for
+// the next 5s tick. Idempotent — Supabase will accept duplicate timestamps;
+// extra rows just give the chart finer granularity.
+let _lastForceEquityMs = 0;
+function pushEquitySnapshot(equity) {
+  if (!Number.isFinite(equity) || equity <= 0) return;
+  const now = Date.now();
+  // Throttle to at most one push per 1s to avoid spamming during rapid exits
+  if (now - _lastForceEquityMs < 1000) return;
+  _lastForceEquityMs = now;
+  lastEquitySnapshot = now; // also resets the regular interval guard
+  sbFetch(tbl('tc_equity'), 'POST', {
+    value: +equity.toFixed(2),
+    created_at: new Date().toISOString(),
+  }).catch(()=>{});
+}
+
 function recordSymbolOutcome(sym, pnl, direction = null) {
   if (!symbolStats[sym]) symbolStats[sym] = { lossStreak: 0, winStreak: 0, totalPnl: 0, benchedUntil: 0,
                                                 longWins: 0, longLosses: 0, shortWins: 0, shortLosses: 0 };
@@ -2412,6 +2431,13 @@ function recordSymbolOutcome(sym, pnl, direction = null) {
     log('risk', `⛔ BENCH ${sym} for ${hours}h — ${s.lossStreak} losses, cum P&L $${s.totalPnl.toFixed(0)}`);
   }
   _scheduleSymbolStatsSync();
+
+  // ── Force an equity snapshot on every trade close ──
+  // Without this, chart updates are bound to the 5s interval — meaning a
+  // burst of 4 trades closing inside one 5s window only registers one
+  // candle update. Pushing on each close gives the chart a real datapoint
+  // for each P&L event (throttled to 1/sec internally).
+  if (realEquity > 0) pushEquitySnapshot(realEquity);
 }
 
 // Returns 'long' if the symbol has historically performed better long, 'short' if
