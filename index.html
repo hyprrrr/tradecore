@@ -1313,31 +1313,32 @@ async function fetchBotStatus() {
     if ($('statScalpRate')) $('statScalpRate').textContent = (sw+sl > 0 ? (sw/(sw+sl)*100).toFixed(1) : '0.0') + '% WR';
   }
 
-  // Secondary: try Railway bot for richer status (optional - won't block)
-  if (CONFIG.botUrl) {
+  // Secondary: try Railway bot for richer status (optional - won't block).
+  // In sim mode, skip the bot's HTTP endpoint — it returns LIVE stats
+  // which would overwrite the sim portfolio data we just rendered (sim
+  // and live keep separate W/L counters).
+  if (CONFIG.botUrl && state.mode !== 'sim') {
     const status = await botFetch('/');
     if (status) {
       updateBotStatus(status);
       state.connected = true; // bot alive = definitely connected
     }
-  } else {
-    // Build status from portfolio+settings data
-    if (portData && portData[0]) {
-      const p = portData[0];
-      const synth = {
-        mode:             state.mode,
-        session:          p.session || '--',
-        wins:             p.total_wins    || 0,
-        losses:           p.total_losses  || 0,
-        scalp_wins:       p.scalp_wins    || 0,
-        scalp_losses:     p.scalp_losses  || 0,
-        uptime_min:       p.uptime_min    || 0,
-        open_positions:   p.open_positions   || 0,
-        short_positions:  p.short_positions  || 0,
-        scalp_positions:  p.scalp_positions  || 0,
-      };
-      updateBotStatus(synth);
-    }
+  } else if (portData && portData[0]) {
+    // Build status from portfolio data
+    const p = portData[0];
+    const synth = {
+      mode:             state.mode,
+      session:          p.session || '--',
+      wins:             p.total_wins    || 0,
+      losses:           p.total_losses  || 0,
+      scalp_wins:       p.scalp_wins    || 0,
+      scalp_losses:     p.scalp_losses  || 0,
+      uptime_min:       p.uptime_min    || 0,
+      open_positions:   p.open_positions   || 0,
+      short_positions:  p.short_positions  || 0,
+      scalp_positions:  p.scalp_positions  || 0,
+    };
+    updateBotStatus(synth);
   }
 
   updateConnStatus();
