@@ -2548,6 +2548,12 @@ function isPreMarket() {
  */
 function shouldScanSymbol(symbol) {
   if (BYPASS_HOURS) return true; // testing mode — scan everything
+  // SIM MODE: replay historical bars regardless of wall-clock market hours.
+  // Without this, sim silently stops at 4pm ET (when isMarketOpen() flips
+  // false) even though the historical replay has plenty of trading bars
+  // left. User reported: "still having the sim not taking trades issue"
+  // after several hours — was actually wall clock past US close.
+  if (isSimMode()) return true;
   if (!isWeekday()) return false;
   const isIntlETF = !!ETF_SESSIONS[symbol];
   if (!isIntlETF) {
@@ -5911,7 +5917,9 @@ async function runScan() {
   lastScanTime = new Date();
   const session = getCurrentSession();
 
-  if (!isWeekday()) {
+  // Sim runs regardless of weekend (replay continues on its own historical
+  // calendar). Live mode still bails on weekends — markets are closed.
+  if (!isSimMode() && !isWeekday()) {
     log('scan', 'Weekend — markets closed globally');
     return;
   }
@@ -6640,7 +6648,7 @@ function generateScalpSignal(sym, bars1m) {
  */
 async function enterScalp(sym, price, sigInfo, direction = 'long') {
   if (checkCircuitBreaker()) return;
-  if (!isMarketOpen()) { log('scalp', `Scalp blocked — market closed`); return; }
+  if (!isSimMode() && !isMarketOpen()) { log('scalp', `Scalp blocked — market closed`); return; }
   if (scalpPositions[sym]) { log('scalp', `Already in scalp position for ${sym}`); return; }
   if (isSymbolBenched(sym)) {
     log('scalp', `⛔ Scalp blocked ${sym} — benched`);
@@ -7016,14 +7024,17 @@ async function manageScalpPositions() {
  */
 async function runScalpScan() {
   if (!CONFIG.scalpMode) return;
-  if (!isMarketOpen()) return;
+  if (!isSimMode() && !isMarketOpen()) return;
   if (checkCircuitBreaker()) return;
 
   // Don't scalp during off-hours — 1m bars have no liquidity for US stocks
-  // Scalping needs real price discovery, not pre/after-market noise
-  const sess = getCurrentSession();
-  if (sess.includes('Off') || sess.includes('Pre') || sess.includes('Asia')) {
-    return; // no scalping outside US market hours
+  // Scalping needs real price discovery, not pre/after-market noise.
+  // Sim is replaying historical market hours, so this gate doesn't apply.
+  if (!isSimMode()) {
+    const sess = getCurrentSession();
+    if (sess.includes('Off') || sess.includes('Pre') || sess.includes('Asia')) {
+      return; // no scalping outside US market hours
+    }
   }
 
   // First manage existing positions (most important)
