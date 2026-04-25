@@ -1165,9 +1165,22 @@ async function sbFetch(path, method='GET', body=null) {
   }
 }
 
+// Normalize CONFIG.botUrl → a usable origin with scheme
+function botBase() {
+  if (!CONFIG.botUrl) return '';
+  let b = CONFIG.botUrl.trim().replace(/\/$/, '');
+  if (!/^https?:\/\//i.test(b)) b = 'https://' + b;
+  return b;
+}
+
 async function botFetch(path) {
   if (!CONFIG.botUrl) return null;
-  const url = `${CONFIG.botUrl.replace(/\/$/,'')}${path}`;
+  // Auto-prefix https:// if the user entered the Railway host without scheme.
+  // Without this, fetch() treats "tradecore.up.railway.app" as a relative URL
+  // and returns 404 silently → dashboard thinks bot is unreachable.
+  let base = CONFIG.botUrl.trim().replace(/\/$/, '');
+  if (!/^https?:\/\//i.test(base)) base = 'https://' + base;
+  const url = `${base}${path}`;
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
@@ -1567,7 +1580,7 @@ async function toggleSimMode() {
 async function resetCircuit() {
   if (!CONFIG.botUrl) return;
   try {
-    const res = await fetch(`${CONFIG.botUrl.replace(/\/$/,'')}/reset-cb`);
+    const res = await fetch(`${botBase()}/reset-cb`);
     const data = await res.json();
     addLog('info', data.message || 'Circuit breaker reset');
     fetchBotStatus();
@@ -1583,7 +1596,7 @@ async function exitAll() {
   }
 
   try {
-    const r = await fetch(`${CONFIG.botUrl.replace(/\/$/,'')}/exit-all`);
+    const r = await fetch(`${botBase()}/exit-all`);
     const data = await r.json().catch(() => ({}));
     if (data.ok) {
       if (data.closed > 0) {
@@ -1642,7 +1655,7 @@ async function exportDiagnostics() {
 
   // ── Bot-side diagnostics ──
   if (CONFIG.botUrl) {
-    const bot = CONFIG.botUrl.replace(/\/$/, '');
+    const bot = botBase();
     try {
       const r = await fetch(`${bot}/diagnostic`, { cache: 'no-store' });
       bundle.bot_diagnostic = await r.json().catch(() => ({ error: 'parse failed' }));
@@ -1719,6 +1732,23 @@ function updatePortfolioUI(p) {
   $('statTotalPnL').style.color = (p.total_value - (p.starting_capital||100000)) >= 0 ? 'var(--buy)' : 'var(--sell)';
   $('statCircuit').textContent = p.circuit_breaker ? 'TRIPPED' : 'OFF';
   $('statCircuit').style.color = p.circuit_breaker ? 'var(--sell)' : 'var(--buy)';
+
+  // ── Win/Loss + Scalp stats — pushed here too so portfolio poll keeps
+  // them fresh even when fetchBotStatus is racing or an upstream call
+  // overwrites the DOM mid-cycle.
+  const tw = p.total_wins   || 0;
+  const tl = p.total_losses || 0;
+  if ($('mainWL'))      $('mainWL').textContent      = tw + 'W / ' + tl + 'L';
+  if ($('statWinLoss')) $('statWinLoss').textContent = tw + 'W / ' + tl + 'L';
+  const wr = tw+tl > 0 ? (tw/(tw+tl)*100).toFixed(1) : '0.0';
+  if ($('statWinRate')) {
+    $('statWinRate').textContent = wr + '%';
+    $('statWinRate').style.color = +wr >= 50 ? 'var(--buy)' : 'var(--sell)';
+  }
+  const sw = p.scalp_wins   || 0;
+  const sl = p.scalp_losses || 0;
+  if ($('statScalpWL'))   $('statScalpWL').textContent   = sw + ' / ' + sl;
+  if ($('statScalpRate')) $('statScalpRate').textContent = (sw+sl > 0 ? (sw/(sw+sl)*100).toFixed(1) : '0.0') + '% WR';
 
   // Recovery state — three distinct states:
   //   OFF:   recovery mode disabled in config
