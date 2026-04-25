@@ -1703,6 +1703,7 @@ async function exportDiagnostics() {
       pull('tc_logs?select=*&order=created_at.desc&limit=100',         'tc_logs_recent'),
       pull('sim_tc_logs?select=*&order=created_at.desc&limit=100',     'sim_tc_logs_recent'),
       pull('tc_equity?select=*&order=created_at.desc&limit=50',        'tc_equity_recent'),
+      pull('sim_tc_equity?select=*&order=created_at.desc&limit=50',    'sim_tc_equity_recent'),
     ]);
   } else {
     bundle.supabase = { error: 'no Supabase credentials configured' };
