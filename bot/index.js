@@ -1552,7 +1552,7 @@ async function exitPositionTrade(sym, price, reason) {
   await placeOrder(sym,pos.qty,'sell');
   portfolio += pos.qty*price;
   delete positionTrades[sym];
-  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl, 'long');
   log('position',`${pnl>0?"✅":"🛑"} PT EXIT ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?"+":""}$${pnl.toFixed(2)} (${reason})`);
   await syncTrade({sym,side:'PT_SELL',qty:pos.qty,price,pnl,reason});
   await syncLog('position',`${pnl>0?"✅":"🛑"} Position Trade Closed: ${sym} P&L=${pnl>=0?"+":""}$${pnl.toFixed(2)} (${reason})`);
@@ -1710,6 +1710,8 @@ async function syncPortfolio() {
     day_pnl:          +dayPnl.toFixed(2),
     total_wins:       totalWins,
     total_losses:     totalLosses,
+    scalp_wins:       scalpWins,
+    scalp_losses:     scalpLosses,
     circuit_breaker:  circuitBreakerOn,
     last_scan:        new Date().toISOString(),
     session:          getCurrentSession(),
@@ -2380,12 +2382,23 @@ async function loadSymbolStats() {
   } catch(e) { /* first run, table may not have column yet */ }
 }
 
-function recordSymbolOutcome(sym, pnl) {
-  if (!symbolStats[sym]) symbolStats[sym] = { lossStreak: 0, winStreak: 0, totalPnl: 0, benchedUntil: 0 };
+function recordSymbolOutcome(sym, pnl, direction = null) {
+  if (!symbolStats[sym]) symbolStats[sym] = { lossStreak: 0, winStreak: 0, totalPnl: 0, benchedUntil: 0,
+                                                longWins: 0, longLosses: 0, shortWins: 0, shortLosses: 0 };
   const s = symbolStats[sym];
+  // Backfill new fields on existing entries (older persisted rows won't have them)
+  if (s.longWins === undefined)  s.longWins = s.longLosses = s.shortWins = s.shortLosses = 0;
+
   s.totalPnl += pnl;
   if (pnl > 0) { s.winStreak += 1; s.lossStreak = 0; }
   else if (pnl < 0) { s.lossStreak += 1; s.winStreak = 0; }
+
+  // Directional bias — track long vs short outcomes separately so the bot
+  // can learn that e.g. SLV consistently fails on longs but might work on
+  // shorts (CSV showed SLV 0/9 on longs — never tried shorts).
+  if (direction === 'long')  { pnl > 0 ? s.longWins++  : s.longLosses++;  }
+  if (direction === 'short') { pnl > 0 ? s.shortWins++ : s.shortLosses++; }
+
   // Bench triggers:
   //   - 3 losses in a row on the symbol, OR
   //   - cumulative losses on symbol exceed 2% of starting capital
@@ -2396,6 +2409,27 @@ function recordSymbolOutcome(sym, pnl) {
     log('risk', `⛔ BENCH ${sym} for ${hours}h — ${s.lossStreak} losses, cum P&L $${s.totalPnl.toFixed(0)}`);
   }
   _scheduleSymbolStatsSync();
+}
+
+// Returns 'long' if the symbol has historically performed better long, 'short' if
+// the opposite, or null if the data is too thin to bias on.
+function preferredDirection(sym) {
+  const s = symbolStats[sym];
+  if (!s) return null;
+  const longTotal  = (s.longWins || 0) + (s.longLosses || 0);
+  const shortTotal = (s.shortWins || 0) + (s.shortLosses || 0);
+  // Need at least 4 trades in a direction to draw a conclusion
+  if (longTotal < 4 && shortTotal < 4) return null;
+  const longWR  = longTotal  >= 4 ? s.longWins  / longTotal  : null;
+  const shortWR = shortTotal >= 4 ? s.shortWins / shortTotal : null;
+  if (longWR != null && shortWR != null) {
+    if (longWR  >= 0.5 && longWR  > shortWR + 0.15) return 'long';
+    if (shortWR >= 0.5 && shortWR > longWR + 0.15)  return 'short';
+    return null;
+  }
+  if (longWR != null  && longWR  < 0.30) return 'short'; // longs failing — try shorts
+  if (shortWR != null && shortWR < 0.30) return 'long';  // shorts failing — try longs
+  return null;
 }
 function isSymbolBenched(sym) {
   const s = symbolStats[sym];
@@ -2967,7 +3001,7 @@ async function runSimScan() {
 
   // Load bars on first run
   if (!simState.loaded) {
-    const symbols = buildScanList().slice(0, 20); // limit to 20 in sim for speed
+    const symbols = buildScanList().slice(0, 50); // 50 in sim — broader universe, still fast
     const ok = await loadSimBars(symbols);
     if (!ok) return;
     // Reset portfolio for fresh sim
@@ -3082,6 +3116,8 @@ async function runSimScan() {
       day_pnl:         +dayPnl.toFixed(2),
       total_wins:      totalWins,
       total_losses:    totalLosses,
+      scalp_wins:      scalpWins,
+      scalp_losses:    scalpLosses,
       circuit_breaker: circuitBreakerOn,
       last_scan:       new Date().toISOString(),
       session:         `🎮 SIM [${barTime?.slice(11,16)||'?'}]`,
@@ -4440,6 +4476,15 @@ async function edgeGate(sym, direction, sigInfo, bars5m) {
     }
   }
 
+  // ── 4b. DIRECTIONAL BIAS ──
+  // If history clearly favors the opposite direction, block. This is the
+  // "learn from drawdown" piece: if longs on this symbol immediately spike
+  // down 80% of the time, the bot stops taking longs and waits for shorts.
+  const preferred = preferredDirection(sym);
+  if (preferred && preferred !== direction) {
+    return { pass: false, reason: `${sym} historically favors ${preferred} (taking ${direction} blocked)` };
+  }
+
   // ── 5. NO LATE-DAY ENTRIES ──
   // Last 30min of US session (3:30-4:00 PM ET) has bad entry dynamics:
   // MOC order flow, liquidity drying, positions that can't complete thesis.
@@ -4730,7 +4775,7 @@ async function coverShort(sym, price, reason) {
   // Short P&L = (entry - exit) × qty (profit when price drops)
   const pnl = (pos.entryPrice - price) * qty;
   if (isSimMode()) portfolio += pnl; // only track in sim — live uses Alpaca
-  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl, 'short');
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50,
     atrPct: pos?.atrAtEntry ? pos.atrAtEntry/price : 0,
     session: getCurrentSession(), side: 'short', sym, exitReason: reason,
@@ -4873,7 +4918,7 @@ async function coverPartialShort(sym, price, qty, reason) {
   const pnl = (pos.entryPrice - price) * qty;
   portfolio += pnl;
   shortPositions[sym].qtyRemaining -= qty;
-  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl, 'short');
   if (shortPositions[sym].qtyRemaining <= 0) delete shortPositions[sym];
   log('short', `🎯 PARTIAL COVER ${reason}: ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
   trades.push({ time: new Date(), sym, side: 'COVER', qty, price, pnl, reason });
@@ -4893,7 +4938,7 @@ async function partialExit(sym, price, qtyToSell, reason) {
   if (isSimMode()) portfolio += qtyToSell * price;
   positions[sym].qtyRemaining -= qtyToSell;
   positions[sym].cost = positions[sym].qtyRemaining * avgCost;
-  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl, 'long');
 
   const icons = { TP1: '🎯', TP2: '🎯🎯', TP3: '🎯🎯🎯' };
   const icon = icons[reason] || '🎯';
@@ -4926,7 +4971,7 @@ async function exitPosition(sym, price, reason) {
   // Only update in-memory cash in sim mode — in live mode Alpaca is the source of truth
   // Adding proceeds in live mode causes cash to inflate and diverge from reality
   if (isSimMode()) portfolio += qtyToSell * price;
-  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+  pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl, 'long');
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: pos?.sigInfo?.rsi||50,
     atrPct: pos?.atrAtEntry ? pos.atrAtEntry/price : 0,
     session: getCurrentSession(), side: 'long', sym, exitReason: reason,
@@ -6025,7 +6070,7 @@ async function syncAlpacaPositions() {
       log('sys', `🖐 Manual close detected: ${sym} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
 
       // Stats + cash
-      pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+      pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl, 'long');
       portfolio += qty * lastPrice;
       trades.push({ time: new Date(), sym, side: 'SELL', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
 
@@ -6052,7 +6097,7 @@ async function syncAlpacaPositions() {
       const pnl       = (pos.entryPrice - lastPrice) * qty; // inverted for short
 
       log('sys', `🖐 Manual SHORT close detected: ${sym} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
-      pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl);
+      pnl > 0 ? totalWins++ : totalLosses++; recordSymbolOutcome(sym, pnl, 'short');
       trades.push({ time: new Date(), sym, side: 'COVER', qty, price: lastPrice, pnl, reason: 'MANUAL_CLOSE' });
       try {
         await sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE');
@@ -6658,7 +6703,7 @@ async function exitScalp(sym, price, reason) {
     : (entryPrice - price) * qty;
 
   if (isSimMode()) portfolio += direction === 'long' ? qty * price : pnl;
-  pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++); recordSymbolOutcome(sym, pnl);
+  pnl > 0 ? (totalWins++, scalpWins++) : (totalLosses++, scalpLosses++); recordSymbolOutcome(sym, pnl, pos.direction);
   recordTradeOutcome(pnl, { confidence: pos?.sigInfo?.confidence||0, rsi: 50, session: getCurrentSession(), side: pos?.direction||'long', sym, exitReason: reason, holdMins: Math.round((Date.now()-new Date(pos.entryTime).getTime())/60000), pnlPct: pos.entryPrice > 0 ? pnl/(pos.entryPrice*pos.qty) : 0 });
 
   const holdSecs = Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 1000);
