@@ -642,11 +642,10 @@
           </div>
         </div>
         <div class="chart-controls">
-          <button class="tf-btn" data-tf="1M">1M</button>
-          <button class="tf-btn active" data-tf="5M">5M</button>
+          <button class="tf-btn" data-tf="5M">5M</button>
           <button class="tf-btn" data-tf="15M">15M</button>
           <button class="tf-btn" data-tf="30M">30M</button>
-          <button class="tf-btn" data-tf="1H">1H</button>
+          <button class="tf-btn active" data-tf="1H">1H</button>
           <button class="tf-btn" data-tf="4H">4H</button>
           <button class="tf-btn" data-tf="1D">1D</button>
           <div class="chart-indicators">
@@ -1224,6 +1223,7 @@ async function fetchTrades() {
 }
 
 async function fetchEquity() {
+  if (state._chartPaused) return; // mode toggle in progress, don't draw stale data
   // Read the equity curve directly from tc_equity — the bot writes a snapshot
   // of Alpaca's actual equity every 2 minutes. This is the only source of
   // truth for the curve. Previously we summed pnl from tc_trades, which
@@ -1564,9 +1564,17 @@ async function toggleSetting(field, value) {
 
 async function toggleSimMode() {
   const newSim = state.mode !== 'sim';
+
+  // ── Step 1: pause everything that touches the chart ──
+  // Stop pollers + live tick BEFORE flipping mode, so no in-flight tick
+  // tries to render mid-transition with mixed sim/live data.
+  stopAllPollers();
+  state._chartPaused = true;
+
+  // ── Step 2: flip the toggle on the bot side ──
   await toggleSetting('sim_mode', newSim);
 
-  // Immediately update UI without waiting for bot to respond
+  // ── Step 3: update local state + UI immediately ──
   state.mode = newSim ? 'sim' : 'alpaca';
   $('modeText').textContent = newSim ? 'SIM' : 'LIVE';
   $('modeDot').className    = 'status-dot ' + (newSim ? 'paused' : 'live');
@@ -1579,18 +1587,39 @@ async function toggleSimMode() {
     $('chartBadge').style.borderColor = newSim ? 'rgba(155,89,182,0.25)' : 'rgba(0,229,199,0.25)';
   }
 
-  // Clear chart so it rebuilds with sim/live data
-  lastEquityChart = [];
-  state._lastEquityHash = null;
-  chart.allCandles = [];  // force first-load view behavior in drawCandlestickChart
+  // ── Step 4: NUKE every piece of chart state ──
+  // Anything that survived from the previous mode would corrupt the new
+  // mode's view. Be aggressive — easier to rebuild from scratch.
+  state._lastEquityHash      = null;
+  state.equitySnapshots      = [];
+  state.portfolio            = null;       // force re-fetch
+  chart.allCandles           = [];
+  chart.viewStart            = 0;
+  chart.viewCount            = 60;
+  chart.isDragging           = false;
+  chart.dragStartX           = null;
+  chart.lastMouseX           = null;
+  // Hide tooltip if it's lingering
+  const tip = $('chartTooltip');
+  if (tip) tip.style.display = 'none';
+  // Wipe SVG
   const svg = $('equityChart');
   if (svg) svg.innerHTML = '';
 
-  // Realtime is subscribed to the previous prefix — reconnect to the new one.
+  // ── Step 5: reconnect realtime to new mode's table prefix ──
   connectRealtime();
 
-  // Full refresh with new mode's tables
-  setTimeout(fetchAll, 300);
+  // ── Step 6: full data refresh, then resume pollers ──
+  // Wait long enough for the bot to actually flip modes server-side
+  // before re-fetching, otherwise we read mid-transition garbage.
+  await new Promise(r => setTimeout(r, 500));
+  try {
+    await fetchAll();
+  } catch(e) { console.warn('fetchAll after toggle failed:', e); }
+
+  // Resume rendering — pollers + live tick can run again
+  state._chartPaused = false;
+  startTieredPollers();
 }
 
 async function resetCircuit() {
@@ -2077,6 +2106,7 @@ const chart = {
 //   4. Keep the user's viewport stable: if they were pinned to the right
 //      edge, slide with the new candle; otherwise don't touch the view.
 function tickLiveCandle() {
+  if (state._chartPaused) return;
   const v = state.portfolio ? +state.portfolio.total_value : null;
   if (!Number.isFinite(v) || v <= 0) return;
   if (!chart.allCandles?.length) return;
