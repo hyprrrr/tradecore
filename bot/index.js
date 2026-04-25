@@ -2340,6 +2340,7 @@ let totalLosses         = 0;
 let dailyStartPortfolio = CONFIG.startingCapital;
 let circuitBreakerOn    = false;
 let lastScanTime        = null;
+let scanRotationOffset  = 0;  // Rotates through CONFIG.symbols, scanning SCAN_SLICE per cycle
 
 // ─── SYMBOL BLACKLIST ────────────────────────────────────────────────
 // Tracks per-symbol loss streaks. A symbol that's 0-for-3 or losing
@@ -2928,50 +2929,57 @@ function simAdvanceCursor() {
   if (!simState.loaded) return null;
 
   if (simState.cursor >= simState.totalBars - 20) {
-    // End of 60-day replay — close all open positions at last price then stop
-    log('sim', `🎮 Replay complete — ${simState.totalBars} bars processed`);
-    log('sim', `🎮 Final equity: $${portfolio.toFixed(2)} | ${totalWins}W/${totalLosses}L`);
+    // ── End of replay — log once, close positions, then LOOP back to start ──
+    // Previously the sim froze at the last bar forever, spamming "Final equity"
+    // every 3s and never producing new candles. Now we auto-rewind so testing
+    // continuously runs a fresh replay cycle. To keep logs sane, we only log
+    // the summary once per loop completion (via simState._loopSummaryLogged).
+    if (!simState._loopSummaryLogged) {
+      simState._loopSummaryLogged = true;
+      log('sim', `🎮 Replay complete — ${simState.totalBars} bars processed`);
+      log('sim', `🎮 Cycle equity: $${portfolio.toFixed(2)} | ${totalWins}W/${totalLosses}L`);
 
-    // Force-close all open positions at final bar price
-    for (const sym of Object.keys(positions)) {
-      const pos = positions[sym];
-      const finalPrice = simCurrentPrice(sym) || pos.entryPrice;
-      const pnl = (finalPrice - pos.entryPrice) * pos.qty;
-      portfolio += pos.qty * finalPrice;
-      delete positions[sym];
-      log('sim', `🎮 Sim end — closed ${sym} long @ $${finalPrice.toFixed(2)} PnL: $${pnl.toFixed(2)}`);
+      // Force-close all open positions at final bar price
+      for (const sym of Object.keys(positions)) {
+        const pos = positions[sym];
+        const finalPrice = simCurrentPrice(sym) || pos.entryPrice;
+        const pnl = (finalPrice - pos.entryPrice) * pos.qty;
+        portfolio += pos.qty * finalPrice;
+        delete positions[sym];
+        log('sim', `🎮 Cycle end — closed ${sym} long PnL: $${pnl.toFixed(2)}`);
+      }
+      for (const sym of Object.keys(shortPositions)) {
+        const pos = shortPositions[sym];
+        const finalPrice = simCurrentPrice(sym) || pos.entryPrice;
+        const pnl = (pos.entryPrice - finalPrice) * pos.qty;
+        portfolio += pnl;
+        delete shortPositions[sym];
+      }
+      pendingSignals.clear();
+
+      sbFetch('sim_tc_portfolio?id=eq.1', 'PATCH', {
+        cash: +portfolio.toFixed(2), total_value: +portfolio.toFixed(2),
+        total_wins: totalWins, total_losses: totalLosses,
+        session: `🎮 SIM CYCLE ${(simState._loopCount || 0) + 1}`,
+        updated_at: new Date().toISOString(),
+      }).catch(()=>{});
     }
-    for (const sym of Object.keys(shortPositions)) {
-      const pos = shortPositions[sym];
-      const finalPrice = simCurrentPrice(sym) || pos.entryPrice;
-      const pnl = (pos.entryPrice - finalPrice) * pos.qty;
-      portfolio += pnl;
-      delete shortPositions[sym];
-      log('sim', `🎮 Sim end — closed ${sym} short PnL: $${pnl.toFixed(2)}`);
-    }
-    pendingSignals.clear();
 
-    // Update final sim portfolio state
-    sbFetch('sim_tc_portfolio?id=eq.1', 'PATCH', {
-      cash: +portfolio.toFixed(2), total_value: +portfolio.toFixed(2),
-      total_wins: totalWins, total_losses: totalLosses,
-      session: '🎮 SIM COMPLETE', updated_at: new Date().toISOString(),
-    }).catch(()=>{});
+    // Loop: rewind cursor to the start of the replay so trading continues.
+    simState._loopCount = (simState._loopCount || 0) + 1;
+    simState._loopSummaryLogged = false;
+    simState.cursor = 50; // same starting position as initial load
+    log('sim', `🎮 Looping replay — cycle ${simState._loopCount}`);
 
-    // Pause — don't auto-reset, let user review results
-    simState.cursor = simState.totalBars - 20; // hold at last bar
-    log('sim', '🎮 Sim paused at end. Toggle Sim off/on to restart with fresh data.');
-    return null; // signal to stop advancing
+    // Reset per-cycle state but keep cumulative wins/losses + symbol stats
+    // so adaptive learning carries across cycles
+    realDailyStartEquity = portfolio;
   }
 
   simState.cursor++;
   const firstSym = Object.keys(simState.bars)[0];
   if (simState.bars[firstSym]?.[simState.cursor]) {
     simState.currentTime = simState.bars[firstSym][simState.cursor].t;
-  }
-  // Check if we just hit end-of-replay
-  if (simState.cursor >= simState.totalBars - 20) {
-    return null; // signals runSimScan to stop
   }
 
   // Return sliced bars — bot only sees bars UP TO current cursor
@@ -5868,10 +5876,36 @@ async function runScan() {
 
   // Build dynamic scan list: favorites + screener candidates
   const scanList = buildScanList();
-  const symbolsToScan = scanList.filter(s => shouldScanSymbol(s));
-  log('scan', `Scan list: ${symbolsToScan.length} symbols (${CONFIG.symbols.length} favorites + ${Math.max(0, symbolsToScan.length - CONFIG.symbols.length)} screener picks)`);
+  const eligible = scanList.filter(s => shouldScanSymbol(s));
+
+  // ── SCAN ROTATION ──
+  // Alpaca Basic = 200 req/min. Each symbol = ~2 bar fetches. At 10s scan
+  // interval, we can safely fetch ~15-20 symbols per cycle (30-40 req/scan
+  // × 6 cycles/min = 180-240 req/min). Previously we scanned all 200 per
+  // cycle → 2400 req/min → instant rate-limit block that cascaded for min.
+  // Now we rotate: scan 40 at a time, next batch next cycle. Each symbol
+  // gets scanned every ~5 cycles = every 50s.
+  const SCAN_SLICE = 40;
+  let symbolsToScan;
+  if (eligible.length <= SCAN_SLICE) {
+    symbolsToScan = eligible;
+  } else {
+    const start = scanRotationOffset % eligible.length;
+    symbolsToScan = [];
+    for (let i = 0; i < SCAN_SLICE; i++) {
+      symbolsToScan.push(eligible[(start + i) % eligible.length]);
+    }
+    scanRotationOffset = (start + SCAN_SLICE) % eligible.length;
+  }
+
+  // Always include symbols we already have open positions in — they need
+  // every-scan management regardless of rotation
+  for (const sym of Object.keys(positions)) if (!symbolsToScan.includes(sym)) symbolsToScan.push(sym);
+  for (const sym of Object.keys(shortPositions)) if (!symbolsToScan.includes(sym)) symbolsToScan.push(sym);
+
+  log('scan', `Scan rotation: ${symbolsToScan.length}/${eligible.length} symbols this cycle`);
   log('scan', `═══ ${session} — Scanning ${symbolsToScan.length} symbols ═══`);
-  await syncLog('sys', `Scan started — ${session} — ${symbolsToScan.length} symbols (${CONFIG.symbols.length} favs + screener)`);
+  await syncLog('sys', `Scan started — ${session} — ${symbolsToScan.length}/${eligible.length} symbols (rotating)`);
 
   // Always sync real-time prices BEFORE managing positions
   // This prevents stale bar-close prices from triggering false stop losses
@@ -7247,22 +7281,35 @@ async function placeSmartOrder(symbol, qty, side, isScalp = false) {
 // Fetch all bar data on startup so the first scan fires immediately
 // with full data instead of waiting for serial fetches.
 async function prewarmData() {
-  log('sys', `Pre-warming bar cache for ${CONFIG.symbols.length} symbols (batched to avoid rate limits)…`);
+  // Skip prewarm entirely in sim — sim has its own loadSimBars() that fetches
+  // a much smaller window of historical 5Min bars. Prewarming all 200 symbols
+  // here AND then fetching again in sim = 2× the Alpaca rate-limit pressure
+  // on boot, guaranteed to hit the 200/min cap.
+  if (isSimMode()) {
+    log('sys', 'Sim mode — skipping live prewarm (sim loads its own bars)');
+    await apexLoadStrategies();
+    await loadSymbolStats();
+    return;
+  }
+
+  // Prewarm only what the next scan will actually use (top 30 favorites).
+  // Previously prewarmed all 200 symbols → 400 requests at startup → instant
+  // rate limit block that cascaded for minutes. Remaining symbols warm up
+  // lazily on first scan, spread over a longer window.
+  const PREWARM_LIMIT = 30;
+  const toWarm = CONFIG.symbols.slice(0, PREWARM_LIMIT);
+  log('sys', `Pre-warming bar cache for ${toWarm.length}/${CONFIG.symbols.length} symbols (top priority — rest load lazily)…`);
   const t = Date.now();
-  // Use small batches with delays during startup to avoid hitting Alpaca rate limits
-  // Cold cache = all symbols fetch simultaneously = rate limit burst
   const STARTUP_BATCH = 2;
-  for (let i = 0; i < CONFIG.symbols.length; i += STARTUP_BATCH) {
-    const batch = CONFIG.symbols.slice(i, i + STARTUP_BATCH);
+  for (let i = 0; i < toWarm.length; i += STARTUP_BATCH) {
+    const batch = toWarm.slice(i, i + STARTUP_BATCH);
     await fetchAllBarsParallel(batch);
-    if (i + STARTUP_BATCH < CONFIG.symbols.length) {
-      await new Promise(r => setTimeout(r, 300)); // 300ms between startup batches
+    if (i + STARTUP_BATCH < toWarm.length) {
+      await new Promise(r => setTimeout(r, 500)); // 500ms between batches (was 300)
     }
   }
   log('sys', `Bar cache ready in ${Date.now() - t}ms — first scan will fire immediately`);
-  // Load previously learned strategies from Supabase
   await apexLoadStrategies();
-  // Load persisted symbol bench state so it survives restarts
   await loadSymbolStats();
 }
 
