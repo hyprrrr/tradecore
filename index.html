@@ -744,6 +744,9 @@
         <button class="btn btn-outline btn-sm" style="flex:1;" onclick="resetCircuit()">Reset CB</button>
         <button class="btn btn-danger btn-sm" style="flex:1;" onclick="exitAll()">Exit All</button>
       </div>
+      <div style="padding: 0 14px 10px; display: flex; gap: 8px;">
+        <button class="btn btn-outline btn-sm" style="flex:1;" onclick="exportDiagnostics()" title="Bundle bot + dashboard + DB state into a JSON file for debugging">🩺 Export Diagnostics</button>
+      </div>
 
       <!-- Account -->
       <div class="account-bar">
@@ -1067,6 +1070,28 @@ const $ = id => document.getElementById(id);
 const fmt = n => typeof n === 'number' ? n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '--';
 const fmtP = n => typeof n === 'number' ? (n>=0?'+':'') + n.toFixed(2) + '%' : '--';
 const fmt$ = n => typeof n === 'number' ? (n>=0?'+':'') + '$' + Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '--';
+
+// ── Console capture for diagnostic export ──
+// Keeps the last 200 console entries + uncaught errors in a ring buffer
+// so Export Diagnostics can include them without needing devtools open.
+const __diagConsole = [];
+const __diagPush = (level, args) => {
+  try {
+    const msg = Array.from(args).map(a => {
+      if (a instanceof Error) return a.stack || a.message;
+      if (typeof a === 'object') { try { return JSON.stringify(a); } catch(e){ return String(a); } }
+      return String(a);
+    }).join(' ');
+    __diagConsole.push({ t: new Date().toISOString(), level, msg: msg.slice(0, 500) });
+    if (__diagConsole.length > 200) __diagConsole.shift();
+  } catch(e){}
+};
+['log','warn','error','info'].forEach(lvl => {
+  const orig = console[lvl].bind(console);
+  console[lvl] = (...args) => { __diagPush(lvl, args); orig(...args); };
+});
+window.addEventListener('error', e => __diagPush('uncaught', [e.message, e.filename+':'+e.lineno, e.error?.stack]));
+window.addEventListener('unhandledrejection', e => __diagPush('promise_rejection', [e.reason?.stack || e.reason || 'unknown']));
 
 // ═══════════════════════════════════════ CONFIG ═══════════════════════════════════════
 let CONFIG = {
@@ -1574,6 +1599,110 @@ async function exitAll() {
   } catch(e) {
     addLog('error', `Exit All failed: ${e.message}`);
   }
+}
+
+// ═══════════════════════════════════════ DIAGNOSTICS EXPORT ═══════════════════════════════════════
+// Bundles everything needed to debug a live issue:
+//  • Bot HTTP /diagnostic (full in-memory state: positions, counters, config)
+//  • Bot HTTP / (summary status)
+//  • Supabase tables (portfolio, settings, positions, recent trades, recent logs, equity)
+//  • Dashboard client state (CONFIG, mode, state object, chart settings)
+//  • Recent browser console output + uncaught errors (last 200 entries)
+//  • Environment info (URL, user agent, viewport, timestamps)
+async function exportDiagnostics() {
+  addLog('info', '🩺 Gathering diagnostics…');
+
+  const bundle = {
+    meta: {
+      generated_at: new Date().toISOString(),
+      version: 'tradecore-diag-v1',
+      url: location.href,
+      user_agent: navigator.userAgent,
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+      mode: state.mode,
+      connected: state.connected,
+    },
+    config: {
+      // Redact the actual key, keep prefix for sanity-check
+      sbUrl: CONFIG.sbUrl,
+      sbKey_prefix: (CONFIG.sbKey || '').slice(0, 12) + '…',
+      sbKey_length: (CONFIG.sbKey || '').length,
+      botUrl: CONFIG.botUrl,
+    },
+    client_state: {
+      mode: state.mode,
+      portfolio: state.portfolio,
+      positions_count: (state.positions || []).length,
+      trades_count: (state.trades || []).length,
+      chart: { tf: chart.tf, viewStart: chart.viewStart, viewCount: chart.viewCount, candleCount: chart.allCandles?.length },
+      realtime_healthy: typeof realtimeHealthy !== 'undefined' ? realtimeHealthy : null,
+    },
+    console_tail: __diagConsole.slice(-200),
+  };
+
+  // ── Bot-side diagnostics ──
+  if (CONFIG.botUrl) {
+    const bot = CONFIG.botUrl.replace(/\/$/, '');
+    try {
+      const r = await fetch(`${bot}/diagnostic`, { cache: 'no-store' });
+      bundle.bot_diagnostic = await r.json().catch(() => ({ error: 'parse failed' }));
+    } catch(e) { bundle.bot_diagnostic = { error: e.message }; }
+    try {
+      const r = await fetch(`${bot}/`, { cache: 'no-store' });
+      bundle.bot_status = await r.json().catch(() => ({ error: 'parse failed' }));
+    } catch(e) { bundle.bot_status = { error: e.message }; }
+  } else {
+    bundle.bot_diagnostic = { error: 'no bot URL configured' };
+  }
+
+  // ── Supabase-side snapshots (live + sim) ──
+  bundle.supabase = {};
+  if (CONFIG.sbUrl && CONFIG.sbKey) {
+    const pull = async (path, key) => {
+      try {
+        const r = await sbFetch(path, 'GET');
+        bundle.supabase[key] = r;
+      } catch(e) { bundle.supabase[key] = { error: e.message }; }
+    };
+    await Promise.all([
+      pull('tc_portfolio?id=eq.1&select=*',                            'tc_portfolio'),
+      pull('sim_tc_portfolio?id=eq.1&select=*',                        'sim_tc_portfolio'),
+      pull('tc_settings?id=eq.1&select=*',                             'tc_settings'),
+      pull('tc_positions?select=*&order=entry_time.desc&limit=50',     'tc_positions'),
+      pull('sim_tc_positions?select=*&order=entry_time.desc&limit=50', 'sim_tc_positions'),
+      pull('tc_trades?select=*&order=created_at.desc&limit=100',       'tc_trades_recent'),
+      pull('sim_tc_trades?select=*&order=created_at.desc&limit=100',   'sim_tc_trades_recent'),
+      pull('tc_logs?select=*&order=created_at.desc&limit=100',         'tc_logs_recent'),
+      pull('sim_tc_logs?select=*&order=created_at.desc&limit=100',     'sim_tc_logs_recent'),
+      pull('tc_equity?select=*&order=created_at.desc&limit=50',        'tc_equity_recent'),
+    ]);
+  } else {
+    bundle.supabase = { error: 'no Supabase credentials configured' };
+  }
+
+  // ── Redact anything key-shaped we might have accidentally slurped ──
+  const redact = obj => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const k of Object.keys(obj)) {
+      if (/key|token|secret|password/i.test(k) && typeof obj[k] === 'string' && obj[k].length > 10) {
+        obj[k] = obj[k].slice(0, 6) + '…REDACTED';
+      } else if (obj[k] && typeof obj[k] === 'object') redact(obj[k]);
+    }
+  };
+  redact(bundle);
+
+  // ── Trigger download ──
+  const json = JSON.stringify(bundle, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[:.]/g,'-').slice(0, 19);
+  a.href = URL.createObjectURL(blob);
+  a.download = `alphacore-diag-${stamp}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+
+  const sizeKb = (json.length / 1024).toFixed(1);
+  addLog('info', `🩺 Diagnostics exported (${sizeKb} KB)`);
 }
 
 // ═══════════════════════════════════════ RENDERERS ═══════════════════════════════════════
