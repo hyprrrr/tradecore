@@ -2854,6 +2854,7 @@ async function loadSimBars(symbols) {
 
   // Fetch symbols in batches of 3 (rate limit friendly)
   log('sim', `🎮 Fetching paginated history (this takes ~20s)…`);
+  const tblSim = isSimMode() ? 'sim_tc_portfolio' : 'tc_portfolio';
   for (let i = 0; i < symbols.length; i += 3) {
     const batch = symbols.slice(i, i + 3);
     const results = await Promise.allSettled(batch.map(async sym => {
@@ -2866,6 +2867,13 @@ async function loadSimBars(symbols) {
         log('sim', `🎮 ${r.value.sym}: ${r.value.bars.length} bars loaded`);
       }
     }
+    // Push a live progress counter to the dashboard so "SIM LOADING…"
+    // actually reflects progress instead of appearing frozen.
+    const pct = Math.min(100, Math.round(((i + 3) / symbols.length) * 100));
+    sbFetch(`${tblSim}?id=eq.1`, 'PATCH', {
+      session: `🎮 SIM LOADING ${pct}% (${Object.keys(simState.bars).length}/${symbols.length})`,
+      updated_at: new Date().toISOString(),
+    }).catch(()=>{});
     if (i + 3 < symbols.length) await new Promise(r => setTimeout(r, 300));
   }
 
@@ -3002,7 +3010,7 @@ async function runSimScan() {
 
   // Load bars on first run
   if (!simState.loaded) {
-    const symbols = buildScanList().slice(0, 50); // 50 in sim — broader universe, still fast
+    const symbols = buildScanList().slice(0, 25); // 25 in sim — enough variety, loads in ~90s
     const ok = await loadSimBars(symbols);
     if (!ok) return;
     // Reset portfolio for fresh sim
