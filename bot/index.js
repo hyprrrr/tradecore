@@ -2418,17 +2418,18 @@ function preferredDirection(sym) {
   if (!s) return null;
   const longTotal  = (s.longWins || 0) + (s.longLosses || 0);
   const shortTotal = (s.shortWins || 0) + (s.shortLosses || 0);
-  // Need at least 4 trades in a direction to draw a conclusion
-  if (longTotal < 4 && shortTotal < 4) return null;
-  const longWR  = longTotal  >= 4 ? s.longWins  / longTotal  : null;
-  const shortWR = shortTotal >= 4 ? s.shortWins / shortTotal : null;
+  // Need at least 6 trades in a direction to draw a conclusion (was 4 — too jumpy)
+  if (longTotal < 6 && shortTotal < 6) return null;
+  const longWR  = longTotal  >= 6 ? s.longWins  / longTotal  : null;
+  const shortWR = shortTotal >= 6 ? s.shortWins / shortTotal : null;
   if (longWR != null && shortWR != null) {
-    if (longWR  >= 0.5 && longWR  > shortWR + 0.15) return 'long';
-    if (shortWR >= 0.5 && shortWR > longWR + 0.15)  return 'short';
+    if (longWR  >= 0.55 && longWR  > shortWR + 0.20) return 'long';
+    if (shortWR >= 0.55 && shortWR > longWR + 0.20)  return 'short';
     return null;
   }
-  if (longWR != null  && longWR  < 0.30) return 'short'; // longs failing — try shorts
-  if (shortWR != null && shortWR < 0.30) return 'long';  // shorts failing — try longs
+  // Stronger one-sided floor: only flip if the dominant direction is clearly bad
+  if (longWR != null  && longWR  < 0.20) return 'short'; // longs failing badly — try shorts
+  if (shortWR != null && shortWR < 0.20) return 'long';
   return null;
 }
 function isSymbolBenched(sym) {
@@ -4406,11 +4407,19 @@ let shortPositions = {};
 // Returns { pass: boolean, reason?: string, sizeMultiplier?: number }
 // sizeMultiplier lets regime pass entries but at reduced size (e.g. 0.5 in chop)
 async function edgeGate(sym, direction, sigInfo, bars5m) {
+  // ── SIM MODE: skip market-data gates ──
+  // The regime classifier pulls LIVE SPY/UVXY data — meaningless when sim
+  // is replaying historical bars from days/weeks ago. Volume/MTF rely on
+  // bars that aren't always seeded in sim either. Sim still gets the
+  // adaptive confidence floor + directional bias gates below (those use
+  // accumulated trade outcomes which work fine in sim).
+  const isSim = isSimMode();
+
   // ── 1. REGIME ──
   // Bull = longs full size, shorts at half. Bear = inverse. Chop = half both.
   // Blowoff = both blocked. This is the single biggest edge: the 3pm-ET
   // chop period in the CSV (33% WR, -$1,823) would've been caught here.
-  if (CONFIG.regimeFilter) {
+  if (!isSim && CONFIG.regimeFilter) {
     const regime = await classifyRegime();
     if (regime.state === 'blowoff') {
       return { pass: false, reason: `blowoff regime (${regime.reasons})` };
@@ -4432,48 +4441,51 @@ async function edgeGate(sym, direction, sigInfo, bars5m) {
   }
 
   // ── 2. VOLUME CONFIRMATION ──
-  // Reject low-volume breakouts. The 21 STOP_LOSS hits at 0% WR in the CSV
-  // are classic no-demand signals. We require the entry bar to have >=1.5×
-  // the 20-bar average volume. Volume is the only thing that can't be faked.
-  if (CONFIG.volumeFilter && bars5m && bars5m.length >= 20) {
-    const vols = bars5m.slice(-21, -1).map(b => +b.v || 0);  // 20 bars BEFORE current
+  // Require entry bar volume >= 1.2× (was 1.5× — too aggressive, blocked
+  // many valid entries). Volume is a sanity check, not the primary gate.
+  if (!isSim && CONFIG.volumeFilter && bars5m && bars5m.length >= 20) {
+    const vols = bars5m.slice(-21, -1).map(b => +b.v || 0);
     const curVol = +bars5m[bars5m.length - 1].v || 0;
     const avgVol = vols.reduce((a, b) => a + b, 0) / Math.max(1, vols.length);
-    if (avgVol > 0 && curVol < avgVol * 1.5) {
-      return { pass: false, reason: `volume ${(curVol/avgVol).toFixed(2)}× avg (need 1.5×)` };
+    if (avgVol > 0 && curVol < avgVol * 1.2) {
+      return { pass: false, reason: `volume ${(curVol/avgVol).toFixed(2)}× avg (need 1.2×)` };
     }
   }
 
   // ── 3. MULTI-TIMEFRAME ALIGNMENT ──
-  // Don't take a 5m long if the 15m trend is down (and vice versa).
-  // This catches signals fighting the higher timeframe.
-  const bars15m = priceHistory15m[sym];
-  if (bars15m && bars15m.length >= 6) {
-    const closes15 = bars15m.slice(-6).map(b => +b.c || b);
-    const first    = closes15[0];
-    const last     = closes15[closes15.length - 1];
-    const slope15  = (last - first) / first;
-    if (direction === 'long'  && slope15 < -0.003) { // -0.3% over 1.5h = 15m downtrend
-      return { pass: false, reason: `15m downtrend (${(slope15*100).toFixed(2)}%) blocks long` };
-    }
-    if (direction === 'short' && slope15 >  0.003) {
-      return { pass: false, reason: `15m uptrend (+${(slope15*100).toFixed(2)}%) blocks short` };
+  // Don't take a 5m long if the 15m trend is down. Skip in sim — 15m
+  // history isn't reliably populated in replay mode.
+  if (!isSim) {
+    const bars15m = priceHistory15m[sym];
+    if (bars15m && bars15m.length >= 6) {
+      const closes15 = bars15m.slice(-6).map(b => +b.c || b);
+      const first    = closes15[0];
+      const last     = closes15[closes15.length - 1];
+      const slope15  = (last - first) / first;
+      if (direction === 'long'  && slope15 < -0.005) { // -0.5% over 1.5h (was -0.3%)
+        return { pass: false, reason: `15m downtrend (${(slope15*100).toFixed(2)}%) blocks long` };
+      }
+      if (direction === 'short' && slope15 >  0.005) {
+        return { pass: false, reason: `15m uptrend (+${(slope15*100).toFixed(2)}%) blocks short` };
+      }
     }
   }
 
   // ── 4. ADAPTIVE PER-SYMBOL CONFIDENCE FLOOR ──
   // Symbols with a bad track record need higher conviction.
-  // Global floor is CONFIG.minConfidence (70). We add:
-  //   +5 for 1 recent loss, +10 for 2, +15 for 3+ (after which bench fires)
-  // After a winning streak we ease back to the global floor.
+  // Global floor is CONFIG.minConfidence (70 live, 65 sim — sim universe is
+  // smaller and we want signal flow for adaptive learning to kick in).
   const ss = symbolStats[sym];
   const sigConf = sigInfo?.confidence || 0;
+  const baseFloor = isSim ? 65 : (CONFIG.minConfidence || 70);
   if (ss) {
     const penalty = Math.min(15, ss.lossStreak * 5);
-    const floor = (CONFIG.minConfidence || 70) + penalty;
+    const floor = baseFloor + penalty;
     if (sigConf < floor) {
       return { pass: false, reason: `${sym} conf ${sigConf} < adaptive floor ${floor} (${ss.lossStreak} recent losses)` };
     }
+  } else if (sigConf < baseFloor) {
+    return { pass: false, reason: `${sym} conf ${sigConf} < floor ${baseFloor}` };
   }
 
   // ── 4b. DIRECTIONAL BIAS ──
