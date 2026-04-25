@@ -2171,25 +2171,36 @@ function buildCandlesForTF(snapshots, tf) {
   // Forward-fill empty buckets between the first and last snapshot so the
   // chart is continuous. Without fill, a 3-hour gap with no trades meant
   // the next bucket opened at the old value → phantom gap candle.
+  //
+  // CAP: don't forward-fill across gaps larger than 24 buckets (e.g. 2h on
+  // 5M tf). Long pauses (overnight, weekends, sim rebooting) otherwise
+  // create hundreds of identical doji candles that compress the active
+  // trading periods into invisible slivers. Instead we leave the gap and
+  // continue from the next real snapshot — the chart shows two clusters
+  // of activity with a visual break between them.
+  const MAX_FILL_BUCKETS = 24;
   const filled = [];
   let lastClose = null;
   for (let i = 0; i < keys.length; i++) {
     const key = keys[i];
-    // Insert empty buckets for any missing periods between prior key and this one
     if (i > 0) {
       const prevKey = keys[i - 1];
-      for (let t = prevKey + bucketMs; t < key; t += bucketMs) {
-        filled.push({
-          time: new Date(t),
-          open: lastClose, high: lastClose, low: lastClose, close: lastClose,
-          volume: 0,
-        });
+      const gapBuckets = Math.floor((key - prevKey) / bucketMs) - 1;
+      if (gapBuckets > 0 && gapBuckets <= MAX_FILL_BUCKETS) {
+        for (let t = prevKey + bucketMs; t < key; t += bucketMs) {
+          filled.push({
+            time: new Date(t),
+            open: lastClose, high: lastClose, low: lastClose, close: lastClose,
+            volume: 0,
+          });
+        }
       }
+      // For larger gaps, just skip — chart will show a horizontal time
+      // jump between the two activity clusters. This is the right visual
+      // signal: "nothing happened here, fast-forward".
     }
     const b = buckets[key];
     const v = b.values;
-    // Open = last close from prior bucket if we have one; otherwise the first
-    // value in this bucket (handles the very first candle).
     const open  = lastClose != null ? lastClose : v[0];
     const close = v[v.length - 1];
     const high  = Math.max(open, close, ...v);
