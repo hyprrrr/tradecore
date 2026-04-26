@@ -2288,12 +2288,18 @@ function _redrawChartImmediate() {
   }
 
   // ── Time axis ─────────────────────────────────────────────────
+  // Guard against single-candle case: timeSteps becomes 0, division by
+  // 0 yields NaN, visible[NaN] is undefined → .time crash. Need at least
+  // 2 candles before drawing intermediate time markers.
   const timeSteps = Math.min(8, visible.length - 1);
   for (let i = 0; i <= timeSteps; i++) {
-    const ci = Math.round((i / timeSteps) * (visible.length - 1));
+    const ci = timeSteps === 0 ? 0 : Math.round((i / timeSteps) * (visible.length - 1));
+    const candle = visible[ci];
+    if (!candle) continue;
     const x  = xOf(ci);
     svg.appendChild(svgLine(x, pad.t, x, H - pad.b, 'var(--border)', '0.5', '3,3'));
-    const d  = visible[ci].time;
+    const d  = candle.time;
+    if (!d) continue;
     let label;
     if (chart.tf === '1D') {
       label = `${d.getMonth()+1}/${d.getDate()}`;
