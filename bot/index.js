@@ -383,7 +383,7 @@ const ADAPT_DEFAULTS = {
 const ADAPT_BOUNDS = {
   rsiOversold:    { min: 18, max: 45 },
   rsiOverbought:  { min: 55, max: 82 },
-  minConfidence:  { min: 60, max: 92 },   // was 45-90 — floor raised so engine can't slip to mediocre setups
+  minConfidence:  { min: 60, max: 80 },   // was 60-92 — 92 was so high almost nothing qualified, paralyzed the bot
   atrStopMult:    { min: 1.5, max: 2.5 }, // hard cap — 3.5x caused $2900 loss
   maxPositionPct: { min: 0.03, max: 0.25 },
   tp1Pct:         { min: 0.010, max: 0.030 },
@@ -3186,6 +3186,13 @@ async function runSimScan() {
       circuit_breaker: circuitBreakerOn,
       last_scan:       new Date().toISOString(),
       session:         `🎮 SIM [${barTime?.slice(11,16)||'?'}]`,
+      // Recovery telemetry — without this the dashboard shows OFF/disabled
+      // even when CONFIG.recoveryMode=true (sim was missing these fields).
+      recovery_active:   !!(recoveryState && recoveryState.active),
+      recovery_enabled:  !!CONFIG.recoveryMode,
+      recovery_symbol:   recoveryState?.sym || null,
+      recovery_target:   recoveryState ? +recoveryState.targetPnl.toFixed(2) : 0,
+      recovery_attempts: recoveryState?.attempts || 0,
       updated_at:      new Date().toISOString(),
     }),
   ]);
@@ -5856,11 +5863,13 @@ async function managePosition(sym, price, bars) {
   }
 
   // ── Take profit tiers ──
-  // Partial sizing tuned for asymmetric payoff: sell less at TP1, more at TP2,
-  // all remaining at TP3. Historical: TP1 avg $27, TP2 avg $41, TP3 avg $67 —
-  // we want more shares reaching the higher tiers.
+  // Partial sizing tuned for risk reduction: take MORE off at TP1 so the
+  // remaining shares stopping out (1% loss) is a smaller absolute dollar
+  // hit. Diag showed avg STOP_LOSS = -$70 vs avg TP1 = +$20 (R-ratio 0.36)
+  // because only 25% was taken at TP1, leaving 75% to ride the stop.
+  // Now: 40% at TP1, 35% at TP2, 25% at TP3. Avg loss should drop ~40%.
   if (!pos.tp1Hit && chg >= effectiveTP1) {
-    const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.25)); // was 0.33
+    const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.40)); // was 0.25
     positions[sym].tp1Hit = true;
     log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}% (dyn ${(effectiveTP1*100).toFixed(1)}%): selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
     await partialExit(sym, price, sell, 'TP1');
@@ -5868,7 +5877,7 @@ async function managePosition(sym, price, bars) {
     return;
   }
   if (pos.tp1Hit && !pos.tp2Hit && chg >= effectiveTP2) {
-    const sell = Math.max(1, Math.floor(positions[sym].qtyRemaining * 0.5));
+    const sell = Math.max(1, Math.floor(positions[sym].qtyRemaining * 0.55)); // was 0.5
     positions[sym].tp2Hit = true;
     log('sell', `🎯🎯 TP2 +${(chg*100).toFixed(1)}% (dyn ${(effectiveTP2*100).toFixed(1)}%): selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
     await partialExit(sym, price, sell, 'TP2');
@@ -7389,6 +7398,18 @@ async function prewarmData() {
   log('sys', `Bar cache ready in ${Date.now() - t}ms — first scan will fire immediately`);
   await apexLoadStrategies();
   await loadSymbolStats();
+
+  // Clamp adaptive params to current bounds so stale-from-DB values like
+  // minConfidence=92 (when bound was 92, now 80) get normalized on boot.
+  for (const [k, b] of Object.entries(ADAPT_BOUNDS)) {
+    if (CONFIG[k] != null && typeof CONFIG[k] === 'number') {
+      const clamped = Math.max(b.min, Math.min(b.max, CONFIG[k]));
+      if (clamped !== CONFIG[k]) {
+        log('sys', `🔧 Boot clamp: ${k} ${CONFIG[k]} → ${clamped} (bounds ${b.min}-${b.max})`);
+        CONFIG[k] = clamped;
+      }
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
