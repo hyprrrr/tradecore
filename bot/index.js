@@ -3110,6 +3110,11 @@ async function runSimScan() {
     for (const sym of Object.keys(snapshot)) {
       if (positions[sym] || shortPositions[sym]) continue;
 
+      // Skip benched symbols at the source — saves CPU on signal generation
+      // and prevents log spam from "Blocked SOXS — benched" firing 50 times
+      // per scan when a leveraged ETF is generating signals constantly.
+      if (isSymbolBenched(sym)) continue;
+
       // Hard stop — recalculate after every entry
       const openNow = Object.keys(positions).length + Object.keys(shortPositions).length;
       if (openNow >= CONFIG.maxOpenPositions) break;
@@ -4603,7 +4608,15 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   if (checkCircuitBreaker()) return;
   if (hasLargeGap(sym, price)) return;
   if (isSymbolBenched(sym)) {
-    log('risk', `⛔ Blocked ${sym} — benched (loss streak or cum losses > 2% cap)`);
+    // Throttle — without this a benched symbol generating constant signals
+    // produces 50+ duplicate log lines per scan. 60s window is plenty for
+    // operational visibility without flooding.
+    const _k = sym + '_bench_log';
+    const _n = Date.now();
+    if (!dupWarnThrottle[_k] || _n - dupWarnThrottle[_k] > 60000) {
+      dupWarnThrottle[_k] = _n;
+      log('risk', `⛔ Blocked ${sym} — benched (loss streak or cum losses > 2% cap)`);
+    }
     return;
   }
 
@@ -5997,6 +6010,8 @@ async function runScan() {
 
   for (const sym of symbolsToScan) {
     try {
+      // Skip benched symbols at source (saves bar fetches + signal CPU)
+      if (isSymbolBenched(sym) && !positions[sym] && !shortPositions[sym]) continue;
 
       const sessionMult = getSessionMultiplier(sym);
       const sessionLabel = ETF_SESSIONS[sym]
