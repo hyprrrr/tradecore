@@ -272,6 +272,11 @@ async function loadRemoteConfig() {
           await syncPortfolio();    // update equity/cash values
           log('sys', `✅ Live account fully restored — ${Object.keys(positions).length} positions synced`);
 
+          // ── Adaptive reset on mode change ──
+          // Sim's learned params don't apply to live and vice versa. Reset
+          // so each mode starts with a clean slate every toggle.
+          await resetAdaptiveParams('sim → live');
+
         } else {
           // Entering sim — full clean reset so every sim run starts fresh
           log('sim', '🎮 Simulation mode ENABLED — resetting for fresh replay');
@@ -317,6 +322,11 @@ async function loadRemoteConfig() {
           }).catch(()=>{});
 
           log('sim', `🎮 Sim reset complete — portfolio=$${CONFIG.startingCapital.toFixed(2)}`);
+
+          // ── Adaptive reset on mode change ──
+          // Sim should start with a clean adaptive baseline so previous
+          // live drift doesn't carry over and choke the sim's signal flow.
+          await resetAdaptiveParams('live → sim');
         }
       }
     }
@@ -391,6 +401,59 @@ const ADAPT_BOUNDS = {
   tp3Pct:         { min: 0.040, max: 0.100 },
   breakEvenAt:    { min: 0.01, max: 0.05 },
 };
+
+// ── Adaptive defaults — canonical "fresh start" baseline ──
+// Calling resetAdaptiveParams() restores all of them and clears learned state.
+// This runs on every sim<->live toggle so neither mode inherits the other's
+// drift (e.g. sim ratcheting min_confidence to 80 shouldn't penalize live,
+// and live's STOP_LOSS distribution shouldn't pre-bias sim either).
+const ADAPTIVE_DEFAULTS = {
+  minConfidence:  70,
+  rsiOversold:    35,
+  rsiOverbought:  65,
+  atrStopMult:    2.0,
+  maxPositionPct: 0.15,
+  tp1Pct:         0.015,
+  tp2Pct:         0.030,
+  tp3Pct:         0.050,
+  breakEvenAt:    0.003,
+  hardMaxLoss:    0.010,
+  adaptTargetWR:  0.75,
+};
+
+async function resetAdaptiveParams(reason = 'mode toggle') {
+  log('sys', `🔄 Resetting adaptive parameters → defaults (reason: ${reason})`);
+
+  // 1. Restore in-memory CONFIG to defaults
+  for (const [k, v] of Object.entries(ADAPTIVE_DEFAULTS)) {
+    CONFIG[k] = v;
+  }
+
+  // 2. Clear all learned per-trade state
+  tradePerformanceLog = [];
+  ewmaWinRate         = 0.5;
+  for (const k of Object.keys(symbolStats)) delete symbolStats[k];
+
+  // 3. Clear APEX rules so the engine re-learns organically from fresh trades
+  if (typeof APEX !== 'undefined' && APEX?.rules) {
+    APEX.rules = [];
+  }
+
+  // 4. Persist to Supabase so dashboard + reboots see clean state
+  try {
+    await sbFetch('tc_settings?id=eq.1', 'PATCH', {
+      min_confidence:  ADAPTIVE_DEFAULTS.minConfidence,
+      adapt_target_wr: ADAPTIVE_DEFAULTS.adaptTargetWR * 100,  // stored as percent
+      hard_max_loss:   ADAPTIVE_DEFAULTS.hardMaxLoss   * 100,
+      symbol_stats:    {},
+      apex_strategies: [],
+      updated_at:      new Date().toISOString(),
+    });
+    log('sys', '🔄 Adaptive params reset to defaults — fresh start');
+  } catch(e) {
+    log('warn', `Failed to persist adaptive reset: ${e.message}`);
+  }
+}
 
 // Extended trade log — stores rich context for each trade
 let tradePerformanceLog = [];
@@ -8094,6 +8157,37 @@ http.createServer(async (req, res) => {
         circuit_breaker: circuitBreakerOn,
         recovery_active: !!recoveryState,
       },
+
+      // ── SIM state ──
+      sim: isSimMode() ? {
+        loaded: simState.loaded,
+        cursor: simState.cursor,
+        total_bars: simState.totalBars,
+        progress_pct: simState.totalBars ? +(simState.cursor / simState.totalBars * 100).toFixed(1) : 0,
+        current_bar_time: simState.currentTime,
+        loop_count: simState._loopCount || 0,
+        symbols_loaded: Object.keys(simState.bars || {}).length,
+      } : null,
+
+      // ── Adaptive runtime values ──
+      adaptive: {
+        minConfidence: CONFIG.minConfidence,
+        rsiOversold: CONFIG.rsiOversold,
+        rsiOverbought: CONFIG.rsiOverbought,
+        atrStopMult: CONFIG.atrStopMult,
+        maxPositionPct: CONFIG.maxPositionPct,
+        adaptTargetWR: CONFIG.adaptTargetWR,
+        hardMaxLoss: CONFIG.hardMaxLoss,
+      },
+
+      // ── Symbol bench state ──
+      symbol_bench: Object.entries(symbolStats)
+        .filter(([_, v]) => v.benchedUntil && Date.now() < v.benchedUntil)
+        .map(([sym, v]) => ({
+          sym, benched_until: new Date(v.benchedUntil).toISOString(),
+          loss_streak: v.lossStreak, total_pnl: v.totalPnl,
+          minutes_remaining: Math.round((v.benchedUntil - Date.now()) / 60000),
+        })),
 
       // ── Recent trades (last 20) ──
       recent_trades: trades.slice(-20).map(t => ({
