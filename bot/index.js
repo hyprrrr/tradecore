@@ -199,6 +199,12 @@ async function loadRemoteConfig() {
       const newMode = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
       if (newMode !== CONFIG.mode) {
         const entering = newMode === 'sim';
+        // Loud announcement so we can see the handler fired even if a
+        // downstream step (Alpaca fetch, Supabase write) silently fails.
+        const direction = entering ? 'live → sim' : 'sim → live';
+        const announceMsg = `🔁 MODE TOGGLE DETECTED: ${direction}`;
+        log('warn', announceMsg);
+        syncLog('warn', announceMsg).catch(()=>{});
         CONFIG.mode = newMode;
         simState.loaded = false;
 
@@ -422,7 +428,12 @@ const ADAPTIVE_DEFAULTS = {
 };
 
 async function resetAdaptiveParams(reason = 'mode toggle') {
-  log('sys', `🔄 Resetting adaptive parameters → defaults (reason: ${reason})`);
+  // Log loudly + immediately, BEFORE any await so the log appears even if
+  // subsequent steps fail. Write to Supabase logs table directly so it's
+  // visible in the Logs tab on the dashboard, not just the in-memory buffer.
+  const msg = `🔄 RESETTING ADAPTIVE PARAMS — reason: ${reason}`;
+  log('warn', msg);
+  syncLog('warn', msg).catch(()=>{});
 
   // 1. Restore in-memory CONFIG to defaults
   for (const [k, v] of Object.entries(ADAPTIVE_DEFAULTS)) {
@@ -7586,7 +7597,7 @@ setInterval(async () => {
 let lastConfigCheck = 0;
 setInterval(async () => {
   const now = Date.now();
-  if (now - lastConfigCheck < 28000) return; // poll every 30s not every 3s
+  if (now - lastConfigCheck < 4500) return; // poll every 5s — fast enough to catch toggles
   lastConfigCheck = now;
   try {
     const prevMode = CONFIG.mode;
