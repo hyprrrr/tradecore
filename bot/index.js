@@ -225,11 +225,13 @@ async function loadRemoteConfig() {
           realEquity           = 0; // force re-fetch from Alpaca
           realDailyStartEquity = 0; // force re-fetch from Alpaca
 
-          // 2. Wipe sim positions from Supabase
-          await sbFetch(tbl('tc_positions')+'?symbol=neq.____NONE____', 'DELETE');
+          // 2. Wipe sim positions from Supabase (MUST use sim_ prefix explicitly;
+          // tbl() already resolves to live tc_positions because CONFIG.mode was
+          // just switched back to alpaca above).
+          await sbFetch('sim_tc_positions?symbol=neq.____NONE____', 'DELETE');
 
           // 2b. Delete sim equity snapshots — fake values pollute the chart
-          await sbFetch('tc_equity?id=gt.0', 'DELETE');
+          await sbFetch('sim_tc_equity?id=gt.0', 'DELETE');
           log('sys', '✅ Sim data cleared from Supabase');
 
           // 3. Fetch real Alpaca account values RIGHT NOW
@@ -440,22 +442,45 @@ async function resetAdaptiveParams(reason = 'mode toggle') {
     CONFIG[k] = v;
   }
 
-  // 2. Clear all learned per-trade state
+  // 2. Clear ALL learned per-trade state
   tradePerformanceLog = [];
   ewmaWinRate         = 0.5;
   for (const k of Object.keys(symbolStats)) delete symbolStats[k];
 
-  // 3. Clear APEX rules so the engine re-learns organically from fresh trades
-  if (typeof APEX !== 'undefined' && APEX?.rules) {
-    APEX.rules = [];
+  // 2b. Clear parameter bucket tracking so re-learning starts fresh
+  for (const bucket of Object.keys(paramBuckets)) {
+    paramBuckets[bucket] = {};
   }
 
-  // 4. Persist to Supabase so dashboard + reboots see clean state
+  // 3. Clear APEX rules AND trades so the engine re-learns organically
+  if (typeof APEX !== 'undefined') {
+    if (APEX?.rules)  APEX.rules  = [];
+    if (APEX?.trades) APEX.trades = [];
+  }
+
+  // 4. Persist ALL adaptive defaults to Supabase so dashboard + reboots see
+  //    clean state AND the next loadRemoteConfig() won't re-apply stale drift.
   try {
     await sbFetch('tc_settings?id=eq.1', 'PATCH', {
-      min_confidence:  ADAPTIVE_DEFAULTS.minConfidence,
-      adapt_target_wr: ADAPTIVE_DEFAULTS.adaptTargetWR * 100,  // stored as percent
-      hard_max_loss:   ADAPTIVE_DEFAULTS.hardMaxLoss   * 100,
+      // Core adaptive params (must match everything runAdaptiveTuning writes)
+      min_confidence:     ADAPTIVE_DEFAULTS.minConfidence,
+      adapt_target_wr:    ADAPTIVE_DEFAULTS.adaptTargetWR * 100,
+      hard_max_loss:      ADAPTIVE_DEFAULTS.hardMaxLoss   * 100,
+      rsi_oversold:       ADAPTIVE_DEFAULTS.rsiOversold,
+      rsi_overbought:     ADAPTIVE_DEFAULTS.rsiOverbought,
+      atr_stop_mult:      ADAPTIVE_DEFAULTS.atrStopMult,
+      max_position_pct:   +(ADAPTIVE_DEFAULTS.maxPositionPct * 100).toFixed(2),
+      tp1_pct:            +(ADAPTIVE_DEFAULTS.tp1Pct * 100).toFixed(2),
+      tp2_pct:            +(ADAPTIVE_DEFAULTS.tp2Pct * 100).toFixed(2),
+      tp3_pct:            +(ADAPTIVE_DEFAULTS.tp3Pct * 100).toFixed(2),
+      break_even_at:      +(ADAPTIVE_DEFAULTS.breakEvenAt * 100).toFixed(2),
+      peak_min_profit:    +(ADAPTIVE_DEFAULTS.peakMinProfit * 100).toFixed(2),
+      fade_min_profit:    +(ADAPTIVE_DEFAULTS.fadeMinProfit * 100).toFixed(2),
+      fade_pullback:      +(ADAPTIVE_DEFAULTS.fadePullback * 100).toFixed(2),
+      trail_t2_at:        +(ADAPTIVE_DEFAULTS.trailT2At * 100).toFixed(2),
+      trail_t3_at:        +(ADAPTIVE_DEFAULTS.trailT3At * 100).toFixed(2),
+      trail_t4_at:        +(ADAPTIVE_DEFAULTS.trailT4At * 100).toFixed(2),
+      // Cleared learning state
       symbol_stats:    {},
       apex_strategies: [],
       updated_at:      new Date().toISOString(),
