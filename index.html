@@ -1209,12 +1209,21 @@ async function fetchPortfolio() {
 }
 
 async function fetchPositions() {
-  const tbl = state.mode === 'sim' ? 'sim_tc_positions' : 'tc_positions';
-  const data = await sbFetch(`${tbl}?select=*&order=updated_at.desc`, 'GET');
-  if (data) {
-    state.positions = Array.isArray(data) ? data : [];
-    renderPositions(state.positions);
-    renderPositionsTable(state.positions);
+  if (state._positionsFetchInFlight) return; // dedup concurrent fetches from realtime + poll
+  state._positionsFetchInFlight = true;
+  try {
+    const tbl = state.mode === 'sim' ? 'sim_tc_positions' : 'tc_positions';
+    // Order by entry_time so position rows stay in their original spot
+    // through price updates. updated_at sorting was causing rows to jump
+    // around the table on every tick → looked like flicker/disappear.
+    const data = await sbFetch(`${tbl}?select=*&order=entry_time.asc`, 'GET');
+    if (data) {
+      state.positions = Array.isArray(data) ? data : [];
+      renderPositions(state.positions);
+      renderPositionsTable(state.positions);
+    }
+  } finally {
+    state._positionsFetchInFlight = false;
   }
 }
 
@@ -1522,21 +1531,27 @@ function connectRealtime() {
     startTieredPollers();
   });
 
+  // Debounce realtime fetches — a burst of writes (e.g. bot syncing 5
+  // positions one by one) shouldn't trigger 5 back-to-back fetchPositions
+  // calls. Coalesce into a single fetch 200ms after the last event.
+  const debouncedFetch = (() => {
+    const timers = {};
+    return (key, fn) => {
+      if (timers[key]) clearTimeout(timers[key]);
+      timers[key] = setTimeout(() => { timers[key] = null; fn(); }, 200);
+    };
+  })();
+
   ws.addEventListener('message', ev => {
     let msg; try { msg = JSON.parse(ev.data); } catch(e) { return; }
-    // We care about postgres_changes events on our subscribed topics.
     if (msg.event !== 'postgres_changes' || !msg.topic) return;
-    // Route: topic "realtime:public:tc_trades" → "trades"
     const tail = msg.topic.split(':').pop() || '';
     const tableSuffix = tail.replace(prefix, '');
-    // Trigger targeted refetches — cheaper than refetching everything.
-    // Portfolio push also refreshes equity so the chart stays visually
-    // locked to the P&L number (they derive from different tables).
     switch (tableSuffix) {
-      case 'portfolio': fetchPortfolio(); fetchEquity(); break;
-      case 'positions': fetchPositions(); break;
-      case 'trades':    fetchTrades(); fetchEquity(); fetchPortfolio(); break;
-      case 'logs':      fetchLogs(); break;
+      case 'portfolio': debouncedFetch('portfolio', () => { fetchPortfolio(); fetchEquity(); }); break;
+      case 'positions': debouncedFetch('positions', fetchPositions); break;
+      case 'trades':    debouncedFetch('trades',    () => { fetchTrades(); fetchEquity(); fetchPortfolio(); }); break;
+      case 'logs':      debouncedFetch('logs',      fetchLogs); break;
     }
   });
 
@@ -1907,11 +1922,21 @@ function renderPositions(positions) {
     row.dataset.side = side;
 
     const priceEl = row.querySelector('.watch-price');
-    if (priceEl.textContent !== priceStr) priceEl.textContent = priceStr;
+    // Damp sub-10¢ flicker — only repaint when the price actually moved
+    const lastPrice = +priceEl.dataset.lastVal || 0;
+    if (Math.abs((p.current_price || 0) - lastPrice) >= 0.10 || !priceEl.textContent) {
+      if (priceEl.textContent !== priceStr) priceEl.textContent = priceStr;
+      priceEl.dataset.lastVal = String(p.current_price || 0);
+    }
     if (priceEl.style.color !== color)    priceEl.style.color = color;
 
     const changeEl = row.querySelector('.watch-change');
-    if (changeEl.textContent !== pctStr) changeEl.textContent = pctStr;
+    // Damp sub-0.05% flicker on percent
+    const lastPct = +changeEl.dataset.lastPct || 0;
+    if (Math.abs((p.pnl_pct || 0) - lastPct) >= 0.05 || !changeEl.textContent) {
+      if (changeEl.textContent !== pctStr) changeEl.textContent = pctStr;
+      changeEl.dataset.lastPct = String(p.pnl_pct || 0);
+    }
     const targetCls = 'watch-change ' + changeCls;
     if (changeEl.className !== targetCls) changeEl.className = targetCls;
 
@@ -1974,9 +1999,20 @@ function renderPositionsTable(positions) {
     }
 
     // Helper: only write to the DOM when the value actually changed.
-    const set = (k, html) => {
+    // For numeric P&L cells we additionally damp updates smaller than 10¢
+    // so price ticks producing $95.46 ↔ $95.47 don't visually flicker.
+    const set = (k, html, opts = {}) => {
       const el = tr.querySelector(`[data-k="${k}"]`);
-      if (el && el.innerHTML !== html) el.innerHTML = html;
+      if (!el) return;
+      if (opts.numeric && el.dataset.lastVal != null) {
+        const prev = +el.dataset.lastVal;
+        const cur  = +opts.raw;
+        if (Number.isFinite(prev) && Number.isFinite(cur) && Math.abs(cur - prev) < 0.10) {
+          return; // sub-10¢ change, skip repaint
+        }
+      }
+      if (opts.numeric) el.dataset.lastVal = String(opts.raw);
+      if (el.innerHTML !== html) el.innerHTML = html;
     };
     const setCls = (k, cls) => {
       const el = tr.querySelector(`[data-k="${k}"]`);
@@ -1990,9 +2026,9 @@ function renderPositionsTable(positions) {
     set('sym',   `<b>${cleanSym(p.symbol)}</b>`);
     set('side',  `<span class="tag ${tagClass}">${side}</span>`);
     set('entry', fmt(p.entry_price));
-    set('cur',   fmt(p.current_price));
+    set('cur',   fmt(p.current_price), { numeric: true, raw: p.current_price });
     set('qty',   String(p.qty || 0));
-    set('pnl',   fmt$(p.pnl || 0));       setCls('pnl',  pnlCls);
+    set('pnl',   fmt$(p.pnl || 0),       { numeric: true, raw: p.pnl || 0 }); setCls('pnl',  pnlCls);
     set('pnlp',  fmtP(p.pnl_pct || 0));   setCls('pnlp', pnlCls);
     set('conf',  Math.round(p.confidence || 0) + '%');
     set('age',   age);
