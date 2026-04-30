@@ -3980,6 +3980,309 @@ function signalWyckoff(sym, bars5m, bars15m) {
 // ── Strategy Router ───────────────────────────────────────────────
 // Calls the right strategy based on CONFIG.strategy
 // Also runs a secondary strategy for confluence (optional)
+// ═══════════════════════════════════════════════════════════════════
+// STRATEGY: Opening Range Breakout (proper, not just bonus)
+// ═══════════════════════════════════════════════════════════════════
+// Used by: Day-trading desks, prop firms, ORB legends (Tony Oz, etc.)
+// Edge: First 30 minutes set the day's directional bias for liquid names.
+//       Clean break of OR-high (with volume) typically continues 60-70% of
+//       the time before reversal. Best on names with ATR > 1% intraday.
+//
+// Entry rules:
+//   - Wait for 30-min opening range to fully form (need market_open + 30min)
+//   - LONG when price > OR-high AND volume > 1.3× the OR-period avg
+//   - SHORT when price < OR-low  AND volume > 1.3× the OR-period avg
+//   - Reject if RSI already overbought (>72) on long or oversold (<28) on short
+function signalORB(sym, bars5m, bars15m) {
+  if (bars5m.length < 12) return { signal:'HOLD', confidence:0, reasons:['Need 12+ bars for ORB'] };
+  const orb = openingRanges[sym];
+  if (!orb) return { signal:'HOLD', confidence:0, reasons:['ORB not yet captured'] };
+
+  const closes = bars5m.map(b=>b.c);
+  const vols   = bars5m.map(b=>+b.v||0);
+  const price  = closes[closes.length-1];
+  const lastBar = bars5m[bars5m.length-1];
+  const reasons = [];
+  let score = 0, direction = null;
+
+  // OR width sanity — too tight (<0.3% of price) means no real range, skip
+  const orWidth = orb.high - orb.low;
+  const orWidthPct = orWidth / price;
+  if (orWidthPct < 0.003) return { signal:'HOLD', confidence:0, reasons:['OR too tight — no setup'] };
+  if (orWidthPct > 0.04)  return { signal:'HOLD', confidence:0, reasons:['OR too wide — likely news, fade ORB rules'] };
+
+  // Volume confirm — last bar volume vs the previous 10-bar avg
+  const avgVol = vols.slice(-11, -1).reduce((a,b)=>a+b,0) / 10 || 1;
+  const curVol = vols[vols.length-1];
+  const volMult = curVol / avgVol;
+
+  if (price > orb.high && lastBar.c > lastBar.o) {
+    direction = 'buy';
+    score += 4; reasons.push(`Breakout above OR-high $${orb.high.toFixed(2)} ✅`);
+    if (volMult > 1.3) { score += 2; reasons.push(`Volume ${volMult.toFixed(1)}× confirms breakout ✅`); }
+    else if (volMult < 0.8) { score -= 2; reasons.push(`Volume weak (${volMult.toFixed(1)}×) — false break risk ⚠`); }
+  } else if (price < orb.low && lastBar.c < lastBar.o) {
+    direction = 'sell';
+    score += 4; reasons.push(`Breakdown below OR-low $${orb.low.toFixed(2)} ✅`);
+    if (volMult > 1.3) { score += 2; reasons.push(`Volume ${volMult.toFixed(1)}× confirms breakdown ✅`); }
+    else if (volMult < 0.8) { score -= 2; reasons.push(`Volume weak — false break risk ⚠`); }
+  } else {
+    return { signal:'HOLD', confidence:0, reasons:['Inside OR — no setup'] };
+  }
+
+  // RSI sanity — don't enter into already-extended moves
+  const r = rsi(closes, 14);
+  if (direction === 'buy'  && r > 72) return { signal:'HOLD', confidence:0, reasons:[`RSI already ${r.toFixed(0)} — extended`] };
+  if (direction === 'sell' && r < 28) return { signal:'HOLD', confidence:0, reasons:[`RSI already ${r.toFixed(0)} — extended`] };
+  if (direction === 'buy'  && r > 50 && r < 65) { score += 1; reasons.push(`RSI ${r.toFixed(0)} confirms momentum ✅`); }
+  if (direction === 'sell' && r < 50 && r > 35) { score += 1; reasons.push(`RSI ${r.toFixed(0)} confirms weakness ✅`); }
+
+  // 15m alignment — break should match higher TF
+  if (bars15m?.length >= 5) {
+    const c15 = bars15m.map(b=>b.c);
+    const slope15 = (c15[c15.length-1] - c15[c15.length-5]) / c15[c15.length-5];
+    if (direction === 'buy'  && slope15 >  0.002) { score += 2; reasons.push(`15m uptrend confirms ✅`); }
+    if (direction === 'sell' && slope15 < -0.002) { score += 2; reasons.push(`15m downtrend confirms ✅`); }
+    if (direction === 'buy'  && slope15 < -0.003) { score -= 3; reasons.push(`15m downtrend disagrees ⚠`); }
+    if (direction === 'sell' && slope15 >  0.003) { score -= 3; reasons.push(`15m uptrend disagrees ⚠`); }
+  }
+
+  // Distance from OR boundary — fresh break (small distance) > stale (large)
+  const distPct = direction === 'buy'
+    ? (price - orb.high) / orb.high
+    : (orb.low - price)  / orb.low;
+  if (distPct < 0.002) { score += 1; reasons.push(`Fresh break (${(distPct*100).toFixed(2)}% past) ✅`); }
+  if (distPct > 0.01)  { score -= 2; reasons.push(`Stale break (${(distPct*100).toFixed(2)}% past) — chasing ⚠`); }
+
+  if (score < 5) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(95, 50 + score*5);
+  return { signal: direction==='buy'?'BUY':'SELL', confidence: conf, score, reasons, rsi: r, atr: atr(bars5m, 14) };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STRATEGY: Trend Pullback to VWAP
+// ═══════════════════════════════════════════════════════════════════
+// Used by: Institutional desks, momentum funds
+// Edge: In a strong daily uptrend, intraday pullbacks to VWAP are buyable
+//       — they're where institutions add to positions. Different from
+//       VWAP Reversion (which fades extremes); this rides the trend.
+//
+// Entry rules:
+//   - Daily/15m trend must be clearly UP (or DOWN for shorts)
+//   - Price pulls back to within 0.3% of VWAP
+//   - RSI in middle zone (35-55 for longs, 45-65 for shorts) — not extreme
+//   - Pullback bar showing rejection (lower wick on long, upper wick on short)
+function signalTrendPullback(sym, bars5m, bars15m) {
+  if (bars5m.length < 30) return { signal:'HOLD', confidence:0, reasons:['Need 30+ bars'] };
+  if (!bars15m || bars15m.length < 10) return { signal:'HOLD', confidence:0, reasons:['Need 15m bars for trend'] };
+
+  const closes  = bars5m.map(b=>b.c);
+  const closes15= bars15m.map(b=>b.c);
+  const price   = closes[closes.length-1];
+  const lastBar = bars5m[bars5m.length-1];
+  const v       = vwap(bars5m);
+  const reasons = [];
+  let score = 0, direction = null;
+
+  // ── Trend filter — 15m EMA10 vs EMA30 ──
+  const ema10_15 = ema(closes15, 10);
+  const ema30_15 = ema(closes15, Math.min(30, closes15.length));
+  const slope15 = (closes15[closes15.length-1] - closes15[closes15.length-6]) / closes15[closes15.length-6];
+
+  const isUptrend   = ema10_15 > ema30_15 && slope15 >  0.003;
+  const isDowntrend = ema10_15 < ema30_15 && slope15 < -0.003;
+
+  if (!isUptrend && !isDowntrend) {
+    return { signal:'HOLD', confidence:0, reasons:['No clear 15m trend'] };
+  }
+
+  // ── Pullback — price must be near VWAP ──
+  const distFromVWAP = (price - v) / v;
+  if (isUptrend) {
+    // Long setup: price pulled DOWN to VWAP from above
+    if (distFromVWAP > 0.003) return { signal:'HOLD', confidence:0, reasons:['Above VWAP — no pullback yet'] };
+    if (distFromVWAP < -0.005) return { signal:'HOLD', confidence:0, reasons:['Too far below VWAP — trend may be breaking'] };
+    direction = 'buy';
+    score += 4; reasons.push(`Uptrend + pullback to VWAP ($${v.toFixed(2)}) ✅`);
+  } else if (isDowntrend) {
+    // Short setup: price popped UP to VWAP from below
+    if (distFromVWAP < -0.003) return { signal:'HOLD', confidence:0, reasons:['Below VWAP — no rally yet'] };
+    if (distFromVWAP >  0.005) return { signal:'HOLD', confidence:0, reasons:['Too far above VWAP — trend may be breaking'] };
+    direction = 'sell';
+    score += 4; reasons.push(`Downtrend + rally to VWAP ($${v.toFixed(2)}) ✅`);
+  }
+
+  // ── RSI — middle zone (not extended) ──
+  const r = rsi(closes, 14);
+  if (direction === 'buy'  && r >= 35 && r <= 55) { score += 2; reasons.push(`RSI ${r.toFixed(0)} in pullback zone ✅`); }
+  else if (direction === 'buy'  && r > 55) { score -= 1; reasons.push(`RSI ${r.toFixed(0)} not pulled back enough ⚠`); }
+  else if (direction === 'buy'  && r < 35) { score -= 2; reasons.push(`RSI ${r.toFixed(0)} too oversold — trend break risk ⚠`); }
+
+  if (direction === 'sell' && r <= 65 && r >= 45) { score += 2; reasons.push(`RSI ${r.toFixed(0)} in rally zone ✅`); }
+  else if (direction === 'sell' && r < 45) { score -= 1; reasons.push(`RSI ${r.toFixed(0)} not bounced enough ⚠`); }
+  else if (direction === 'sell' && r > 65) { score -= 2; reasons.push(`RSI ${r.toFixed(0)} too extended — trend break risk ⚠`); }
+
+  // ── Rejection candle — wick away from VWAP ──
+  const range = lastBar.h - lastBar.l;
+  if (range > 0) {
+    if (direction === 'buy') {
+      const lowerWick = (Math.min(lastBar.o, lastBar.c) - lastBar.l) / range;
+      if (lowerWick > 0.4) { score += 2; reasons.push(`Lower-wick rejection (${(lowerWick*100).toFixed(0)}%) ✅`); }
+    } else {
+      const upperWick = (lastBar.h - Math.max(lastBar.o, lastBar.c)) / range;
+      if (upperWick > 0.4) { score += 2; reasons.push(`Upper-wick rejection (${(upperWick*100).toFixed(0)}%) ✅`); }
+    }
+  }
+
+  // ── Volume — pullback should be on declining volume, breakout on rising ──
+  const vols = bars5m.map(b=>+b.v||0);
+  const avgVol = vols.slice(-11, -1).reduce((a,b)=>a+b,0) / 10 || 1;
+  const curVol = vols[vols.length-1];
+  if (curVol < avgVol * 0.8) { score += 1; reasons.push(`Pullback on light volume (${(curVol/avgVol).toFixed(1)}×) ✅`); }
+
+  if (score < 6) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(95, 45 + score*5);
+  return { signal: direction==='buy'?'BUY':'SELL', confidence: conf, score, reasons, rsi: r, atr: atr(bars5m, 14) };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STRATEGY: Bollinger Band + RSI Divergence
+// ═══════════════════════════════════════════════════════════════════
+// Used by: Mean-reversion desks, swing traders
+// Edge: When price punches BB-lower while RSI makes a HIGHER low than its
+//       previous low — that's bullish divergence. The price is making new
+//       lows but momentum isn't following. Reversal high probability.
+//       Inverse for shorts at BB-upper with bearish divergence.
+//
+// Entry rules:
+//   - Price touches/exceeds BB upper or lower (20, 2.0)
+//   - Find the previous BB-extreme touch within last 20 bars
+//   - Compare RSI at both touches: divergence = current RSI better than prior
+//   - Confirm with: candle rejection at extreme + volume
+function signalBBDivergence(sym, bars5m, bars15m) {
+  if (bars5m.length < 30) return { signal:'HOLD', confidence:0, reasons:['Need 30+ bars'] };
+
+  const closes = bars5m.map(b=>b.c);
+  const price  = closes[closes.length-1];
+  const lastBar = bars5m[bars5m.length-1];
+  const reasons = [];
+  let score = 0, direction = null;
+
+  // Bollinger Bands (20, 2.0)
+  const period = 20;
+  const slice = closes.slice(-period);
+  const sma   = slice.reduce((a,b)=>a+b,0) / period;
+  const variance = slice.reduce((s,x)=>s + (x-sma)*(x-sma), 0) / period;
+  const sd = Math.sqrt(variance);
+  const bbUpper = sma + 2*sd;
+  const bbLower = sma - 2*sd;
+
+  const r = rsi(closes, 14);
+
+  // Determine direction by which band we're hitting
+  let touchingLower = price <= bbLower || lastBar.l <= bbLower;
+  let touchingUpper = price >= bbUpper || lastBar.h >= bbUpper;
+  if (!touchingLower && !touchingUpper) {
+    return { signal:'HOLD', confidence:0, reasons:['Inside BB — no extreme'] };
+  }
+
+  // Find previous BB extreme touch in window [-20, -3] for divergence comparison
+  const lookback = Math.min(20, bars5m.length - 3);
+  let prevTouchIdx = -1, prevTouchPrice = 0, prevRSI = 0;
+
+  if (touchingLower) {
+    direction = 'buy';
+    score += 3; reasons.push(`Price at BB lower ($${bbLower.toFixed(2)}) ✅`);
+    // Find prior low BB-touch
+    let lowestPriceInWindow = Infinity;
+    for (let i = bars5m.length - 4; i >= bars5m.length - lookback; i--) {
+      const b = bars5m[i];
+      const sliceI = closes.slice(Math.max(0, i - period + 1), i + 1);
+      if (sliceI.length < period) continue;
+      const smaI = sliceI.reduce((a,b)=>a+b,0) / period;
+      const sdI  = Math.sqrt(sliceI.reduce((s,x)=>s + (x-smaI)*(x-smaI), 0) / period);
+      const lowI = smaI - 2*sdI;
+      if (b.l <= lowI && b.c < lowestPriceInWindow) {
+        lowestPriceInWindow = b.c;
+        prevTouchIdx = i;
+        prevTouchPrice = b.c;
+        prevRSI = rsi(closes.slice(0, i+1), 14);
+      }
+    }
+    if (prevTouchIdx > 0) {
+      // BULLISH divergence: price made LOWER low, RSI made HIGHER low
+      if (price < prevTouchPrice && r > prevRSI + 3) {
+        score += 4;
+        reasons.push(`Bullish divergence: price ${prevTouchPrice.toFixed(2)}→${price.toFixed(2)}, RSI ${prevRSI.toFixed(0)}→${r.toFixed(0)} ✅`);
+      } else {
+        score -= 1;
+        reasons.push(`No clear divergence (need lower-price + higher-RSI)`);
+      }
+    } else {
+      reasons.push('No prior BB-low for divergence check');
+    }
+  } else {
+    direction = 'sell';
+    score += 3; reasons.push(`Price at BB upper ($${bbUpper.toFixed(2)}) ✅`);
+    let highestPriceInWindow = -Infinity;
+    for (let i = bars5m.length - 4; i >= bars5m.length - lookback; i--) {
+      const b = bars5m[i];
+      const sliceI = closes.slice(Math.max(0, i - period + 1), i + 1);
+      if (sliceI.length < period) continue;
+      const smaI = sliceI.reduce((a,b)=>a+b,0) / period;
+      const sdI  = Math.sqrt(sliceI.reduce((s,x)=>s + (x-smaI)*(x-smaI), 0) / period);
+      const highI = smaI + 2*sdI;
+      if (b.h >= highI && b.c > highestPriceInWindow) {
+        highestPriceInWindow = b.c;
+        prevTouchIdx = i;
+        prevTouchPrice = b.c;
+        prevRSI = rsi(closes.slice(0, i+1), 14);
+      }
+    }
+    if (prevTouchIdx > 0) {
+      // BEARISH divergence: price made HIGHER high, RSI made LOWER high
+      if (price > prevTouchPrice && r < prevRSI - 3) {
+        score += 4;
+        reasons.push(`Bearish divergence: price ${prevTouchPrice.toFixed(2)}→${price.toFixed(2)}, RSI ${prevRSI.toFixed(0)}→${r.toFixed(0)} ✅`);
+      } else {
+        score -= 1;
+        reasons.push(`No clear divergence (need higher-price + lower-RSI)`);
+      }
+    }
+  }
+
+  // RSI extreme for the band touched
+  if (direction === 'buy'  && r < 30) { score += 2; reasons.push(`RSI oversold (${r.toFixed(0)}) ✅`); }
+  if (direction === 'sell' && r > 70) { score += 2; reasons.push(`RSI overbought (${r.toFixed(0)}) ✅`); }
+
+  // Rejection candle
+  const range = lastBar.h - lastBar.l;
+  if (range > 0) {
+    if (direction === 'buy') {
+      const lowerWick = (Math.min(lastBar.o, lastBar.c) - lastBar.l) / range;
+      if (lowerWick > 0.45) { score += 2; reasons.push(`Long lower-wick rejection ✅`); }
+    } else {
+      const upperWick = (lastBar.h - Math.max(lastBar.o, lastBar.c)) / range;
+      if (upperWick > 0.45) { score += 2; reasons.push(`Long upper-wick rejection ✅`); }
+    }
+  }
+
+  // Volume confirms
+  const vols = bars5m.map(b=>+b.v||0);
+  const avgVol = vols.slice(-11, -1).reduce((a,b)=>a+b,0) / 10 || 1;
+  const curVol = vols[vols.length-1];
+  if (curVol > avgVol * 1.4) { score += 1; reasons.push(`Volume ${(curVol/avgVol).toFixed(1)}× confirms reversal ✅`); }
+
+  // ADX — only take BB reversion in non-trending conditions
+  const adxVal = adx(bars5m);
+  if (adxVal.adx > 35) { score -= 2; reasons.push(`ADX ${adxVal.adx.toFixed(0)} too trending — fade risk ⚠`); }
+  else if (adxVal.adx < 20) { score += 1; reasons.push(`ADX ${adxVal.adx.toFixed(0)} ranging — perfect for reversion ✅`); }
+
+  if (score < 7) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(95, 40 + score*5);
+  return { signal: direction==='buy'?'BUY':'SELL', confidence: conf, score, reasons, rsi: r, atr: atr(bars5m, 14) };
+}
+
 function generateSignalByStrategy(sym, bars5m, bars15m) {
   const strategy = CONFIG.strategy || 'rsi_macd';
 
@@ -3989,6 +4292,9 @@ function generateSignalByStrategy(sym, bars5m, bars15m) {
     case 'vwap_reversion': return signalVWAPReversion(sym, bars5m, bars15m);
     case 'order_flow':     return signalOrderFlow(sym, bars5m, bars15m);
     case 'wyckoff':        return signalWyckoff(sym, bars5m, bars15m);
+    case 'orb':            return signalORB(sym, bars5m, bars15m);
+    case 'trend_pullback': return signalTrendPullback(sym, bars5m, bars15m);
+    case 'bb_divergence':  return signalBBDivergence(sym, bars5m, bars15m);
     case 'rsi_macd':
     default:               return null; // falls through to existing generateSignal
   }
