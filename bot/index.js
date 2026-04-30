@@ -5115,6 +5115,24 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
           }
         } catch(e) { /* 404 = no position, that's fine */ }
       }
+      // ── PRE-ENTRY STALE-PRICE GUARD ──
+      // Signal price is the last 5-min bar close, which can be stale by
+      // minutes when scans take a while. If the current quote has drifted
+      // more than 0.5% from the signal price, the trade thesis no longer
+      // holds — RSI/MACD/etc. were computed at a different price level.
+      // Rejecting here prevents getting filled 3-4% above signal and
+      // immediately stopping out (e.g. SPXL signal $235, fill $243, stop $234).
+      if (!isSimMode() && CONFIG.alpacaKey) {
+        try {
+          const qcheck = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${sym}/quotes/latest?feed=${getDataFeed()}`);
+          const ask = qcheck?.quote?.ap;
+          if (ask && Math.abs(ask - price) / price > 0.005) {
+            log('warn', `🚫 ${sym} stale-price reject: signal $${price.toFixed(2)} vs ask $${ask.toFixed(2)} (${((ask-price)/price*100).toFixed(2)}% drift)`);
+            return;
+          }
+        } catch(e) { /* quote fetch failed — proceed cautiously */ }
+      }
+
       try {
         const orderRes = await placeSmartOrder(sym, finalQty, 'buy', false);
         // Use the actual fill price from Alpaca (falls back to pre-order
@@ -5130,6 +5148,21 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
         }
       }
       catch (e) { log('error', `BUY failed ${sym}: ${e.message}`); return; }
+    }
+
+    // ── RECOMPUTE STOP AROUND FILL PRICE ──
+    // Stop was originally calculated from the signal-time price, BEFORE
+    // we knew the fill price. If slippage was significant (e.g. SPXL signal
+    // $235, filled at $243.48 = 3.5% slip), the stale stop $233.89 sits
+    // 4% below the actual fill — basically guaranteed to trigger on noise.
+    // Always rebuild the stop around the actual entry price.
+    const stopPriceFinal = (() => {
+      const atrStop2 = price - (atrVal14 * CONFIG.atrStopMult);
+      const capStop2 = price * (1 - hardMaxPct);
+      return Math.max(atrStop2, capStop2);
+    })();
+    if (Math.abs(stopPriceFinal - stopPrice) / price > 0.002) {
+      log('risk', `${sym} stop recomputed for fill: $${stopPrice.toFixed(2)} → $${stopPriceFinal.toFixed(2)} (slippage adjustment)`);
     }
     if (isSimMode()) portfolio -= finalCost; // live mode: Alpaca tracks cash
 
@@ -5158,13 +5191,13 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     positions[sym] = {
       entryPrice: price, qty: finalQty, qtyRemaining: finalQty, cost: finalCost,
       entryTime: new Date(), highWater: price, lowWater: price,
-      atrAtEntry: atrVal14, stopPrice,
+      atrAtEntry: atrVal14, stopPrice: stopPriceFinal,
       breakEvenSet: false, tp1Hit: false, tp2Hit: false,
       srLevels, sigInfo, direction: 'long',
       // Rich entry analytics for post-trade learning
       entryAnalytics: {
-        stopDistPct:    +((price - stopPrice) / price * 100).toFixed(3),
-        stopDistAtr:    atrVal14 > 0 ? +((price - stopPrice) / atrVal14).toFixed(2) : 0,
+        stopDistPct:    +((price - stopPriceFinal) / price * 100).toFixed(3),
+        stopDistAtr:    atrVal14 > 0 ? +((price - stopPriceFinal) / atrVal14).toFixed(2) : 0,
         atrPct:         +((atrVal14 / price) * 100).toFixed(3),
         confidence:     sigInfo.confidence,
         score:          sigInfo.score || 0,
@@ -5203,6 +5236,17 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     const stopPrice = Math.min(atrStopS, capStopS);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
+      // Pre-entry stale-price guard (same rationale as long branch)
+      if (!isSimMode() && CONFIG.alpacaKey) {
+        try {
+          const qcheck = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${sym}/quotes/latest?feed=${getDataFeed()}`);
+          const bid = qcheck?.quote?.bp;
+          if (bid && Math.abs(bid - price) / price > 0.005) {
+            log('warn', `🚫 ${sym} SHORT stale-price reject: signal $${price.toFixed(2)} vs bid $${bid.toFixed(2)} (${((bid-price)/price*100).toFixed(2)}% drift)`);
+            return;
+          }
+        } catch(e) {}
+      }
       try {
         const orderRes = await placeSmartOrder(sym, qty, 'sell', false); // sell to open short
         if (orderRes?.filled_avg_price && +orderRes.filled_avg_price > 0) {
@@ -5215,10 +5259,21 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
       }
       catch (e) { log('error', `SHORT failed ${sym}: ${e.message}`); return; }
     }
+
+    // Recompute stop around fill price (slippage protection — same bug
+    // fixed in the long branch). For shorts, stop is ABOVE entry.
+    const stopPriceFinalShort = Math.min(
+      price + (atrVal14s * CONFIG.atrStopMult),
+      price * (1 + hardMaxPctS),
+    );
+    if (Math.abs(stopPriceFinalShort - stopPrice) / price > 0.002) {
+      log('risk', `${sym} SHORT stop recomputed for fill: $${stopPrice.toFixed(2)} → $${stopPriceFinalShort.toFixed(2)}`);
+    }
+
     shortPositions[sym] = {
       entryPrice: price, qty, qtyRemaining: qty,
       entryTime: new Date(), lowWater: price, // track lowest price for trailing
-      atrAtEntry: atrVal, stopPrice,
+      atrAtEntry: atrVal, stopPrice: stopPriceFinalShort,
       breakEvenSet: false, tp1Hit: false, tp2Hit: false,
       srLevels, sigInfo, direction: 'short',
     };
@@ -5228,9 +5283,9 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
       priceHistory5m[sym] = [price];
     }
     trades.push({ time: new Date(), sym, side: 'SHORT', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
-    const stopPct = ((stopPrice - price) / price * 100).toFixed(2);
-    log('short', `🔴 SHORT ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPrice.toFixed(2)} (+${stopPct}%) | conf=${sigInfo.confidence}%`);
-    await sendDiscordAlert('short', sym, qty, price, undefined, undefined, sigInfo, { stopPrice, atrVal });
+    const stopPct = ((stopPriceFinalShort - price) / price * 100).toFixed(2);
+    log('short', `🔴 SHORT ${qty}x ${sym} @ $${price.toFixed(2)} | SL=$${stopPriceFinalShort.toFixed(2)} (+${stopPct}%) | conf=${sigInfo.confidence}%`);
+    await sendDiscordAlert('short', sym, qty, price, undefined, undefined, sigInfo, { stopPrice: stopPriceFinalShort, atrVal });
     await syncTrade({ sym, side: 'SHORT', qty, price, pnl: null, reason: 'SIGNAL', confidence: sigInfo.confidence });
     // syncAll below handles portfolio refresh from Alpaca
   }
