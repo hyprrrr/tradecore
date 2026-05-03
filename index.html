@@ -251,14 +251,15 @@
   #equityChart { width: 100%; height: 100%; }
   .chart-tooltip {
     position: absolute; pointer-events: none;
-    background: var(--bg-3); border: 1px solid var(--border-light);
-    border-radius: var(--radius-sm); padding: 8px 12px; font-size: 11px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: none; z-index: 50; min-width: 140px;
+    background: rgba(13,13,17,0.96); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px; padding: 7px 11px; font-size: 11px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.7); display: none; z-index: 50; min-width: 148px;
+    backdrop-filter: blur(4px);
   }
-  .tt-row { display: flex; justify-content: space-between; gap: 12px; margin: 2px 0; }
-  .tt-label { color: var(--text-dim); }
-  .tt-val { font-family: var(--font-mono); font-weight: 600; }
-  .tt-sep { height: 1px; background: var(--border); margin: 4px 0; }
+  .tt-row { display: flex; justify-content: space-between; gap: 14px; margin: 2px 0; }
+  .tt-label { color: rgba(140,140,155,0.85); font-size: 10.5px; }
+  .tt-val { font-family: var(--font-mono); font-weight: 500; font-size: 11px; }
+  .tt-sep { height: 1px; background: rgba(255,255,255,0.07); margin: 5px 0; }
 
   .chart-legend {
     position: absolute; top: 10px; left: 14px;
@@ -2317,17 +2318,17 @@ function _redrawChartImmediate() {
   const xOf  = i  => pad.l + (i / Math.max(visible.length - 1, 1)) * cw;
   const yOf  = p  => pad.t + ch - ((p - yMin) / yRng) * ch;
 
-  // ── Grid ──────────────────────────────────────────────────────
-  const gridSteps = 5;
+  // ── Grid — TV style: very faint solid lines, no dashes ─────────
+  const gridSteps = 6;
   for (let i = 0; i <= gridSteps; i++) {
     const y     = pad.t + (i / gridSteps) * ch;
     const price = yMax  - (i / gridSteps) * yRng;
-    svg.appendChild(svgLine(pad.l, y, W - pad.r, y, 'var(--border)',
-      i === 0 || i === gridSteps ? '1' : '0.5',
-      i === 0 || i === gridSteps ? null : '4,4'));
-    const t = svgText(W - pad.r + 5, y + 3.5,
-      price >= 1000 ? '$' + price.toLocaleString('en-US',{maximumFractionDigits:0}) : '$' + price.toFixed(2),
-      '9.5', 'var(--text-dim)', 'start');
+    const isEdge = i === 0 || i === gridSteps;
+    svg.appendChild(svgLine(pad.l, y, W - pad.r, y,
+      isEdge ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.04)', '1'));
+    const t = svgText(W - pad.r + 6, y + 3.5,
+      price >= 1000 ? price.toLocaleString('en-US',{maximumFractionDigits:0}) : price.toFixed(2),
+      '9', 'rgba(150,150,160,0.8)', 'start');
     t.setAttribute('font-family', 'var(--font-mono)');
     svg.appendChild(t);
   }
@@ -2354,7 +2355,7 @@ function _redrawChartImmediate() {
       // 5M/15M/30M/1H all show HH:MM, with date prefix only on day boundaries
       label = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
     }
-    svg.appendChild(svgText(x, H - 8, label, '8.5', 'var(--text-dim)', 'middle'));
+    svg.appendChild(svgText(x, H - 6, label, '8.5', 'rgba(120,120,130,0.75)', 'middle'));
   }
 
   // ── EMA(20) ───────────────────────────────────────────────────
@@ -2362,7 +2363,7 @@ function _redrawChartImmediate() {
   const ema20  = calculateEMA(closes, Math.min(20, closes.length));
   let emaPath  = '';
   ema20.forEach((v, i) => { if (v != null) emaPath += (emaPath ? ' L' : 'M') + `${xOf(i)},${yOf(v)}`; });
-  if (emaPath) svg.appendChild(svgPath(emaPath, 'none', 'rgba(241,196,15,0.7)', '1.5'));
+  if (emaPath) svg.appendChild(svgPath(emaPath, 'none', 'rgba(255,196,0,0.75)', '1.2'));
 
   // ── Bollinger Bands ───────────────────────────────────────────
   const bb = closes.map((_, i) => {
@@ -2379,42 +2380,71 @@ function _redrawChartImmediate() {
     // Band fill
     let fill = bpU;
     for (let i = bb.length - 1; i >= 0; i--) { if (bb[i]) fill += ` L${xOf(i)},${yOf(bb[i].lower)}`; }
-    svg.appendChild(svgPath(fill + ' Z', 'rgba(52,152,219,0.05)', null, null));
-    svg.appendChild(svgPath(bpU, 'none', 'rgba(52,152,219,0.3)', '1', '3,3'));
-    svg.appendChild(svgPath(bpL, 'none', 'rgba(52,152,219,0.3)', '1', '3,3'));
+    svg.appendChild(svgPath(fill + ' Z', 'rgba(38,166,154,0.04)', null, null));
+    svg.appendChild(svgPath(bpU, 'none', 'rgba(38,166,154,0.25)', '1'));
+    svg.appendChild(svgPath(bpL, 'none', 'rgba(38,166,154,0.25)', '1'));
   }
 
-  // ── Candles ───────────────────────────────────────────────────
-  const candleW = Math.max(1.5, Math.min(18, (cw / visible.length) * 0.7));
+  // ── Candles — TradingView style ──────────────────────────────
+  // Bull: solid teal/blue body, thin wick same color
+  // Bear: solid darker body with sell-red, thin wick
+  // Spacing: 20% gap between candles (TV default feel)
+  const slotW   = cw / Math.max(visible.length, 1);
+  const candleW = Math.max(2, Math.min(20, slotW * 0.72));
+  const wickW   = Math.max(1, Math.min(1.5, candleW * 0.12)); // thin wicks like TV
+  const BULL_BODY   = '#26a69a';  // TV default green (teal)
+  const BEAR_BODY   = '#ef5350';  // TV default red
+  const BULL_WICK   = '#26a69a';
+  const BEAR_WICK   = '#ef5350';
+
   visible.forEach((d, i) => {
-    const x      = xOf(i);
-    const up     = d.close >= d.open;
-    const color  = up ? 'var(--buy)' : 'var(--sell)';
-    const yo     = yOf(d.open);
-    const yc     = yOf(d.close);
-    const yh     = yOf(d.high);
-    const yl     = yOf(d.low);
-    const top    = Math.min(yo, yc);
-    const bodyH  = Math.max(Math.abs(yo - yc), 1.5);
+    const x   = xOf(i);
+    const up  = d.close >= d.open;
+    const yo  = yOf(d.open);
+    const yc  = yOf(d.close);
+    const yh  = yOf(d.high);
+    const yl  = yOf(d.low);
+    const bodyTop = Math.min(yo, yc);
+    const bodyH   = Math.max(Math.abs(yo - yc), 1.5);
+    const bodyCol = up ? BULL_BODY : BEAR_BODY;
+    const wickCol = up ? BULL_WICK : BEAR_WICK;
 
-    // Wick
-    svg.appendChild(svgLine(x, yh, x, yl, color, '1'));
+    // Upper wick (high → body top)
+    const upperWickBot = bodyTop;
+    if (yh < upperWickBot - 0.5) {
+      const uw = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      uw.setAttribute('x1', x); uw.setAttribute('y1', yh);
+      uw.setAttribute('x2', x); uw.setAttribute('y2', upperWickBot);
+      uw.setAttribute('stroke', wickCol);
+      uw.setAttribute('stroke-width', wickW);
+      uw.setAttribute('stroke-linecap', 'round');
+      svg.appendChild(uw);
+    }
 
-    // Body
-    const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    rect.setAttribute('x', x - candleW / 2);
-    rect.setAttribute('y', top);
-    rect.setAttribute('width', candleW);
-    rect.setAttribute('height', bodyH);
-    rect.setAttribute('fill', color);
-    rect.setAttribute('fill-opacity', up ? '0.25' : '0.9');
-    rect.setAttribute('stroke', color);
-    rect.setAttribute('stroke-width', '1');
-    rect.setAttribute('rx', '1');
-    svg.appendChild(rect);
+    // Lower wick (body bottom → low)
+    const lowerWickTop = bodyTop + bodyH;
+    if (yl > lowerWickTop + 0.5) {
+      const lw = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      lw.setAttribute('x1', x); lw.setAttribute('y1', lowerWickTop);
+      lw.setAttribute('x2', x); lw.setAttribute('y2', yl);
+      lw.setAttribute('stroke', wickCol);
+      lw.setAttribute('stroke-width', wickW);
+      lw.setAttribute('stroke-linecap', 'round');
+      svg.appendChild(lw);
+    }
 
-    // Hit area
-    const slotW = cw / visible.length;
+    // Body — solid fill, slight border radius like TV
+    const body = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    body.setAttribute('x', x - candleW / 2);
+    body.setAttribute('y', bodyTop);
+    body.setAttribute('width', candleW);
+    body.setAttribute('height', bodyH);
+    body.setAttribute('fill', bodyCol);
+    body.setAttribute('rx', candleW > 6 ? '1.5' : '0.8');
+    body.setAttribute('ry', candleW > 6 ? '1.5' : '0.8');
+    svg.appendChild(body);
+
+    // Invisible hit area for tooltip (full slot width)
     const hit = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
     hit.setAttribute('x', x - slotW / 2);
     hit.setAttribute('y', pad.t);
@@ -2422,7 +2452,7 @@ function _redrawChartImmediate() {
     hit.setAttribute('height', ch);
     hit.setAttribute('fill', 'transparent');
     hit.style.cursor = 'crosshair';
-    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, top, up, color); });
+    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, bodyTop, up, bodyCol); });
     hit.addEventListener('mouseleave', hideTooltip);
     svg.appendChild(hit);
   });
@@ -2430,11 +2460,12 @@ function _redrawChartImmediate() {
   // ── Current price line ────────────────────────────────────────
   const last = visible[visible.length - 1];
   const ly   = yOf(last.close);
-  svg.appendChild(svgLine(pad.l, ly, W - pad.r, ly, 'var(--text)', '0.5', '4,3', '0.4'));
+  const priceLineColor = last.close >= last.open ? '#26a69a' : '#ef5350';
+  svg.appendChild(svgLine(pad.l, ly, W - pad.r, ly, priceLineColor, '0.8', '4,3', '0.6'));
   const lbg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-  lbg.setAttribute('x', W - pad.r + 2); lbg.setAttribute('y', ly - 9);
-  lbg.setAttribute('width', 68); lbg.setAttribute('height', 18); lbg.setAttribute('rx', '3');
-  lbg.setAttribute('fill', last.close >= last.open ? 'var(--buy)' : 'var(--sell)');
+  lbg.setAttribute('x', W - pad.r + 1); lbg.setAttribute('y', ly - 9);
+  lbg.setAttribute('width', 70); lbg.setAttribute('height', 18); lbg.setAttribute('rx', '2');
+  lbg.setAttribute('fill', priceLineColor);
   svg.appendChild(lbg);
   const lt = svgText(W - pad.r + 36, ly + 3.5,
     '$' + last.close.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}),
