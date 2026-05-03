@@ -2392,10 +2392,11 @@ function _redrawChartImmediate() {
   const slotW   = cw / Math.max(visible.length, 1);
   const candleW = Math.max(2, Math.min(20, slotW * 0.72));
   const wickW   = Math.max(1, Math.min(1.5, candleW * 0.12)); // thin wicks like TV
-  const BULL_BODY   = '#26a69a';  // TV default green (teal)
-  const BEAR_BODY   = '#ef5350';  // TV default red
-  const BULL_WICK   = '#26a69a';
-  const BEAR_WICK   = '#ef5350';
+  const BULL_BODY   = '#2962ff';  // TV blue (matches screenshot)
+  const BEAR_BODY   = '#131722';  // TV near-black body with border
+  const BEAR_BORDER = '#2962ff';  // bear outline same blue as bull (TV style)
+  const BULL_WICK   = '#2962ff';
+  const BEAR_WICK   = '#2962ff';
 
   visible.forEach((d, i) => {
     const x   = xOf(i);
@@ -2433,13 +2434,19 @@ function _redrawChartImmediate() {
       svg.appendChild(lw);
     }
 
-    // Body — solid fill, slight border radius like TV
+    // Body — bull: solid blue fill. Bear: dark body with blue border (TV screenshot style)
     const body = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
     body.setAttribute('x', x - candleW / 2);
     body.setAttribute('y', bodyTop);
     body.setAttribute('width', candleW);
     body.setAttribute('height', bodyH);
-    body.setAttribute('fill', bodyCol);
+    if (up) {
+      body.setAttribute('fill', BULL_BODY);
+    } else {
+      body.setAttribute('fill', BEAR_BODY);
+      body.setAttribute('stroke', BEAR_BORDER);
+      body.setAttribute('stroke-width', '1');
+    }
     body.setAttribute('rx', candleW > 6 ? '1.5' : '0.8');
     body.setAttribute('ry', candleW > 6 ? '1.5' : '0.8');
     svg.appendChild(body);
@@ -2452,7 +2459,7 @@ function _redrawChartImmediate() {
     hit.setAttribute('height', ch);
     hit.setAttribute('fill', 'transparent');
     hit.style.cursor = 'crosshair';
-    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, bodyTop, up, bodyCol); });
+    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, bodyTop, up, up ? BULL_BODY : BEAR_BORDER); });
     hit.addEventListener('mouseleave', hideTooltip);
     svg.appendChild(hit);
   });
@@ -2460,7 +2467,7 @@ function _redrawChartImmediate() {
   // ── Current price line ────────────────────────────────────────
   const last = visible[visible.length - 1];
   const ly   = yOf(last.close);
-  const priceLineColor = last.close >= last.open ? '#26a69a' : '#ef5350';
+  const priceLineColor = '#2962ff';
   svg.appendChild(svgLine(pad.l, ly, W - pad.r, ly, priceLineColor, '0.8', '4,3', '0.6'));
   const lbg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
   lbg.setAttribute('x', W - pad.r + 1); lbg.setAttribute('y', ly - 9);
