@@ -1690,11 +1690,11 @@ async function syncPortfolio() {
   // ── SIM MODE ──
   if (isSimMode()) {
     const openVal = Object.entries(positions).reduce((a, [sym, pos]) => {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       return a + cur * (pos.qtyRemaining || pos.qty);
     }, 0);
     const shortPnl = Object.entries(shortPositions).reduce((a, [sym, pos]) => {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       return a + (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty);
     }, 0);
     const equity = portfolio + openVal + shortPnl;
@@ -1748,10 +1748,10 @@ async function syncPortfolio() {
   // Alpaca might show equity = cash only (position not valued yet).
   // Calculate our own equity and use whichever is higher.
   const posMarketVal = Object.entries(positions).reduce((a, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
     return a + cur * (pos.qtyRemaining || pos.qty);
   }, 0) + Object.entries(scalpPositions).reduce((a, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
     return a + (pos.direction === 'long' ? cur * pos.qty : 0);
   }, 0);
 
@@ -3240,11 +3240,11 @@ async function runSimScan() {
 
   // Calculate equity from fresh bar prices
   const positionMarketValue = Object.entries(positions).reduce((acc, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
     return acc + cur * (pos.qtyRemaining || pos.qty);
   }, 0);
   const shortPnl = Object.entries(shortPositions).reduce((acc, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
     return acc + (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty);
   }, 0);
   const equity = portfolio + positionMarketValue + shortPnl;
@@ -3627,6 +3627,143 @@ function inKillZone() {
   const lClose = mins >= 600 && mins <= 720;   // 10 AM-12 PM ET
   const nyPM   = mins >= 780 && mins <= 900;   // 1-3 PM ET
   return { inZone: london||nyOpen||lClose||nyPM, london, nyOpen, lClose, nyPM };
+}
+
+// ── Helper: Key Levels (timeframe H/L + PDH/PDL/PDC + HOD/LOD) ──
+// Used by: prop traders, ICT students, SMC practitioners, all serious intraday traders
+// These levels act as magnets for price — stops cluster here, institutions defend them,
+// and breakouts/rejections at these levels produce the highest-probability moves.
+//
+// Timeframes computed from 5m bars (no extra API call):
+//   HOD / LOD   — day's high/low so far (price will be drawn to sweep these)
+//   H60 / L60   — last completed 1-hour candle H/L (most watched by institutions)
+//   H45 / L45   — last 45-min window (less common but used by ICT practitioners)
+//   H30 / L30   — last 30-min window (pre-market / AM session splits)
+//   H15 / L15   — last 15-min window (scalp reference, equal highs/lows sweeps)
+//   PDH / PDL / PDC — previous day high/low/close (overnight orders cluster here)
+//   ORB_H / ORB_L   — opening range high/low (first 30m of session)
+//   MID          — midpoint of HOD-LOD range (50% retracement magnet)
+//
+// Returns: { HOD, LOD, H60, L60, H45, L45, H30, L30, H15, L15,
+//            PDH, PDL, PDC, ORB_H, ORB_L, MID,
+//            nearLevel(price, tol) → { level, label, dist } | null }
+function computeKeyLevels(sym, bars5m) {
+  if (!bars5m || bars5m.length < 12) return null;
+
+  const price = bars5m[bars5m.length - 1].c;
+
+  // ── HOD / LOD ────────────────────────────────────────────────────
+  // Use today's bars only — bar[0] may be old if we have 100 bars (8h+)
+  // Approximate: take all bars since 9:30 AM ET today
+  const etNow  = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const etOpen = new Date(etNow); etOpen.setHours(9, 30, 0, 0);
+  const todayBars = bars5m.filter(b => {
+    if (!b.t) return true; // no timestamp — include all
+    const bt = new Date(b.t);
+    return bt >= etOpen;
+  });
+  const barsForSession = todayBars.length >= 6 ? todayBars : bars5m.slice(-78); // fallback: last 6.5h
+  const HOD = Math.max(...barsForSession.map(b => b.h));
+  const LOD = Math.min(...barsForSession.map(b => b.l));
+  const MID = (HOD + LOD) / 2;
+
+  // ── Period H/L from 5m bars ───────────────────────────────────────
+  // 1 period = N 5-minute bars
+  const periodHL = (n) => {
+    const slice = bars5m.slice(-n);
+    return {
+      h: Math.max(...slice.map(b => b.h)),
+      l: Math.min(...slice.map(b => b.l)),
+    };
+  };
+
+  const p60 = periodHL(12); // 12 × 5m = 60 min
+  const p45 = periodHL(9);  // 9 × 5m  = 45 min
+  const p30 = periodHL(6);  // 6 × 5m  = 30 min
+  const p15 = periodHL(3);  // 3 × 5m  = 15 min
+
+  // ── PDH / PDL / PDC ───────────────────────────────────────────────
+  // We already cache prevDayClose; extract H/L from the oldest portion of bars
+  // as a rough proxy (accurate enough for intraday decisions)
+  const PDC = prevDayClose[sym] || null;
+  // Estimate PDH/PDL from bars that are clearly from yesterday
+  const yestBars = bars5m.filter(b => {
+    if (!b.t) return false;
+    const bt = new Date(b.t);
+    return bt < etOpen;
+  });
+  const PDH = yestBars.length >= 2 ? Math.max(...yestBars.map(b => b.h)) : null;
+  const PDL = yestBars.length >= 2 ? Math.min(...yestBars.map(b => b.l)) : null;
+
+  // ── ORB (Opening Range — first 30 min of session) ─────────────────
+  const orb    = openingRanges[sym];
+  const ORB_H  = orb?.high  || null;
+  const ORB_L  = orb?.low   || null;
+  const ORB_MID = (ORB_H && ORB_L) ? (ORB_H + ORB_L) / 2 : null;
+
+  // ── Catalogue all named levels ────────────────────────────────────
+  const allLevels = [
+    { label: 'HOD',    v: HOD },
+    { label: 'LOD',    v: LOD },
+    { label: 'MID',    v: MID },
+    { label: 'H60',    v: p60.h },
+    { label: 'L60',    v: p60.l },
+    { label: 'H45',    v: p45.h },
+    { label: 'L45',    v: p45.l },
+    { label: 'H30',    v: p30.h },
+    { label: 'L30',    v: p30.l },
+    { label: 'H15',    v: p15.h },
+    { label: 'L15',    v: p15.l },
+    ...(PDH ? [{ label: 'PDH', v: PDH }] : []),
+    ...(PDL ? [{ label: 'PDL', v: PDL }] : []),
+    ...(PDC ? [{ label: 'PDC', v: PDC }] : []),
+    ...(ORB_H ? [{ label: 'ORB_H', v: ORB_H }] : []),
+    ...(ORB_L ? [{ label: 'ORB_L', v: ORB_L }] : []),
+    ...(ORB_MID ? [{ label: 'ORB_MID', v: ORB_MID }] : []),
+  ].filter(l => l.v && isFinite(l.v));
+
+  // ── nearLevel: returns closest level within tolerance ─────────────
+  // tol = fraction of price (default 0.003 = 0.3%)
+  const nearLevel = (px, tol = 0.003) => {
+    const thresh = px * tol;
+    let best = null;
+    for (const l of allLevels) {
+      const dist = Math.abs(px - l.v);
+      if (dist <= thresh && (!best || dist < best.dist)) {
+        best = { label: l.label, level: l.v, dist, distPct: dist / px };
+      }
+    }
+    return best; // null if no level nearby
+  };
+
+  // ── isResistance / isSupport convenience flags ────────────────────
+  // True if price is within 0.3% of a H-type or L-type level
+  const atResistance = () => ['HOD','H60','H45','H30','H15','PDH','ORB_H'].some(
+    lbl => { const l = allLevels.find(x => x.label === lbl); return l && Math.abs(price - l.v) / price < 0.003; }
+  );
+  const atSupport = () => ['LOD','L60','L45','L30','L15','PDL','ORB_L'].some(
+    lbl => { const l = allLevels.find(x => x.label === lbl); return l && Math.abs(price - l.v) / price < 0.003; }
+  );
+
+  // ── Breakout detection: price just crossed a level ────────────────
+  // Compare last bar close vs bar[-2] close
+  const prevClose = bars5m.length >= 2 ? bars5m[bars5m.length - 2].c : price;
+  const breakAbove = allLevels.filter(l => prevClose < l.v && price >= l.v).map(l => l.label);
+  const breakBelow = allLevels.filter(l => prevClose > l.v && price <= l.v).map(l => l.label);
+
+  return {
+    HOD, LOD, MID,
+    H60: p60.h, L60: p60.l,
+    H45: p45.h, L45: p45.l,
+    H30: p30.h, L30: p30.l,
+    H15: p15.h, L15: p15.l,
+    PDH, PDL, PDC,
+    ORB_H, ORB_L, ORB_MID,
+    allLevels,
+    nearLevel,
+    atResistance, atSupport,
+    breakAbove, breakBelow,
+  };
 }
 
 // ── Helper: Wyckoff Phase Detection ──────────────────────────────
@@ -4283,21 +4420,166 @@ function signalBBDivergence(sym, bars5m, bars15m) {
   return { signal: direction==='buy'?'BUY':'SELL', confidence: conf, score, reasons, rsi: r, atr: atr(bars5m, 14) };
 }
 
+// ── Key-Level Score Overlay ──────────────────────────────────────
+// Applied to EVERY strategy's output. Boosts score when price is at
+// a key structural level that professionals watch. Blocks/penalizes
+// entries against those levels.
+//
+// Logic (for BUY signals):
+//   +2  Price at support (LOD, L60, L45, L30, L15, PDL, ORB_L) — buy the floor
+//   +2  Price just broke above a key level (H60, H30, PDH, ORB_H) — momentum breakout
+//   +1  Price near the MID of HOD-LOD range (mean-reversion magnet)
+//   +1  PDC acted as support (within 0.2%)
+//   -3  Price at resistance while trying to buy — hostile entry (blocks weak signals)
+//   -3  Price at support while trying to sell
+// For SELL signals: inverted.
+// BLOCK: if signal is BUY and price is within 0.15% of HOD/H60/PDH (selling wall) → downgrade to HOLD
+// BLOCK: if signal is SELL and price is within 0.15% of LOD/L60/PDL (buying wall) → downgrade to HOLD
+function applyKeyLevelScoring(sig, sym, bars5m) {
+  if (!sig || sig.signal === 'HOLD') return sig;
+
+  const kl = computeKeyLevels(sym, bars5m);
+  if (!kl) return sig;
+
+  const price    = bars5m[bars5m.length - 1].c;
+  const isBuy    = sig.signal === 'BUY';
+  const isSell   = sig.signal === 'SELL';
+  const reasons  = [...(sig.reasons || [])];
+  let   score    = sig.score || 0;
+  let   blocked  = false;
+
+  // ── Hard blocks: entering into a wall ───────────────────────────
+  // BUY at HOD / H60 / PDH = buying the ceiling → block weak signals
+  const resistanceTight = 0.0015;
+  const supportTight    = 0.0015;
+  if (isBuy) {
+    const ceiling = [
+      { lbl: 'HOD',  v: kl.HOD  },
+      { lbl: 'H60',  v: kl.H60  },
+      { lbl: 'PDH',  v: kl.PDH  },
+      { lbl: 'ORB_H',v: kl.ORB_H },
+    ].filter(l => l.v);
+    for (const l of ceiling) {
+      if (Math.abs(price - l.v) / price < resistanceTight) {
+        if (score < 10) { // only block low-conviction signals
+          reasons.push(`🚫 BUY blocked — at ${l.lbl} $${l.v.toFixed(2)} (ceiling)`);
+          blocked = true;
+          break;
+        }
+        score -= 2;
+        reasons.push(`⚠️ At ${l.lbl} $${l.v.toFixed(2)} — resistance above (−2)`);
+      }
+    }
+  }
+  if (isSell) {
+    const floor = [
+      { lbl: 'LOD',  v: kl.LOD  },
+      { lbl: 'L60',  v: kl.L60  },
+      { lbl: 'PDL',  v: kl.PDL  },
+      { lbl: 'ORB_L',v: kl.ORB_L },
+    ].filter(l => l.v);
+    for (const l of floor) {
+      if (Math.abs(price - l.v) / price < supportTight) {
+        if (score < 10) {
+          reasons.push(`🚫 SELL blocked — at ${l.lbl} $${l.v.toFixed(2)} (floor)`);
+          blocked = true;
+          break;
+        }
+        score -= 2;
+        reasons.push(`⚠️ At ${l.lbl} $${l.v.toFixed(2)} — support below (−2)`);
+      }
+    }
+  }
+  if (blocked) return { ...sig, signal: 'HOLD', confidence: 0, score, reasons, _klBlocked: true };
+
+  // ── Confluence boosts ────────────────────────────────────────────
+  const tol = 0.003; // 0.3%
+  if (isBuy) {
+    // Support confluence
+    const supportLevels = [
+      { lbl:'L60',  v:kl.L60  }, { lbl:'L45', v:kl.L45 },
+      { lbl:'L30',  v:kl.L30  }, { lbl:'L15', v:kl.L15 },
+      { lbl:'LOD',  v:kl.LOD  }, { lbl:'PDL', v:kl.PDL },
+      { lbl:'ORB_L',v:kl.ORB_L},
+    ].filter(l => l.v);
+    const atSupport = supportLevels.find(l => Math.abs(price - l.v) / price < tol);
+    if (atSupport) { score += 2; reasons.push(`📐 At ${atSupport.lbl} support $${atSupport.v.toFixed(2)} (+2) ✅`); }
+
+    // Breakout above key level
+    if (kl.breakAbove.length > 0) {
+      score += 2; reasons.push(`🚀 Broke above ${kl.breakAbove.join('/')} (+2) ✅`);
+    }
+
+    // PDC as support (institutional memory — prior close = magnet)
+    if (kl.PDC && Math.abs(price - kl.PDC) / price < 0.002) {
+      score += 1; reasons.push(`📌 PDC support $${kl.PDC.toFixed(2)} (+1) ✅`);
+    }
+
+    // Midpoint magnet (50% retracement buy)
+    if (kl.MID && Math.abs(price - kl.MID) / price < tol && price < kl.HOD * 0.998) {
+      score += 1; reasons.push(`🎯 At HOD-LOD midpoint $${kl.MID.toFixed(2)} (+1) ✅`);
+    }
+
+    // Penalty: buying into resistance
+    if (kl.atResistance()) { score -= 2; reasons.push(`⚠️ Resistance overhead (−2)`); }
+  }
+
+  if (isSell) {
+    // Resistance confluence
+    const resistanceLevels = [
+      { lbl:'H60',  v:kl.H60  }, { lbl:'H45', v:kl.H45 },
+      { lbl:'H30',  v:kl.H30  }, { lbl:'H15', v:kl.H15 },
+      { lbl:'HOD',  v:kl.HOD  }, { lbl:'PDH', v:kl.PDH },
+      { lbl:'ORB_H',v:kl.ORB_H},
+    ].filter(l => l.v);
+    const atResist = resistanceLevels.find(l => Math.abs(price - l.v) / price < tol);
+    if (atResist) { score += 2; reasons.push(`📐 At ${atResist.lbl} resistance $${atResist.v.toFixed(2)} (+2) ✅`); }
+
+    // Breakdown below key level
+    if (kl.breakBelow.length > 0) {
+      score += 2; reasons.push(`📉 Broke below ${kl.breakBelow.join('/')} (+2) ✅`);
+    }
+
+    // PDC as resistance
+    if (kl.PDC && Math.abs(price - kl.PDC) / price < 0.002) {
+      score += 1; reasons.push(`📌 PDC resistance $${kl.PDC.toFixed(2)} (+1) ✅`);
+    }
+
+    // Midpoint magnet
+    if (kl.MID && Math.abs(price - kl.MID) / price < tol && price > kl.LOD * 1.002) {
+      score += 1; reasons.push(`🎯 At HOD-LOD midpoint $${kl.MID.toFixed(2)} (+1) ✅`);
+    }
+
+    // Penalty: selling into support
+    if (kl.atSupport()) { score -= 2; reasons.push(`⚠️ Support below (−2)`); }
+  }
+
+  // If score dropped below threshold, downgrade
+  const minScore = CONFIG.minSignalScore || 5;
+  if (score < minScore) return { ...sig, signal: 'HOLD', confidence: 0, score, reasons, _klDowngraded: true };
+
+  const newConf = Math.min(98, sig.confidence + (score - (sig.score || 0)) * 2);
+  return { ...sig, score, confidence: newConf, reasons, keyLevels: { HOD:kl.HOD, LOD:kl.LOD, H60:kl.H60, L60:kl.L60, H30:kl.H30, L30:kl.L30, H15:kl.H15, L15:kl.L15, PDH:kl.PDH, PDL:kl.PDL, PDC:kl.PDC } };
+}
+
 function generateSignalByStrategy(sym, bars5m, bars15m) {
   const strategy = CONFIG.strategy || 'rsi_macd';
 
+  let sig;
   switch(strategy) {
-    case 'smc':            return signalSMC(sym, bars5m, bars15m);
-    case 'ict':            return signalICT(sym, bars5m, bars15m);
-    case 'vwap_reversion': return signalVWAPReversion(sym, bars5m, bars15m);
-    case 'order_flow':     return signalOrderFlow(sym, bars5m, bars15m);
-    case 'wyckoff':        return signalWyckoff(sym, bars5m, bars15m);
-    case 'orb':            return signalORB(sym, bars5m, bars15m);
-    case 'trend_pullback': return signalTrendPullback(sym, bars5m, bars15m);
-    case 'bb_divergence':  return signalBBDivergence(sym, bars5m, bars15m);
+    case 'smc':            sig = signalSMC(sym, bars5m, bars15m); break;
+    case 'ict':            sig = signalICT(sym, bars5m, bars15m); break;
+    case 'vwap_reversion': sig = signalVWAPReversion(sym, bars5m, bars15m); break;
+    case 'order_flow':     sig = signalOrderFlow(sym, bars5m, bars15m); break;
+    case 'wyckoff':        sig = signalWyckoff(sym, bars5m, bars15m); break;
+    case 'orb':            sig = signalORB(sym, bars5m, bars15m); break;
+    case 'trend_pullback': sig = signalTrendPullback(sym, bars5m, bars15m); break;
+    case 'bb_divergence':  sig = signalBBDivergence(sym, bars5m, bars15m); break;
     case 'rsi_macd':
     default:               return null; // falls through to existing generateSignal
   }
+  // Apply key-level scoring overlay to all named strategies
+  return applyKeyLevelScoring(sig, sym, bars5m);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -4643,11 +4925,13 @@ function generateSignal(sym, bars5m, bars15m) {
     atr: atrVal,
   };
   // Apply APEX learned rules — may boost confidence or block bad setups
-  return apexFilter(_baseSig, {
+  const apexSig = apexFilter(_baseSig, {
     sym: sym || '',
     session: getCurrentSession(),
     atrPct: atrVal / (price || 1),
   });
+  // Apply key-level structural overlay — boosts/blocks based on H/L levels
+  return applyKeyLevelScoring(apexSig, sym, bars5m);
 }
 
 // ─────────────────────────────────────────────
@@ -6483,9 +6767,10 @@ async function runScan() {
       priceHistory15m[sym] = bars15m?.map(b => b.c) || [];
 
       // Manage open long position
-      // Use real-time price from WebSocket stream — sub-ms latency
+      // Prefer alpacaLivePrice (refreshed every 5s from Alpaca /v2/positions) over
+      // priceHistory5m last-close which can be up to 5 minutes stale
       if (positions[sym]) {
-        const rtPrice  = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+        const rtPrice  = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
         const managedPrice = rtPrice && rtPrice > 0 ? rtPrice : price;
         // Merge live tick bars so ATR/RSI use tick-accurate current candle
         const liveBars = getLiveBars(sym, bars5m);
@@ -6502,7 +6787,7 @@ async function runScan() {
 
       // Manage open short position — use real-time price
       if (shortPositions[sym]) {
-        const rtPriceS = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
+        const rtPriceS = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1];
         const managedPriceS = rtPriceS && rtPriceS > 0 ? rtPriceS : price;
         await manageShort(sym, managedPriceS, bars5m);
         if (shortPositions[sym]) {
@@ -6578,7 +6863,7 @@ async function runScan() {
 
   // Summary
   const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+    const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
     return acc + (cur - pos.entryPrice) * pos.qty;
   }, 0);
   const total = portfolio + openPnl;
@@ -6642,7 +6927,7 @@ async function syncAlpacaPositions() {
       alpacaPositions.delete(sym);
       _recentlyClosed[sym] = Date.now();
 
-      const lastPrice = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const lastPrice = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       const qty       = pos.qtyRemaining || pos.qty;
       const pnl       = (lastPrice - pos.entryPrice) * qty;
 
@@ -6671,7 +6956,7 @@ async function syncAlpacaPositions() {
       alpacaShorts.delete(sym);
       _recentlyClosed[sym] = Date.now();
 
-      const lastPrice = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const lastPrice = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       const qty       = pos.qtyRemaining || pos.qty;
       const pnl       = (pos.entryPrice - lastPrice) * qty; // inverted for short
 
@@ -6825,7 +7110,7 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
 
   const displayEquity = realEquity > 0 ? realEquity : portfolio;
   const openPnlTotal  = Object.entries(positions).reduce((a, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+    const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
     return a + (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
   }, 0);
   const dayPnlDisplay = realDailyStartEquity > 0 ? displayEquity - realDailyStartEquity : openPnlTotal;
@@ -7475,7 +7760,7 @@ async function manageScalpPositions() {
         const reversed = (pos.direction === 'long'  && sig.signal === 'SELL' && sig.score >= CONFIG.scalpMinScore)
                       || (pos.direction === 'short' && sig.signal === 'BUY'  && sig.score >= CONFIG.scalpMinScore);
         if (reversed && scalpPositions[sym]) {
-          const price = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+          const price = alpacaLivePrice[sym] || alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
           log('scalp', `↩️ Signal reversal: ${sym} — exiting`);
           await exitScalp(sym, price, 'SCALP_REVERSE');
         }
@@ -7892,11 +8177,11 @@ async function tick() {
       if (allOpen.length > 0) {
         log('risk', `⏰ INTRADAY CLOSE-ALL: ${allOpen.length} positions still open at market close`);
         for (const sym of Object.keys(positions)) {
-          const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || positions[sym].entryPrice;
+          const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || positions[sym].entryPrice;
           await exitPosition(sym, cur, 'INTRADAY_CLOSE');
         }
         for (const sym of Object.keys(shortPositions)) {
-          const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || shortPositions[sym].entryPrice;
+          const cur = alpacaLivePrice[sym] || alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || shortPositions[sym].entryPrice;
           await coverShort(sym, cur, 'INTRADAY_CLOSE');
         }
       }
@@ -8044,20 +8329,20 @@ setInterval(async () => {
 
   for (const sym of [...Object.keys(positions)]) {
     try {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || positions[sym].entryPrice;
+      const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || positions[sym].entryPrice;
       await exitPosition(sym, cur, 'INTRADAY_CLOSE');
       log('risk', `✅ Overnight close: ${sym}`);
     } catch(e) { log('error', `Overnight close failed ${sym}: ${e.message}`); }
   }
   for (const sym of [...Object.keys(shortPositions)]) {
     try {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || shortPositions[sym].entryPrice;
+      const cur = alpacaLivePrice[sym] || alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || shortPositions[sym].entryPrice;
       await coverShort(sym, cur, 'INTRADAY_CLOSE');
     } catch(e) { log('error', `Overnight short close failed ${sym}: ${e.message}`); }
   }
   for (const sym of [...Object.keys(scalpPositions)]) {
     try {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || scalpPositions[sym].entryPrice;
+      const cur = alpacaLivePrice[sym] || alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || scalpPositions[sym].entryPrice;
       await exitScalp(sym, cur, 'SCALP_TIME');
     } catch(e) { log('error', `Overnight scalp close failed ${sym}: ${e.message}`); }
   }
@@ -8137,7 +8422,7 @@ function verifyDiscordRequest(rawBody, signature, timestamp) {
 
 // Format a position as a Discord embed field value
 function formatPosition(sym, pos, isShort = false) {
-  const cur    = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+  const cur    = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
   const pnl    = isShort
     ? (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty)
     : (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
@@ -8159,7 +8444,7 @@ async function handleSlashCommand(commandName, options) {
     // Check all position types
     if (positions[sym]) {
       const pos   = positions[sym];
-      const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       await exitPosition(sym, price, 'MANUAL_DISCORD');
       const pnl = (price - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
       return { content: `✅ **${sym}** long position exited @ $${price.toFixed(2)}\nP&L: ${pnl>=0?'**+':'**'}$${pnl.toFixed(2)}**\nReason: Manual Discord command` };
@@ -8167,7 +8452,7 @@ async function handleSlashCommand(commandName, options) {
 
     if (shortPositions[sym]) {
       const pos   = shortPositions[sym];
-      const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       await coverShort(sym, price, 'MANUAL_DISCORD');
       const pnl = (pos.entryPrice - price) * (pos.qtyRemaining || pos.qty);
       return { content: `✅ **${sym}** short position covered @ $${price.toFixed(2)}\nP&L: ${pnl>=0?'**+':'**'}$${pnl.toFixed(2)}**\nReason: Manual Discord command` };
@@ -8175,7 +8460,7 @@ async function handleSlashCommand(commandName, options) {
 
     if (scalpPositions[sym]) {
       const pos   = scalpPositions[sym];
-      const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       await exitScalp(sym, price, 'SCALP_MANUAL');
       const pnl = pos.direction === 'long'
         ? (price - pos.entryPrice) * pos.qty
@@ -8204,7 +8489,7 @@ async function handleSlashCommand(commandName, options) {
     for (const sym of Object.keys(positions)) {
       try {
         const pos   = positions[sym];
-        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
         const pnl   = (price - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
         await exitPosition(sym, price, 'MANUAL_DISCORD');
         totalPnl += pnl;
@@ -8217,7 +8502,7 @@ async function handleSlashCommand(commandName, options) {
     for (const sym of Object.keys(shortPositions)) {
       try {
         const pos   = shortPositions[sym];
-        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
         const pnl   = (pos.entryPrice - price) * (pos.qtyRemaining || pos.qty);
         await coverShort(sym, price, 'MANUAL_DISCORD');
         totalPnl += pnl;
@@ -8230,7 +8515,7 @@ async function handleSlashCommand(commandName, options) {
     for (const sym of Object.keys(scalpPositions)) {
       try {
         const pos   = scalpPositions[sym];
-        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
         const pnl   = pos.direction === 'long'
           ? (price - pos.entryPrice) * pos.qty
           : (pos.entryPrice - price) * pos.qty;
@@ -8256,7 +8541,7 @@ async function handleSlashCommand(commandName, options) {
   // ── /status ──
   if (commandName === 'status') {
     const openPnl = Object.entries(positions).reduce((a, [s, p]) => {
-      const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || p.entryPrice;
+      const cur = alpacaLivePrice[s] || priceHistory5m[s]?.[priceHistory5m[s].length-1] || p.entryPrice;
       return a + (cur - p.entryPrice) * (p.qtyRemaining || p.qty);
     }, 0);
     const equity = realEquity || portfolio + openPnl;
@@ -8281,7 +8566,7 @@ async function handleSlashCommand(commandName, options) {
       ...Object.entries(positions).map(([s,p])      => `🟢 **${s}** (LONG)\n${formatPosition(s,p,false)}`),
       ...Object.entries(shortPositions).map(([s,p]) => `🔴 **${s}** (SHORT)\n${formatPosition(s,p,true)}`),
       ...Object.entries(scalpPositions).map(([s,p]) => {
-        const cur = priceHistory5m[s]?.[priceHistory5m[s].length-1] || p.entryPrice;
+        const cur = alpacaLivePrice[s] || priceHistory5m[s]?.[priceHistory5m[s].length-1] || p.entryPrice;
         const pnl = p.direction==='long' ? (cur-p.entryPrice)*p.qty : (p.entryPrice-cur)*p.qty;
         return `⚡ **${s}** (SCALP ${p.direction.toUpperCase()})\n${p.qty}x @ $${p.entryPrice.toFixed(2)} → $${cur.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`;
       }),
@@ -8410,7 +8695,7 @@ http.createServer(async (req, res) => {
     for (const sym of Object.keys(positions)) {
       try {
         const pos   = positions[sym];
-        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
         const pnl   = (price - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
         await exitPosition(sym, price, 'MANUAL_DISCORD');
         totalPnl += pnl; closed++;
@@ -8419,7 +8704,7 @@ http.createServer(async (req, res) => {
     for (const sym of Object.keys(shortPositions)) {
       try {
         const pos   = shortPositions[sym];
-        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
         const pnl   = (pos.entryPrice - price) * (pos.qtyRemaining || pos.qty);
         await coverShort(sym, price, 'MANUAL_DISCORD');
         totalPnl += pnl; closed++;
@@ -8428,7 +8713,7 @@ http.createServer(async (req, res) => {
     for (const sym of Object.keys(scalpPositions)) {
       try {
         const pos   = scalpPositions[sym];
-        const price = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+        const price = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
         const pnl   = pos.direction === 'long'
           ? (price - pos.entryPrice) * pos.qty
           : (pos.entryPrice - price) * pos.qty;
@@ -8458,7 +8743,7 @@ http.createServer(async (req, res) => {
 
     // Snapshot every position with full detail
     const posSnapshot = Object.entries(positions).map(([sym, pos]) => {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       return {
         sym, direction: 'LONG',
         entryPrice: pos.entryPrice, currentPrice: cur,
@@ -8473,7 +8758,7 @@ http.createServer(async (req, res) => {
       };
     });
     const shortSnapshot = Object.entries(shortPositions).map(([sym, pos]) => {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       return {
         sym, direction: 'SHORT',
         entryPrice: pos.entryPrice, currentPrice: cur,
@@ -8483,7 +8768,7 @@ http.createServer(async (req, res) => {
       };
     });
     const scalpSnapshot = Object.entries(scalpPositions).map(([sym, pos]) => {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       return {
         sym, direction: pos.direction,
         entryPrice: pos.entryPrice, currentPrice: cur,
@@ -8598,7 +8883,7 @@ http.createServer(async (req, res) => {
   // ── GET / — health check ──
   if (req.method === 'GET' && url === '/') {
     const openPnl = Object.entries(positions).reduce((acc, [sym, pos]) => {
-      const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
+      const cur = alpacaLivePrice[sym] || priceHistory5m[sym]?.[priceHistory5m[sym].length - 1] || pos.entryPrice;
       return acc + (cur - pos.entryPrice) * pos.qty;
     }, 0);
     res.writeHead(200, { 'Content-Type': 'application/json' });
