@@ -251,15 +251,14 @@
   #equityChart { width: 100%; height: 100%; }
   .chart-tooltip {
     position: absolute; pointer-events: none;
-    background: rgba(13,13,17,0.96); border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 4px; padding: 7px 11px; font-size: 11px;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.7); display: none; z-index: 50; min-width: 148px;
-    backdrop-filter: blur(4px);
+    background: var(--bg-3); border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm); padding: 8px 12px; font-size: 11px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: none; z-index: 50; min-width: 140px;
   }
-  .tt-row { display: flex; justify-content: space-between; gap: 14px; margin: 2px 0; }
-  .tt-label { color: rgba(140,140,155,0.85); font-size: 10.5px; }
-  .tt-val { font-family: var(--font-mono); font-weight: 500; font-size: 11px; }
-  .tt-sep { height: 1px; background: rgba(255,255,255,0.07); margin: 5px 0; }
+  .tt-row { display: flex; justify-content: space-between; gap: 12px; margin: 2px 0; }
+  .tt-label { color: var(--text-dim); }
+  .tt-val { font-family: var(--font-mono); font-weight: 600; }
+  .tt-sep { height: 1px; background: var(--border); margin: 4px 0; }
 
   .chart-legend {
     position: absolute; top: 10px; left: 14px;
@@ -2151,6 +2150,10 @@ const chart = {
 //      rolls forward at bucket boundaries.
 //   4. Keep the user's viewport stable: if they were pinned to the right
 //      edge, slide with the new candle; otherwise don't touch the view.
+// Track which bucket the live candle last rendered so we detect boundary
+// crossings even when equity is flat (v === last.close every tick).
+let _liveCandleLastBucketKey = 0;
+
 function tickLiveCandle() {
   if (state._chartPaused) return;
   const v = state.portfolio ? +state.portfolio.total_value : null;
@@ -2159,40 +2162,63 @@ function tickLiveCandle() {
 
   const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
   const bucketMs = msMap[chart.tf] || 3600e3;
-  const now   = Date.now();
-  const key   = Math.floor(now / bucketMs) * bucketMs;
+  const now      = Date.now();
+  const key      = Math.floor(now / bucketMs) * bucketMs;
 
-  const last      = chart.allCandles[chart.allCandles.length - 1];
-  const lastKey   = last.time instanceof Date ? last.time.getTime() : +last.time;
+  const last    = chart.allCandles[chart.allCandles.length - 1];
+  const lastKey = last.time instanceof Date ? last.time.getTime() : +last.time;
   const wasAtEdge = (chart.viewStart + chart.viewCount >= chart.allCandles.length - 1);
 
-  if (key === lastKey) {
-    // Same bucket — extend the current candle in place
-    if (v === last.close) return; // nothing changed, skip render
-    last.close = v;
-    if (v > last.high) last.high = v;
-    if (v < last.low)  last.low  = v;
-  } else if (key > lastKey) {
-    // Crossed a bucket boundary — start a new candle
-    const openPrice = last.close;
+  if (key > lastKey) {
+    // ── Crossed one or more bucket boundaries ─────────────────────
+    // Fill any skipped intermediate buckets as flat doji candles
+    // (equity was unchanged — no trades fired — so H/L/O/C = last close)
+    // Cap at 12 buckets to avoid flooding (overnight gap etc.)
+    const gapCount = Math.min(12, Math.floor((key - lastKey) / bucketMs) - 1);
+    for (let g = 1; g <= gapCount; g++) {
+      const gapKey = lastKey + g * bucketMs;
+      chart.allCandles.push({
+        time:   new Date(gapKey),
+        open:   last.close, high: last.close, low: last.close, close: last.close,
+        volume: 0, live: true,
+      });
+    }
+    // Push the current live bucket
     chart.allCandles.push({
       time:   new Date(key),
-      open:   openPrice,
-      high:   Math.max(openPrice, v),
-      low:    Math.min(openPrice, v),
+      open:   last.close,
+      high:   Math.max(last.close, v),
+      low:    Math.min(last.close, v),
       close:  v,
       volume: 1,
       live:   true,
     });
-    // If user was tracking the right edge, slide viewport with the new candle
+    _liveCandleLastBucketKey = key;
     if (wasAtEdge) {
       chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
     }
-  } else {
-    // key < lastKey → clock skew, ignore
+    redrawChart();
     return;
   }
 
+  // ── Same bucket ───────────────────────────────────────────────────
+  // Always update OHLC so wicks/body are accurate, but only redraw if
+  // something actually changed (avoids ~120 redraws/min when idle)
+  const changed = (v !== last.close) || (v > last.high) || (v < last.low);
+  last.close = v;
+  if (v > last.high) last.high = v;
+  if (v < last.low)  last.low  = v;
+
+  // Even if value is flat: check if we need to redraw because it's been
+  // a while (keeps the chart "alive" visually — e.g. price label refreshes)
+  const now2 = Date.now();
+  if (!changed) {
+    if (!tickLiveCandle._lastForceRedraw || now2 - tickLiveCandle._lastForceRedraw > 10000) {
+      tickLiveCandle._lastForceRedraw = now2;
+      redrawChart(); // heartbeat redraw every 10s even when flat
+    }
+    return;
+  }
   redrawChart();
 }
 
@@ -2261,6 +2287,7 @@ function buildCandlesForTF(snapshots, tf) {
 function setTF(tf) {
   // User-initiated timeframe change — safe to reset view.
   chart.tf = tf;
+  _liveCandleLastBucketKey = 0; // reset so tickLiveCandle re-syncs to current bucket
   chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
   if (!chart.allCandles.length) return;
   // Default view: show last 60 candles (or all if fewer)
@@ -2318,17 +2345,17 @@ function _redrawChartImmediate() {
   const xOf  = i  => pad.l + (i / Math.max(visible.length - 1, 1)) * cw;
   const yOf  = p  => pad.t + ch - ((p - yMin) / yRng) * ch;
 
-  // ── Grid — TV style: very faint solid lines, no dashes ─────────
-  const gridSteps = 6;
+  // ── Grid ──────────────────────────────────────────────────────
+  const gridSteps = 5;
   for (let i = 0; i <= gridSteps; i++) {
     const y     = pad.t + (i / gridSteps) * ch;
     const price = yMax  - (i / gridSteps) * yRng;
-    const isEdge = i === 0 || i === gridSteps;
-    svg.appendChild(svgLine(pad.l, y, W - pad.r, y,
-      isEdge ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.04)', '1'));
-    const t = svgText(W - pad.r + 6, y + 3.5,
-      price >= 1000 ? price.toLocaleString('en-US',{maximumFractionDigits:0}) : price.toFixed(2),
-      '9', 'rgba(150,150,160,0.8)', 'start');
+    svg.appendChild(svgLine(pad.l, y, W - pad.r, y, 'var(--border)',
+      i === 0 || i === gridSteps ? '1' : '0.5',
+      i === 0 || i === gridSteps ? null : '4,4'));
+    const t = svgText(W - pad.r + 5, y + 3.5,
+      price >= 1000 ? '$' + price.toLocaleString('en-US',{maximumFractionDigits:0}) : '$' + price.toFixed(2),
+      '9.5', 'var(--text-dim)', 'start');
     t.setAttribute('font-family', 'var(--font-mono)');
     svg.appendChild(t);
   }
@@ -2355,7 +2382,7 @@ function _redrawChartImmediate() {
       // 5M/15M/30M/1H all show HH:MM, with date prefix only on day boundaries
       label = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
     }
-    svg.appendChild(svgText(x, H - 6, label, '8.5', 'rgba(120,120,130,0.75)', 'middle'));
+    svg.appendChild(svgText(x, H - 8, label, '8.5', 'var(--text-dim)', 'middle'));
   }
 
   // ── EMA(20) ───────────────────────────────────────────────────
@@ -2363,7 +2390,7 @@ function _redrawChartImmediate() {
   const ema20  = calculateEMA(closes, Math.min(20, closes.length));
   let emaPath  = '';
   ema20.forEach((v, i) => { if (v != null) emaPath += (emaPath ? ' L' : 'M') + `${xOf(i)},${yOf(v)}`; });
-  if (emaPath) svg.appendChild(svgPath(emaPath, 'none', 'rgba(255,196,0,0.75)', '1.2'));
+  if (emaPath) svg.appendChild(svgPath(emaPath, 'none', 'rgba(241,196,15,0.7)', '1.5'));
 
   // ── Bollinger Bands ───────────────────────────────────────────
   const bb = closes.map((_, i) => {
@@ -2380,78 +2407,42 @@ function _redrawChartImmediate() {
     // Band fill
     let fill = bpU;
     for (let i = bb.length - 1; i >= 0; i--) { if (bb[i]) fill += ` L${xOf(i)},${yOf(bb[i].lower)}`; }
-    svg.appendChild(svgPath(fill + ' Z', 'rgba(38,166,154,0.04)', null, null));
-    svg.appendChild(svgPath(bpU, 'none', 'rgba(38,166,154,0.25)', '1'));
-    svg.appendChild(svgPath(bpL, 'none', 'rgba(38,166,154,0.25)', '1'));
+    svg.appendChild(svgPath(fill + ' Z', 'rgba(52,152,219,0.05)', null, null));
+    svg.appendChild(svgPath(bpU, 'none', 'rgba(52,152,219,0.3)', '1', '3,3'));
+    svg.appendChild(svgPath(bpL, 'none', 'rgba(52,152,219,0.3)', '1', '3,3'));
   }
 
-  // ── Candles — TradingView style ──────────────────────────────
-  // Bull: solid teal/blue body, thin wick same color
-  // Bear: solid darker body with sell-red, thin wick
-  // Spacing: 20% gap between candles (TV default feel)
-  const slotW   = cw / Math.max(visible.length, 1);
-  const candleW = Math.max(2, Math.min(20, slotW * 0.72));
-  const wickW   = Math.max(1, Math.min(1.5, candleW * 0.12)); // thin wicks like TV
-  const BULL_BODY   = '#2962ff';  // TV blue (matches screenshot)
-  const BEAR_BODY   = '#131722';  // TV near-black body with border
-  const BEAR_BORDER = '#2962ff';  // bear outline same blue as bull (TV style)
-  const BULL_WICK   = '#2962ff';
-  const BEAR_WICK   = '#2962ff';
-
+  // ── Candles ───────────────────────────────────────────────────
+  const candleW = Math.max(1.5, Math.min(18, (cw / visible.length) * 0.7));
   visible.forEach((d, i) => {
-    const x   = xOf(i);
-    const up  = d.close >= d.open;
-    const yo  = yOf(d.open);
-    const yc  = yOf(d.close);
-    const yh  = yOf(d.high);
-    const yl  = yOf(d.low);
-    const bodyTop = Math.min(yo, yc);
-    const bodyH   = Math.max(Math.abs(yo - yc), 1.5);
-    const bodyCol = up ? BULL_BODY : BEAR_BODY;
-    const wickCol = up ? BULL_WICK : BEAR_WICK;
+    const x      = xOf(i);
+    const up     = d.close >= d.open;
+    const color  = up ? 'var(--buy)' : 'var(--sell)';
+    const yo     = yOf(d.open);
+    const yc     = yOf(d.close);
+    const yh     = yOf(d.high);
+    const yl     = yOf(d.low);
+    const top    = Math.min(yo, yc);
+    const bodyH  = Math.max(Math.abs(yo - yc), 1.5);
 
-    // Upper wick (high → body top)
-    const upperWickBot = bodyTop;
-    if (yh < upperWickBot - 0.5) {
-      const uw = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      uw.setAttribute('x1', x); uw.setAttribute('y1', yh);
-      uw.setAttribute('x2', x); uw.setAttribute('y2', upperWickBot);
-      uw.setAttribute('stroke', wickCol);
-      uw.setAttribute('stroke-width', wickW);
-      uw.setAttribute('stroke-linecap', 'round');
-      svg.appendChild(uw);
-    }
+    // Wick
+    svg.appendChild(svgLine(x, yh, x, yl, color, '1'));
 
-    // Lower wick (body bottom → low)
-    const lowerWickTop = bodyTop + bodyH;
-    if (yl > lowerWickTop + 0.5) {
-      const lw = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      lw.setAttribute('x1', x); lw.setAttribute('y1', lowerWickTop);
-      lw.setAttribute('x2', x); lw.setAttribute('y2', yl);
-      lw.setAttribute('stroke', wickCol);
-      lw.setAttribute('stroke-width', wickW);
-      lw.setAttribute('stroke-linecap', 'round');
-      svg.appendChild(lw);
-    }
+    // Body
+    const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    rect.setAttribute('x', x - candleW / 2);
+    rect.setAttribute('y', top);
+    rect.setAttribute('width', candleW);
+    rect.setAttribute('height', bodyH);
+    rect.setAttribute('fill', color);
+    rect.setAttribute('fill-opacity', up ? '0.25' : '0.9');
+    rect.setAttribute('stroke', color);
+    rect.setAttribute('stroke-width', '1');
+    rect.setAttribute('rx', '1');
+    svg.appendChild(rect);
 
-    // Body — bull: solid blue fill. Bear: dark body with blue border (TV screenshot style)
-    const body = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    body.setAttribute('x', x - candleW / 2);
-    body.setAttribute('y', bodyTop);
-    body.setAttribute('width', candleW);
-    body.setAttribute('height', bodyH);
-    if (up) {
-      body.setAttribute('fill', BULL_BODY);
-    } else {
-      body.setAttribute('fill', BEAR_BODY);
-      body.setAttribute('stroke', BEAR_BORDER);
-      body.setAttribute('stroke-width', '1');
-    }
-    body.setAttribute('rx', candleW > 6 ? '1.5' : '0.8');
-    body.setAttribute('ry', candleW > 6 ? '1.5' : '0.8');
-    svg.appendChild(body);
-
-    // Invisible hit area for tooltip (full slot width)
+    // Hit area
+    const slotW = cw / visible.length;
     const hit = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
     hit.setAttribute('x', x - slotW / 2);
     hit.setAttribute('y', pad.t);
@@ -2459,7 +2450,7 @@ function _redrawChartImmediate() {
     hit.setAttribute('height', ch);
     hit.setAttribute('fill', 'transparent');
     hit.style.cursor = 'crosshair';
-    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, bodyTop, up, up ? BULL_BODY : BEAR_BORDER); });
+    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, top, up, color); });
     hit.addEventListener('mouseleave', hideTooltip);
     svg.appendChild(hit);
   });
@@ -2467,12 +2458,11 @@ function _redrawChartImmediate() {
   // ── Current price line ────────────────────────────────────────
   const last = visible[visible.length - 1];
   const ly   = yOf(last.close);
-  const priceLineColor = '#2962ff';
-  svg.appendChild(svgLine(pad.l, ly, W - pad.r, ly, priceLineColor, '0.8', '4,3', '0.6'));
+  svg.appendChild(svgLine(pad.l, ly, W - pad.r, ly, 'var(--text)', '0.5', '4,3', '0.4'));
   const lbg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-  lbg.setAttribute('x', W - pad.r + 1); lbg.setAttribute('y', ly - 9);
-  lbg.setAttribute('width', 70); lbg.setAttribute('height', 18); lbg.setAttribute('rx', '2');
-  lbg.setAttribute('fill', priceLineColor);
+  lbg.setAttribute('x', W - pad.r + 2); lbg.setAttribute('y', ly - 9);
+  lbg.setAttribute('width', 68); lbg.setAttribute('height', 18); lbg.setAttribute('rx', '3');
+  lbg.setAttribute('fill', last.close >= last.open ? 'var(--buy)' : 'var(--sell)');
   svg.appendChild(lbg);
   const lt = svgText(W - pad.r + 36, ly + 3.5,
     '$' + last.close.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}),
@@ -2823,7 +2813,8 @@ document.querySelectorAll('.tf-btn').forEach(btn => {
 async function refreshAnalytics() {
   // Fetch all trades (not just 24h)
   const tbl = state.mode === 'sim' ? 'sim_tc_trades' : 'tc_trades';
-  const data = await sbFetch(`${tbl}?select=*&order=created_at.desc&limit=500`, 'GET');
+  // Fetch up to 5000 trades — 500 was losing ~80% of history on active bots
+  const data = await sbFetch(`${tbl}?select=*&order=created_at.desc&limit=5000`, 'GET');
   if (!data || !Array.isArray(data)) return;
   const trades = data;
 
@@ -2846,15 +2837,26 @@ async function refreshAnalytics() {
   const largestWin  = wins.length   ? wins.reduce((a,b)   => (b.pnl||0) > (a.pnl||0) ? b : a) : null;
   const largestLoss = losses.length ? losses.reduce((a,b) => (b.pnl||0) < (a.pnl||0) ? b : a) : null;
 
-  const scalps = closed.filter(t => (t.side||'').includes('SCALP') || (t.side||'').includes('scalp'));
-  const swings = closed.filter(t => !((t.side||'').includes('SCALP')));
+  // Scalp trades are identified by reason (SCALP_TP/SCALP_SL/SCALP_TRAIL etc.), not side
+  const scalps = closed.filter(t => (t.reason||'').toUpperCase().startsWith('SCALP') || (t.side||'').toUpperCase().includes('SCALP'));
+  const swings = closed.filter(t => !((t.reason||'').toUpperCase().startsWith('SCALP') || (t.side||'').toUpperCase().includes('SCALP')));
 
-  const dayPnl = state.portfolio?.day_pnl || 0;
+  // Compute day P&L by summing today's closed trades in local time
+  // portfolio.day_pnl is unreliable — it's not always updated correctly by Alpaca paper
+  const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+  const dayTrades = closed.filter(t => {
+    if (!t.created_at) return false;
+    return new Date(t.created_at).toLocaleDateString('en-US', { timeZone: 'America/New_York' }) === todayStr;
+  });
+  const dayPnl = dayTrades.reduce((s, t) => s + (t.pnl || 0), 0);
+  const dayWins = dayTrades.filter(t => (t.pnl||0) > 0).length;
+  const dayLoss = dayTrades.filter(t => (t.pnl||0) < 0).length;
 
   // Update cards
   $('aTotalPnL').textContent = (totalPnL >= 0 ? '+$' : '-$') + Math.abs(totalPnL).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   $('aTotalPnL').style.color = totalPnL >= 0 ? 'var(--buy)' : 'var(--sell)';
-  $('aTotalPct').textContent = (totalPnL >= 0 ? '+' : '') + (startCap > 0 ? (totalPnL/startCap*100).toFixed(2) : '0.00') + '% all-time';
+  const pctBase = startCap > 0 ? startCap : (eq - totalPnL) || 1;
+  $('aTotalPct').textContent = (totalPnL >= 0 ? '+' : '') + (pctBase > 0 ? (totalPnL/pctBase*100).toFixed(2) : '0.00') + '% all-time';
   $('aWinRate').textContent = wr.toFixed(1) + '%';
   $('aWinRate').style.color = wr >= 50 ? 'var(--buy)' : 'var(--sell)';
   $('aWinLoss').textContent = wins.length + 'W / ' + losses.length + 'L';
@@ -2864,7 +2866,9 @@ async function refreshAnalytics() {
   $('aRR').textContent = 'Risk:Reward ' + rr.toFixed(2) + ':1';
   $('aDayPnL').textContent = (dayPnl >= 0 ? '+$' : '-$') + Math.abs(dayPnl).toFixed(2);
   $('aDayPnL').style.color = dayPnl >= 0 ? 'var(--buy)' : 'var(--sell)';
-  $('aDayPct').textContent = (dayPnl >= 0 ? '+' : '') + (startCap > 0 ? (dayPnl/startCap*100).toFixed(2) : '0.00') + '% today';
+  $('aDayPct').textContent = dayTrades.length > 0
+    ? `${dayTrades.length} trades today (${dayWins}W/${dayLoss}L)`
+    : (dayPnl >= 0 ? '+' : '') + (startCap > 0 ? (dayPnl/startCap*100).toFixed(2) : '0.00') + '% today';
   $('aTotalTrades').textContent = closed.length;
   $('aScalpTrades').textContent = scalps.length + ' scalp / ' + swings.length + ' swing';
   $('aLargestWin').textContent  = largestWin  ? '+$' + largestWin.pnl.toFixed(2)   : '--';
@@ -2916,14 +2920,17 @@ async function refreshAnalytics() {
 
   // By session (using hour of day as proxy)
   const sessions = {'Pre-Mkt (4-9:30)':[], 'US Open (9:30-12)':[], 'Midday (12-2)':[], 'Close (2-4)':[], 'After (4-8)':[]};
+  // Use ET for session bucketing — UTC was off by 4-5 hours
   closed.forEach(t => {
     if (!t.created_at) return;
-    const h = new Date(t.created_at).getHours();
-    if (h < 9 || (h === 9 && new Date(t.created_at).getMinutes() < 30)) sessions['Pre-Mkt (4-9:30)'].push(t);
-    else if (h < 12) sessions['US Open (9:30-12)'].push(t);
-    else if (h < 14) sessions['Midday (12-2)'].push(t);
-    else if (h < 16) sessions['Close (2-4)'].push(t);
-    else sessions['After (4-8)'].push(t);
+    const etDate = new Date(new Date(t.created_at).toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const h = etDate.getHours(), m = etDate.getMinutes();
+    const mins = h * 60 + m;
+    if      (mins < 9*60+30)              sessions['Pre-Mkt (4-9:30)'].push(t);
+    else if (mins < 12*60)                sessions['US Open (9:30-12)'].push(t);
+    else if (mins < 14*60)                sessions['Midday (12-2)'].push(t);
+    else if (mins < 16*60)                sessions['Close (2-4)'].push(t);
+    else                                  sessions['After (4-8)'].push(t);
   });
   $('analyticsSessions').innerHTML = Object.entries(sessions).map(([name, ts]) => {
     if (!ts.length) return `<div class="analytics-bar-row"><span class="analytics-bar-label" style="width:130px">${name}</span><span style="color:var(--text-dim);font-size:11px;">No trades</span></div>`;
