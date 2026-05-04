@@ -5141,8 +5141,12 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
         try {
           const qcheck = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${sym}/quotes/latest?feed=${getDataFeed()}`);
           const ask = qcheck?.quote?.ap;
-          if (ask && Math.abs(ask - price) / price > 0.005) {
-            log('warn', `🚫 ${sym} stale-price reject: signal $${price.toFixed(2)} vs ask $${ask.toFixed(2)} (${((ask-price)/price*100).toFixed(2)}% drift)`);
+          // Threshold raised 0.5%→1.5%: bar prefetch takes 25-45s so normal
+          // intraday movement easily exceeds 0.5% before we reach this gate.
+          // 1.5% still blocks the dangerous SPXL-type fills ($235 signal → $243 fill).
+          const driftPct = Math.abs(ask - price) / price;
+          if (ask && driftPct > 0.015) {
+            log('warn', `🚫 ${sym} stale-price reject: signal $${price.toFixed(2)} vs ask $${ask.toFixed(2)} (${(driftPct*100).toFixed(2)}% drift)`);
             return;
           }
         } catch(e) { /* quote fetch failed — proceed cautiously */ }
@@ -5256,8 +5260,9 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
         try {
           const qcheck = await alpacaFetch(`${ALPACA_DATA_BASE}/v2/stocks/${sym}/quotes/latest?feed=${getDataFeed()}`);
           const bid = qcheck?.quote?.bp;
-          if (bid && Math.abs(bid - price) / price > 0.005) {
-            log('warn', `🚫 ${sym} SHORT stale-price reject: signal $${price.toFixed(2)} vs bid $${bid.toFixed(2)} (${((bid-price)/price*100).toFixed(2)}% drift)`);
+          const driftPctS = Math.abs(bid - price) / price;
+          if (bid && driftPctS > 0.015) {
+            log('warn', `🚫 ${sym} SHORT stale-price reject: signal $${price.toFixed(2)} vs bid $${bid.toFixed(2)} (${(driftPctS*100).toFixed(2)}% drift)`);
             return;
           }
         } catch(e) {}
@@ -7685,7 +7690,7 @@ async function spreadIsAcceptable(symbol, price) {
     const quote = data?.quote;
     if (!quote?.ap || !quote?.bp) return true; // can't check — allow
     const spreadPct = (quote.ap - quote.bp) / price;
-    const maxSpread = 0.0015; // 0.15% max spread — tighter than any TP target
+    const maxSpread = 0.005; // 0.5% max spread — was 0.15% which blocked PANW/SNOW on normal volatile days
     if (spreadPct > maxSpread) {
       log('filter', `${symbol} spread too wide: ${(spreadPct*100).toFixed(3)}% — skipping`);
       return false;
@@ -8016,15 +8021,20 @@ setInterval(async () => {
   if (now - lastConfigCheck < 4500) return; // poll every 5s — fast enough to catch toggles
   lastConfigCheck = now;
   try {
-    const prevMode = CONFIG.mode;
-    const prevSyms = CONFIG.symbols.join(',');
-    const prevRsi  = CONFIG.rsiOversold;
+    const prevMode     = CONFIG.mode;
+    const prevSyms     = CONFIG.symbols.join(',');
+    const prevRsi      = CONFIG.rsiOversold;
+    const prevStrategy = CONFIG.strategy;
     await loadRemoteConfig();
     // Only log if something actually changed
-    const changed = CONFIG.mode !== prevMode || CONFIG.symbols.join(',') !== prevSyms || CONFIG.rsiOversold !== prevRsi;
+    const strategyChanged = CONFIG.strategy !== prevStrategy;
+    const changed = CONFIG.mode !== prevMode || CONFIG.symbols.join(',') !== prevSyms || CONFIG.rsiOversold !== prevRsi || strategyChanged;
     if (changed) {
-      log('sys', `Config updated — Modes: ${CONFIG.mode} | Symbols: ${CONFIG.symbols.length} | RSI: ${CONFIG.rsiOversold}`);
-      if (CONFIG.mode !== prevMode) lastFullScan = 0;
+      log('sys', `⚙️ Config updated — Strategy: ${CONFIG.strategy} | Mode: ${CONFIG.mode} | Symbols: ${CONFIG.symbols.length} | RSI: ${CONFIG.rsiOversold}`);
+      if (CONFIG.mode !== prevMode || strategyChanged) {
+        lastFullScan = 0; // force immediate rescan with new strategy
+        if (strategyChanged) log('sys', `🔄 Strategy switched: ${prevStrategy} → ${CONFIG.strategy}`);
+      }
     }
   } catch(e) {}
 }, 5000);
