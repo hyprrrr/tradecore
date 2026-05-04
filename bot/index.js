@@ -6860,11 +6860,24 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
   };
 
   const displayEquity = realEquity > 0 ? realEquity : portfolio;
-  const openPnlTotal  = Object.entries(positions).reduce((a, [sym, pos]) => {
-    const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || pos.entryPrice;
+  // Use alpacaLivePrice (refreshed every 5s) for accurate open P&L
+  const openPnlTotal = Object.entries(positions).reduce((a, [s, pos]) => {
+    const cur = alpacaLivePrice[s] || priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
     return a + (cur - pos.entryPrice) * (pos.qtyRemaining || pos.qty);
+  }, 0) + Object.entries(shortPositions).reduce((a, [s, pos]) => {
+    const cur = alpacaLivePrice[s] || priceHistory5m[s]?.[priceHistory5m[s].length-1] || pos.entryPrice;
+    return a + (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty); // shorts profit when price drops
   }, 0);
-  const dayPnlDisplay = realDailyStartEquity > 0 ? displayEquity - realDailyStartEquity : openPnlTotal;
+  // Day P&L: prefer real equity delta; fall back to closed-trade sum for the day
+  const todayET = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+  const todayClosedPnl = trades.filter(t => {
+    if (t.pnl === null || t.pnl === undefined) return false;
+    const d = new Date(t.time || Date.now()).toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+    return d === todayET;
+  }).reduce((s, t) => s + (t.pnl || 0), 0);
+  const dayPnlDisplay = realDailyStartEquity > 0
+    ? (displayEquity - realDailyStartEquity)
+    : todayClosedPnl;
 
   const fields = [
     sym!=='ALL' ? {name:'Symbol',value:sym,inline:true} : null,
@@ -6916,7 +6929,7 @@ async function sendDailySummary() {
       color: totalPnl >= 0 ? 0x7fff6e : 0xff5f57,
       fields: [
         { name: 'Account Value',  value: `$${(realEquity > 0 ? realEquity : portfolio).toFixed(2)}`, inline: true },
-        { name: 'Day P&L',        value: `${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`, inline: true },
+        { name: 'Day P&L (closed)', value: `${todayClosedPnl >= 0 ? '+' : ''}$${todayClosedPnl.toFixed(2)}`, inline: true },
         { name: 'Win Rate',      value: `${winRate}%`, inline: true },
         { name: 'Trades Today',  value: String(closed.length), inline: true },
         { name: 'W / L',         value: `${totalWins} / ${totalLosses}`, inline: true },
