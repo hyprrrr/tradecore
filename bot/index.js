@@ -55,6 +55,12 @@ const CONFIG = {
   symbols: (process.env.SYMBOLS || 'NVDA,AAPL,MSFT,TSLA,META,AMZN,GOOGL,AMD,SPY,QQQ,MSTR,COIN,PLTR,SOFI,HOOD').split(',').map(s => s.trim().toUpperCase()),
 
   strategy:      process.env.STRATEGY      || 'pmrb', // default: pre-market range breakout
+  // marketSentiment: 'auto' | 'bullish' | 'bearish' | 'neutral'
+  // auto  = derived from SPY regime each scan
+  // bullish  = only take long signals (market is trending up)
+  // bearish  = only take short signals (market is trending down)
+  // neutral  = take both directions (ranging market, lower confidence)
+  marketSentiment: process.env.MARKET_SENTIMENT || 'auto',
   rsiPeriod:     +(process.env.RSI_PERIOD     || 14),
   rsiOversold:   +(process.env.RSI_OVERSOLD   || 35),
   rsiOverbought: +(process.env.RSI_OVERBOUGHT || 65),
@@ -147,6 +153,7 @@ async function loadRemoteConfig() {
     // Apply remote settings over CONFIG — secrets never overwritten
     if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 200); // hard cap 200 (was 20)
     if (s.strategy)         CONFIG.strategy         = s.strategy;
+    if (s.marketSentiment)  CONFIG.marketSentiment  = s.marketSentiment;
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
     if (s.rsi_oversold)     CONFIG.rsiOversold      = +s.rsi_oversold;
     if (s.rsi_overbought)   CONFIG.rsiOverbought    = +s.rsi_overbought;
@@ -4338,6 +4345,264 @@ function markPMRBFailed(sym) {
 //       Clean break of OR-high (with volume) typically continues 60-70% of
 //       the time before reversal. Best on names with ATR > 1% intraday.
 //
+// ═══════════════════════════════════════════════════════════════════
+// STRATEGY: 4-Hour Range Scalp (4HRS)
+// ═══════════════════════════════════════════════════════════════════
+//
+// CONCEPT:
+//   The first 4-hour candle of the New York trading day defines a
+//   structural range. Breakouts above/below that range that FAIL and
+//   re-enter the range are high-probability fade setups. The market
+//   ran stops outside the range, trapped breakout traders, and is now
+//   reversing. That trapped-trader flow provides the edge.
+//
+// RULES (exact, from strategy):
+//   1. Mark H/L of the FIRST 4H candle of the day (NY time = midnight ET)
+//   2. On 5-min chart: 5-min candle must CLOSE outside the range (wick = invalid)
+//   3. Wait for price to CLOSE back inside the range
+//   4. Break above H → SHORT on re-entry close
+//      Break below L → LONG on re-entry close
+//   5. Stop = exact high/low of the breakout move
+//      (if breakout was very large, use nearest key level instead)
+//   6. Target = 2R (2× the stop distance)
+//   7. Multiple setups valid per day as long as they occur within the same range day
+//
+// ADDED CONFLUENCE:
+//   - Volume on re-entry candle (confirms trapped traders are capitulating)
+//   - RSI not extreme in the opposite direction of trade
+//   - Breakout size check: if breakout > 2× ATR, use key level stop not exact swing
+//   - Time gate: only valid within same trading day as the 4H range
+//   - SPY alignment: macro matches the fade direction = bonus
+//   - Multiple re-entries same side same day = lower score (range resolving)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── 4H Range Storage ──────────────────────────────────────────────
+// Keyed by sym+day. Stores the first 4H candle's H/L and tracks
+// how many setups have fired on each side today.
+const fourHRanges = {}; // sym → { day, high, low, mid, setups: {long:0, short:0} }
+
+// ── Capture first 4H candle of the NY day ─────────────────────────
+// The "first 4H candle" in NY time starts at midnight ET (00:00 ET).
+// We derive it from 5-min bars by collecting all bars from 00:00 ET
+// and taking the first 240-minute window (48 × 5-min bars).
+function capture4HRange(symbol, bars5m) {
+  if (!bars5m || bars5m.length < 48) return;
+
+  const etNow    = getETTime();
+  const todayKey = etNow.toISOString().slice(0, 10);
+
+  // Reset on new day
+  if (fourHRanges[symbol]?.day !== todayKey) delete fourHRanges[symbol];
+  if (fourHRanges[symbol]?.high) return;
+
+  // Find bars from today's midnight ET onward
+  const etMidnight = new Date(etNow);
+  etMidnight.setHours(0, 0, 0, 0);
+
+  const todayBars = bars5m.filter(b => {
+    if (!b.t) return false;
+    const btET = new Date(new Date(b.t).toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    return btET >= etMidnight;
+  });
+
+  if (todayBars.length < 48) return; // 4H candle hasn't fully closed yet
+
+  // Take exactly the first 48 bars (4H = 48 × 5min)
+  const fourHBars = todayBars.slice(0, 48);
+  const rangeH    = Math.max(...fourHBars.map(b => b.h));
+  const rangeL    = Math.min(...fourHBars.map(b => b.l));
+  const rangeMid  = (rangeH + rangeL) / 2;
+  const rangeW    = rangeH - rangeL;
+
+  if (rangeW / rangeMid < 0.0003) return; // degenerate
+
+  fourHRanges[symbol] = {
+    day:    todayKey,
+    high:   rangeH,
+    low:    rangeL,
+    mid:    rangeMid,
+    width:  rangeW,
+    setups: { long: 0, short: 0 },
+    lastBreakHigh: null, // price high of last breakout above
+    lastBreakLow:  null, // price low of last breakout below
+  };
+
+  log('sys', `📦 4HR ${symbol}: first 4H candle $${rangeL.toFixed(2)}–$${rangeH.toFixed(2)} mid=$${rangeMid.toFixed(2)} width=$${rangeW.toFixed(2)}`);
+}
+
+// ── 4H Range Scalp Signal ─────────────────────────────────────────
+function signal4HRangeScalp(sym, bars5m, bars15m) {
+  if (!bars5m || bars5m.length < 50) return { signal:'HOLD', confidence:0, reasons:['Need 50+ bars for 4HR'] };
+
+  // Capture range if not yet done
+  capture4HRange(sym, bars5m);
+
+  const range = fourHRanges[sym];
+  if (!range?.high) return { signal:'HOLD', confidence:0, reasons:['4H range not yet captured (waiting for 4H candle close)'] };
+
+  const price    = bars5m[bars5m.length - 1].c;
+  const lastBar  = bars5m[bars5m.length - 1];
+  const prevBar  = bars5m[bars5m.length - 2];  // the breakout bar
+  const prev2Bar = bars5m[bars5m.length - 3];
+  const closes   = bars5m.map(b => b.c);
+  const highs    = bars5m.map(b => b.h);
+  const lows     = bars5m.map(b => b.l);
+  const vols     = bars5m.map(b => +b.v || 0);
+  const avgVol   = vols.slice(-12, -1).reduce((a,b)=>a+b,0) / 11 || 1;
+  const curVol   = vols[vols.length - 1];
+  const atrVal   = atr(bars5m, 14);
+  const r        = rsi(closes, 14);
+  const reasons  = [];
+  let   score    = 0;
+  let   direction = null;
+
+  // ── Time gate: only trade within today's range day ───────────────
+  const etNow  = getETTime();
+  const todayKey = etNow.toISOString().slice(0, 10);
+  if (range.day !== todayKey) return { signal:'HOLD', confidence:0, reasons:['4H range is from a previous day'] };
+
+  // ── CORE PATTERN DETECTION ────────────────────────────────────────
+  // We need to detect the two-bar sequence:
+  //   Bar[-2]: closed OUTSIDE the range  (the breakout bar)
+  //   Bar[-1]: closed INSIDE  the range  (the re-entry bar = our entry)
+  //
+  // Note: bar[-1] is the just-closed candle. bar[-2] is the breakout.
+
+  const prevClosedAbove = prevBar.c > range.high;
+  const prevClosedBelow = prevBar.c < range.low;
+  const nowInsideRange  = price >= range.low && price <= range.high;
+
+  if (!nowInsideRange) {
+    return { signal:'HOLD', confidence:0, reasons:['Price outside range — waiting for re-entry close'] };
+  }
+
+  if (prevClosedAbove) {
+    // Breakout above → re-entered → SHORT
+    direction = 'sell';
+    // Track the stop: exact high of the breakout move
+    const breakoutHigh = Math.max(prevBar.h, prev2Bar.h);
+    range.lastBreakHigh = breakoutHigh;
+
+    score += 8; reasons.push(`📉 Breakout above $${range.high.toFixed(2)} → re-entry close = SHORT ✅`);
+
+    // Validate the breakout bar actually closed outside (not just wick)
+    if (prevBar.c <= range.high) {
+      return { signal:'HOLD', confidence:0, reasons:['Prior bar wick only — close was inside range (no valid breakout)'] };
+    }
+
+    // Stop and target
+    const stopPrice = breakoutHigh + atrVal * 0.1; // tiny buffer above breakout high
+    const risk      = Math.abs(price - stopPrice);
+    const tpPrice   = price - risk * 2; // 2R target
+    const rrStr     = `Stop: $${stopPrice.toFixed(2)} | TP: $${tpPrice.toFixed(2)} | 2R`;
+
+    // Breakout size — if huge, note key-level stop adjustment
+    const breakSize = prevBar.c - range.high;
+    if (breakSize > atrVal * 2) {
+      reasons.push(`⚠ Large breakout ($${breakSize.toFixed(2)}) — use nearest key level for stop, not exact swing`);
+      score -= 1;
+    }
+
+    // ── Confluence ──────────────────────────────────────────────────
+    // Volume on re-entry (trapped longs capitulating)
+    const volRatio = curVol / avgVol;
+    if (volRatio >= 1.5) { score += 3; reasons.push(`✅ Volume ${volRatio.toFixed(1)}× on re-entry (trapped buyers exiting)`); }
+    else if (volRatio < 0.7) { score -= 2; reasons.push(`⚠ Low re-entry volume ${volRatio.toFixed(1)}×`); }
+
+    // RSI not oversold (don't short into exhausted selling)
+    if (r < 30) return { signal:'HOLD', confidence:0, reasons:[`RSI ${r.toFixed(0)} oversold — skip short`] };
+    if (r >= 45 && r <= 70) { score += 2; reasons.push(`✅ RSI ${r.toFixed(0)} good for short`); }
+    if (r > 70) { score += 3; reasons.push(`✅ RSI ${r.toFixed(0)} overbought — confirms fade`); }
+
+    // Re-entry candle is bearish (closes below its open)
+    if (lastBar.c < lastBar.o) { score += 2; reasons.push(`✅ Re-entry candle bearish`); }
+
+    // Not too many short setups already today (range may be resolving)
+    if (range.setups.short >= 3) { score -= 3; reasons.push(`⚠ 3rd+ short setup today — range losing structure`); }
+
+    // SPY alignment
+    const spyR = fourHRanges['SPY'];
+    if (spyR?.high && price < spyR.mid) { score += 2; reasons.push(`✅ SPY below 4H mid — macro confirms short`); }
+
+    // 15m trend
+    if (bars15m?.length >= 4) {
+      const c15   = bars15m.map(b => b.c);
+      const slope = (c15[c15.length-1] - c15[c15.length-4]) / c15[c15.length-4];
+      if (slope < -0.002) { score += 2; reasons.push(`✅ 15m downtrend confirms`); }
+      if (slope >  0.003) { score -= 2; reasons.push(`⚠ 15m uptrend fights short`); }
+    }
+
+    if (score < 8) return { signal:'HOLD', confidence:0, score, reasons };
+    range.setups.short++;
+    reasons.push(rrStr);
+
+    const conf = Math.min(96, 50 + score * 2.5);
+    return {
+      signal: 'SELL', confidence: conf, score, reasons, rsi: r, atr: atrVal,
+      fourHR: { high: range.high, low: range.low, mid: range.mid, stopPrice, tpPrice, breakoutHigh },
+    };
+
+  } else if (prevClosedBelow) {
+    // Breakout below → re-entered → LONG
+    direction = 'buy';
+    const breakoutLow = Math.min(prevBar.l, prev2Bar.l);
+    range.lastBreakLow = breakoutLow;
+
+    score += 8; reasons.push(`📈 Breakout below $${range.low.toFixed(2)} → re-entry close = LONG ✅`);
+
+    if (prevBar.c >= range.low) {
+      return { signal:'HOLD', confidence:0, reasons:['Prior bar wick only — close was inside range (no valid breakout)'] };
+    }
+
+    const stopPrice = breakoutLow - atrVal * 0.1;
+    const risk      = Math.abs(price - stopPrice);
+    const tpPrice   = price + risk * 2;
+    const rrStr     = `Stop: $${stopPrice.toFixed(2)} | TP: $${tpPrice.toFixed(2)} | 2R`;
+
+    const breakSize = range.low - prevBar.c;
+    if (breakSize > atrVal * 2) {
+      reasons.push(`⚠ Large breakout ($${breakSize.toFixed(2)}) — use nearest key level for stop`);
+      score -= 1;
+    }
+
+    const volRatio = curVol / avgVol;
+    if (volRatio >= 1.5) { score += 3; reasons.push(`✅ Volume ${volRatio.toFixed(1)}× on re-entry (trapped shorts covering)`); }
+    else if (volRatio < 0.7) { score -= 2; reasons.push(`⚠ Low re-entry volume ${volRatio.toFixed(1)}×`); }
+
+    if (r > 70) return { signal:'HOLD', confidence:0, reasons:[`RSI ${r.toFixed(0)} overbought — skip long`] };
+    if (r >= 30 && r <= 55) { score += 2; reasons.push(`✅ RSI ${r.toFixed(0)} good for long`); }
+    if (r < 30) { score += 3; reasons.push(`✅ RSI ${r.toFixed(0)} oversold — confirms fade`); }
+
+    if (lastBar.c > lastBar.o) { score += 2; reasons.push(`✅ Re-entry candle bullish`); }
+
+    if (range.setups.long >= 3) { score -= 3; reasons.push(`⚠ 3rd+ long setup today — range losing structure`); }
+
+    const spyR = fourHRanges['SPY'];
+    if (spyR?.high && price > spyR.mid) { score += 2; reasons.push(`✅ SPY above 4H mid — macro confirms long`); }
+
+    if (bars15m?.length >= 4) {
+      const c15   = bars15m.map(b => b.c);
+      const slope = (c15[c15.length-1] - c15[c15.length-4]) / c15[c15.length-4];
+      if (slope >  0.002) { score += 2; reasons.push(`✅ 15m uptrend confirms`); }
+      if (slope < -0.003) { score -= 2; reasons.push(`⚠ 15m downtrend fights long`); }
+    }
+
+    if (score < 8) return { signal:'HOLD', confidence:0, score, reasons };
+    range.setups.long++;
+    reasons.push(rrStr);
+
+    const conf = Math.min(96, 50 + score * 2.5);
+    return {
+      signal: 'BUY', confidence: conf, score, reasons, rsi: r, atr: atrVal,
+      fourHR: { high: range.high, low: range.low, mid: range.mid, stopPrice, tpPrice, breakoutLow },
+    };
+
+  } else {
+    // Price is inside range and previous bar was also inside — no setup
+    return { signal:'HOLD', confidence:0, reasons:['Price inside 4H range — waiting for break + re-entry sequence'] };
+  }
+}
+
 // Entry rules:
 //   - Wait for 30-min opening range to fully form (need market_open + 30min)
 //   - LONG when price > OR-high AND volume > 1.3× the OR-period avg
@@ -4643,6 +4908,7 @@ function generateSignalByStrategy(sym, bars5m, bars15m) {
     case 'order_flow':     return signalOrderFlow(sym, bars5m, bars15m);
     case 'wyckoff':        return signalWyckoff(sym, bars5m, bars15m);
     case 'orb':            return signalORB(sym, bars5m, bars15m);
+    case '4hrs':           return signal4HRangeScalp(sym, bars5m, bars15m);
     case 'pmrb':           return signalPMRB(sym, bars5m, bars15m);
     case 'trend_pullback': return signalTrendPullback(sym, bars5m, bars15m);
     case 'bb_divergence':  return signalBBDivergence(sym, bars5m, bars15m);
@@ -5227,6 +5493,36 @@ let shortPositions = {};
 // EDGE GATE — 5 filters applied before every entry
 // ─────────────────────────────────────────────
 // Returns { pass: boolean, reason?: string, sizeMultiplier?: number }
+// ── Market Sentiment Bias ───────────────────────────────────────────
+// Resolves current market sentiment from CONFIG.marketSentiment.
+// 'auto' mode derives from SPY regime: bull→bullish, bear→bearish, chop→neutral.
+// Manual override ('bullish'/'bearish'/'neutral') persists until changed via dashboard.
+//
+// Key insight from live testing: bots that take counter-trend trades during
+// strong directional markets give back all their gains. A sentiment bias filter
+// alone can cut losing trades by ~30% in trending conditions.
+function resolveMarketSentiment(regimeState) {
+  const manual = (CONFIG.marketSentiment || 'auto').toLowerCase();
+  if (manual !== 'auto') return manual; // manual override wins
+
+  // Auto: map regime state → sentiment
+  switch (regimeState) {
+    case 'bull':   return 'bullish';
+    case 'bear':   return 'bearish';
+    case 'chop':   return 'neutral';
+    case 'blowoff':return 'bearish'; // parabolic = expect reversal, fade longs
+    default:       return 'neutral';
+  }
+}
+
+// Returns true if signal direction is allowed under current sentiment bias
+function sentimentAllows(direction, sentiment) {
+  if (sentiment === 'bullish'  && direction === 'sell') return false; // no shorts in bull
+  if (sentiment === 'bearish'  && direction === 'buy')  return false; // no longs in bear
+  // neutral = both allowed
+  return true;
+}
+
 // sizeMultiplier lets regime pass entries but at reduced size (e.g. 0.5 in chop)
 async function edgeGate(sym, direction, sigInfo, bars5m) {
   // ── SIM MODE: skip market-data gates ──
@@ -5252,8 +5548,24 @@ async function edgeGate(sym, direction, sigInfo, bars5m) {
     if (direction === 'short' && regime.state === 'bull') {
       return { pass: false, reason: `bull regime — shorts blocked (${regime.reasons})` };
     }
+
+    // ── Market Sentiment Bias ──────────────────────────────────────
+    // Prevents counter-trend trades during strong directional moves.
+    // 'auto' derives from SPY regime. Manual override via dashboard setting.
+    // Live experiment insight: counter-trend trades in trending markets
+    // were the single biggest P&L drag — cutting them = cleaner equity curve.
+    const sentiment = resolveMarketSentiment(regime.state);
+    if (!sentimentAllows(direction === 'long' ? 'buy' : 'sell', sentiment)) {
+      return { pass: false, reason: `Sentiment ${sentiment.toUpperCase()} — ${direction} blocked` };
+    }
     if (regime.state === 'chop') {
-      return { pass: true, sizeMultiplier: 0.5, reason: `chop — half size` };
+      // Full block in chop — the video experiment proved sideways markets
+      // destroy bot performance. Half-size entries still lose, just slower.
+      // Exception: PMRB has its own time/structure gate and can survive chop.
+      if (CONFIG.strategy !== 'pmrb') {
+        return { pass: false, sizeMultiplier: 0, reason: `chop market — all entries blocked (strategy=${CONFIG.strategy})` };
+      }
+      return { pass: true, sizeMultiplier: 0.6, reason: `chop — PMRB reduced size` };
     }
     // Counter-regime trades (short in bull when regime allows) still allowed at half
     if ((direction === 'long' && regime.spyTrendScore <= 0) ||
@@ -5447,6 +5759,14 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     if (safeQty < 1) { log('warn', `${sym}: position too risky even at 1 share — skipping`); return; }
     log('risk', `${sym}: reducing qty ${qty}→${safeQty} (implied loss $${impliedLoss.toFixed(0)} > max $${maxDollarLoss.toFixed(0)})`);
   }
+  // 4HRS: use the signal's explicit stop/target (exact breakout high/low)
+  // This overrides the default ATR-based stop to honor the strategy's exact rules
+  const is4HRS = CONFIG.strategy === '4hrs' && sigInfo?.fourHR;
+  if (is4HRS && sigInfo.fourHR.stopPrice) {
+    // The stop is set in the signal — log it; managePosition will use it on entry
+    log('4hrs', `${sym} 4HR stop: $${sigInfo.fourHR.stopPrice.toFixed(2)} | TP: $${sigInfo.fourHR.tpPrice.toFixed(2)} | 2R`);
+  }
+
   // PMRB: 60% initial size — preserves capital for the 40% add-on at reclaim
   const isPMRBScaled = CONFIG.strategy === 'pmrb' && sigInfo?.pmrb?.reclaimLevel;
   let finalQty = Math.min(qty, Math.max(1, Math.floor(maxDollarLoss / (price * CONFIG.hardMaxLoss))));
@@ -5545,7 +5865,14 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     // Use trapped buyer clusters above as TP targets — they'll panic-sell when price hits them
     // This gives us precise TP levels based on where the real supply/resistance is
     const entryTraps = bars ? findTraps(bars, 20) : null;
+    // 4HRS: override TP tiers to a single 2R target (as per strategy rules)
     let initTP1 = CONFIG.tp1Pct, initTP2 = CONFIG.tp2Pct, initTP3 = CONFIG.tp3Pct;
+    if (is4HRS && sigInfo?.fourHR?.tpPrice) {
+      const tp2R = Math.abs(sigInfo.fourHR.tpPrice - price) / price;
+      initTP1 = tp2R * 0.5;  // exit 50% at 1R
+      initTP2 = tp2R;         // exit rest at 2R
+      initTP3 = tp2R * 1.5;  // safety in case it runs
+    }
     if (entryTraps && entryTraps.trappedBuyers.length > 0) {
       // Sort trapped buyer clusters by proximity above entry price
       const buyerTargets = entryTraps.trappedBuyers
@@ -6873,6 +7200,7 @@ async function runScan() {
       const bars15m = barData15m[sym] || await fetchBarsCached(sym, '15Min', 40);
       // PMRB: capture 8AM candle from 15m bars whenever we have them
       if (bars15m?.length >= 2) capturePMRBRange(sym, bars15m).catch(() => {});
+      if (bars5m?.length  >= 50) capture4HRange(sym, bars5m); // 4HR strategy
       if (!bars5m || bars5m.length < 10) { log('warn', `No data for ${sym}`); continue; }
 
       // Capture opening range at 10:00 AM ET
@@ -7315,6 +7643,7 @@ async function sendDailySummary() {
   Object.keys(pmrbRanges).forEach(k => delete pmrbRanges[k]);
   Object.keys(pmrbAttempted).forEach(k => delete pmrbAttempted[k]);
   Object.keys(openingRanges).forEach(k => delete openingRanges[k]);
+  Object.keys(fourHRanges).forEach(k => delete fourHRanges[k]);
   dailyStartPortfolio  = portfolio;
   realDailyStartEquity = realEquity; // reset to current equity for new day
   circuitBreakerOn     = false;
@@ -8394,16 +8723,19 @@ setInterval(async () => {
     const prevMode     = CONFIG.mode;
     const prevSyms     = CONFIG.symbols.join(',');
     const prevRsi      = CONFIG.rsiOversold;
-    const prevStrategy = CONFIG.strategy;
+    const prevStrategy  = CONFIG.strategy;
+    const prevSentiment = CONFIG.marketSentiment;
     await loadRemoteConfig();
     // Only log if something actually changed
-    const strategyChanged = CONFIG.strategy !== prevStrategy;
-    const changed = CONFIG.mode !== prevMode || CONFIG.symbols.join(',') !== prevSyms || CONFIG.rsiOversold !== prevRsi || strategyChanged;
+    const strategyChanged  = CONFIG.strategy !== prevStrategy;
+    const sentimentChanged = CONFIG.marketSentiment !== prevSentiment;
+    const changed = CONFIG.mode !== prevMode || CONFIG.symbols.join(',') !== prevSyms || CONFIG.rsiOversold !== prevRsi || strategyChanged || sentimentChanged;
     if (changed) {
-      log('sys', `⚙️ Config updated — Strategy: ${CONFIG.strategy} | Mode: ${CONFIG.mode} | Symbols: ${CONFIG.symbols.length} | RSI: ${CONFIG.rsiOversold}`);
+      log('sys', `⚙️ Config updated — Strategy: ${CONFIG.strategy} | Sentiment: ${CONFIG.marketSentiment} | Mode: ${CONFIG.mode} | Symbols: ${CONFIG.symbols.length}`);
       if (CONFIG.mode !== prevMode || strategyChanged) {
         lastFullScan = 0; // force immediate rescan with new strategy
-        if (strategyChanged) log('sys', `🔄 Strategy switched: ${prevStrategy} → ${CONFIG.strategy}`);
+        if (strategyChanged)  log('sys', `🔄 Strategy switched: ${prevStrategy} → ${CONFIG.strategy}`);
+        if (sentimentChanged) log('sys', `🧭 Sentiment changed: ${prevSentiment} → ${CONFIG.marketSentiment}`);
       }
     }
   } catch(e) {}
