@@ -3984,322 +3984,329 @@ function signalWyckoff(sym, bars5m, bars15m) {
 // STRATEGY: Opening Range Breakout (proper, not just bonus)
 // ═══════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════
-// STRATEGY: Pre-Market Range Breakout (PMRB) — 8:00 AM 15-min Candle
+// STRATEGY: Pre-Market Range Breakout (PMRB) v2 — Maximum Edge Build
 // ═══════════════════════════════════════════════════════════════════
 //
-// CONCEPT (prop firm / ICT-adjacent):
-//   The 8:00–8:15 AM ET 15-minute candle is the first candle of the
-//   pre-market session with meaningful volume. Institutional desks and
-//   algorithmic systems set their initial directional bias from this
-//   candle's range. A clean break of the high OR low signals that one
-//   side has won the pre-market auction and price is likely to run.
+// BASE SETUP:
+//   Mark the 8:00–8:15 AM ET 15-min candle. Wait for a confirmed close
+//   break of the HIGH or LOW. Direction of break = trade direction.
+//   Enter on retest of the MIDPOINT with rejection confirmation.
+//   Stop = opposite side of box. Target = 3× box range (1:3 R:R).
 //
-// SETUP (exactly as described):
-//   1. Mark the 8:00 AM 15-min candle's HIGH, LOW, and MIDPOINT as a box
-//   2. Wait for price to break clearly above the HIGH or below the LOW
-//   3. The direction of the break = the trade direction for the session
-//   4. ENTRY: Wait for price to RETEST the box — specifically a retest
-//      of the MIDPOINT (50% of the 8:00 candle's range)
-//      - Long: price broke above high, comes back down and taps the mid,
-//        then shows rejection (bullish candle) → BUY
-//      - Short: price broke below low, bounces back up to the mid,
-//        shows rejection (bearish candle) → SELL
-//   5. TARGET: 15–20 points (absolute), or 3× the range of the 8AM candle
-//   6. STOP: Below/above the opposite side of the 8AM box (1:3 R:R)
-//
-// ADDED CONFLUENCE FILTERS:
-//   - Volume spike on the break candle (confirms intent, not a fake-out)
-//   - RSI not already extreme at retest (55–70 for longs, 30–45 for shorts)
-//   - 5-min candle at retest shows rejection wick (tape confirms)
-//   - ATR-based min range width (skip if box is too small to trade)
-//   - No retest entry if price has already traveled >2× the range from mid
-//     (entry too late — missed the move)
-//   - Kill-zone boost: highest probability during 9:00–10:30 AM ET window
-//   - SPY alignment: if SPY broke its 8AM range in same direction = +bonus
-//   - Prior HOD/LOD confluence near target = score boost
+// EDGE STACK (all must align for max confidence):
+//   1. SPY macro bias — SPY's 8AM break must match direction (hard filter)
+//   2. ATR floor — symbol must have ATR > $1.50 on the day (hard filter)
+//   3. Time gate — only 8:00 AM–10:30 AM ET (hard filter after 10:30)
+//   4. One attempt per symbol per day — invalidated after first stop hit
+//   5. Institutional volume — 2×+ avg vol on the retest bar
+//   6. Rejection wick — candle body + wick structure confirmed at mid
+//   7. RSI zone — not already extended, in healthy retest range
+//   8. 15m trend alignment — confirms direction on higher timeframe
+//   9. Box width quality — wide enough for 1:3 math to work
+//  10. Scaled entry — 60% at mid retest, flag for 40% add at reclaim
 // ═══════════════════════════════════════════════════════════════════
+
+// ── Per-symbol daily attempt tracker (one trade per sym per day) ───
+const pmrbAttempted = {}; // sym → { day, attempted, failed }
 
 // ── PMRB Range Capture ─────────────────────────────────────────────
-// Called from the main scan. Captures the 8:00 AM 15-min candle once
-// per day per symbol. Uses 15m bars from Alpaca so no extra API cost.
 async function capturePMRBRange(symbol, bars15m) {
   if (!bars15m || bars15m.length < 2) return;
+  const etNow    = getETTime();
+  const todayKey = etNow.toISOString().slice(0, 10);
 
-  const etNow = getETTime();
-  const todayKey = etNow.toISOString().slice(0, 10); // YYYY-MM-DD
-
-  // Reset if it's a new day
-  if (pmrbRanges[symbol]?.day !== todayKey) {
-    delete pmrbRanges[symbol];
-  }
-
-  // Already captured today
+  if (pmrbRanges[symbol]?.day !== todayKey) delete pmrbRanges[symbol];
   if (pmrbRanges[symbol]?.high) return;
 
-  // Find the bar that starts at 08:00 ET
-  // bars15m are in UTC — 08:00 ET = 12:00 UTC (EST) or 13:00 UTC (EDT)
   const target8amBar = bars15m.find(b => {
     if (!b.t) return false;
-    const bt = new Date(b.t);
-    const btET = new Date(bt.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const btET = new Date(new Date(b.t).toLocaleString('en-US', { timeZone: 'America/New_York' }));
     return btET.getHours() === 8 && btET.getMinutes() === 0;
   });
+  if (!target8amBar) return;
 
-  if (!target8amBar) return; // 8AM candle not in our bar history yet
-
-  const rangeH = target8amBar.h;
-  const rangeL = target8amBar.l;
+  const rangeH   = target8amBar.h;
+  const rangeL   = target8amBar.l;
   const rangeMid = (rangeH + rangeL) / 2;
-  const rangeWidth = rangeH - rangeL;
-
-  // Skip degenerate candles (< 0.05% range — likely no data)
-  if (rangeWidth / rangeMid < 0.0005) return;
+  const rangeW   = rangeH - rangeL;
+  if (rangeW / rangeMid < 0.0005) return; // degenerate candle
 
   pmrbRanges[symbol] = {
-    day:      todayKey,
-    high:     rangeH,
-    low:      rangeL,
-    mid:      rangeMid,
-    width:    rangeWidth,
-    open:     target8amBar.o,
-    close:    target8amBar.c,
-    volume:   target8amBar.v || 0,
-    breakDir: null,      // 'up' | 'down' | null (not yet broken)
-    breakTime: null,     // timestamp of the break
-    breakPrice: null,    // price at which break was confirmed
-    retestReady: false,  // true once we've had a clean retest opportunity
+    day: todayKey, high: rangeH, low: rangeL, mid: rangeMid, width: rangeW,
+    open: target8amBar.o, close: target8amBar.c, volume: target8amBar.v || 0,
+    breakDir: null, breakTime: null, breakPrice: null,
+    peakAfterBreak: null, // track max extension after break
   };
-
-  log('sys', `PMRB ${symbol}: 8AM candle $${rangeL.toFixed(2)}–$${rangeH.toFixed(2)} mid=$${rangeMid.toFixed(2)} width=$${rangeWidth.toFixed(2)}`);
+  log('sys', `📦 PMRB ${symbol}: 8AM box $${rangeL.toFixed(2)}–$${rangeH.toFixed(2)} mid=$${rangeMid.toFixed(2)} width=$${rangeW.toFixed(2)}`);
 }
 
-// ── PMRB Break Detection ───────────────────────────────────────────
-// Separate from signal — updates pmrbRanges[sym].breakDir when the
-// break is confirmed. Called before signalPMRB so state is fresh.
+// ── Break Detection ────────────────────────────────────────────────
 function updatePMRBBreak(symbol, bars5m) {
   const pmrb = pmrbRanges[symbol];
-  if (!pmrb?.high || pmrb.breakDir) return; // already broken or not captured
+  if (!pmrb?.high || pmrb.breakDir) {
+    // Track peak extension even after break is recorded
+    if (pmrb?.breakDir && bars5m?.length) {
+      const price = bars5m[bars5m.length-1].c;
+      if (pmrb.breakDir === 'up'   && (pmrb.peakAfterBreak === null || price > pmrb.peakAfterBreak)) pmrb.peakAfterBreak = price;
+      if (pmrb.breakDir === 'down' && (pmrb.peakAfterBreak === null || price < pmrb.peakAfterBreak)) pmrb.peakAfterBreak = price;
+    }
+    return;
+  }
+  if (!bars5m?.length) return;
 
-  if (bars5m.length < 2) return;
-  const lastBar = bars5m[bars5m.length - 1];
-  const price = lastBar.c;
-  const vols  = bars5m.map(b => +b.v || 0);
-  const avgVol = vols.slice(-7, -1).reduce((a,b)=>a+b,0) / 6 || 1;
+  const lastBar = bars5m[bars5m.length-1];
+  const price   = lastBar.c;
 
-  // Break must close OUTSIDE the range (not just wick through)
+  // Break requires a CLOSED bar outside the range, not a wick
   if (price > pmrb.high && lastBar.c > lastBar.o) {
-    pmrb.breakDir   = 'up';
-    pmrb.breakTime  = Date.now();
-    pmrb.breakPrice = price;
-    log('sys', `PMRB ${symbol}: 🚀 Break UP above $${pmrb.high.toFixed(2)} at $${price.toFixed(2)}`);
+    pmrb.breakDir       = 'up';
+    pmrb.breakTime      = Date.now();
+    pmrb.breakPrice     = price;
+    pmrb.peakAfterBreak = price;
+    log('sys', `🚀 PMRB ${symbol}: Break UP confirmed at $${price.toFixed(2)} (box high=$${pmrb.high.toFixed(2)})`);
   } else if (price < pmrb.low && lastBar.c < lastBar.o) {
-    pmrb.breakDir   = 'down';
-    pmrb.breakTime  = Date.now();
-    pmrb.breakPrice = price;
-    log('sys', `PMRB ${symbol}: 📉 Break DOWN below $${pmrb.low.toFixed(2)} at $${price.toFixed(2)}`);
+    pmrb.breakDir       = 'down';
+    pmrb.breakTime      = Date.now();
+    pmrb.breakPrice     = price;
+    pmrb.peakAfterBreak = price;
+    log('sys', `📉 PMRB ${symbol}: Break DOWN confirmed at $${price.toFixed(2)} (box low=$${pmrb.low.toFixed(2)})`);
   }
 }
 
-// ── PMRB Signal ────────────────────────────────────────────────────
+// ── Main Signal Function ───────────────────────────────────────────
 function signalPMRB(sym, bars5m, bars15m) {
   if (!bars5m || bars5m.length < 6) return { signal:'HOLD', confidence:0, reasons:['Need 6+ bars'] };
 
-  // Ensure capture and break detection are current
   updatePMRBBreak(sym, bars5m);
 
-  const pmrb = pmrbRanges[sym];
+  const pmrb    = pmrbRanges[sym];
+  const etNow   = getETTime();
+  const etMins  = etNow.getHours() * 60 + etNow.getMinutes();
+  const todayKey = etNow.toISOString().slice(0, 10);
+
+  // ── HARD FILTER 1: Time gate ─────────────────────────────────────
+  // After 10:30 AM the pre-market range edge degrades sharply.
+  // Before 8:00 AM there's no candle to trade.
+  if (etMins < 8*60)       return { signal:'HOLD', confidence:0, reasons:['Before 8AM — PMRB not active'] };
+  if (etMins > 10*60+30)   return { signal:'HOLD', confidence:0, reasons:['After 10:30 AM — PMRB window closed'] };
+
   if (!pmrb?.high) return { signal:'HOLD', confidence:0, reasons:['8AM candle not yet captured'] };
-  if (!pmrb.breakDir) return { signal:'HOLD', confidence:0, reasons:['Waiting for 8AM range break'] };
-
-  const price    = bars5m[bars5m.length - 1].c;
-  const lastBar  = bars5m[bars5m.length - 1];
-  const prevBar  = bars5m[bars5m.length - 2];
-  const closes   = bars5m.map(b => b.c);
-  const highs    = bars5m.map(b => b.h);
-  const lows     = bars5m.map(b => b.l);
-  const vols     = bars5m.map(b => +b.v || 0);
-  const avgVol   = vols.slice(-7, -1).reduce((a,b)=>a+b,0) / 6 || 1;
-  const curVol   = vols[vols.length - 1];
-
-  const reasons  = [];
-  let score      = 0;
-  let direction  = null;
-
-  // ── Core setup: has price traveled away from the break and returned? ──
-  const distFromMid = price - pmrb.mid;  // + = above mid, - = below mid
-  const rangeTol    = pmrb.width * 0.25; // within 25% of mid = at the midpoint
-
-  // ── LONG setup (break UP → wait for retest of mid) ────────────────
-  if (pmrb.breakDir === 'up') {
-    direction = 'buy';
-
-    // Price must have gone meaningfully above the high after the break
-    // (proves the break was real, not a fake-out)
-    const peakAbove = Math.max(...bars5m
-      .filter(b => b.t && new Date(b.t).getTime() > (pmrb.breakTime || 0))
-      .map(b => b.h), pmrb.breakPrice || pmrb.high);
-    const hasExtended = peakAbove > pmrb.high + pmrb.width * 0.5;
-
-    if (!hasExtended) {
-      return { signal:'HOLD', confidence:0, reasons:['Break up — waiting for extension before retest entry'] };
-    }
-
-    // Retest: price has come back to the midpoint zone
-    const atMid = Math.abs(price - pmrb.mid) < rangeTol;
-    if (!atMid) {
-      const distPct = ((price - pmrb.mid) / pmrb.mid * 100).toFixed(2);
-      return { signal:'HOLD', confidence:0, reasons:[`Break up confirmed — waiting for retest of mid $${pmrb.mid.toFixed(2)} (currently ${distPct}% away)`] };
-    }
-
-    // Price must not have closed BELOW the low (break failed)
-    if (price < pmrb.low) {
-      return { signal:'HOLD', confidence:0, reasons:['Break failed — price below 8AM low'] };
-    }
-
-    score += 8; reasons.push(`🟩 8AM range break UP — retest of mid $${pmrb.mid.toFixed(2)} ✅`);
-
-    // ── Rejection candle at mid (bullish confirmation) ────────────────
-    const lowerWick = lastBar.o - lastBar.l;   // how much wick below body
-    const bodySize  = Math.abs(lastBar.c - lastBar.o);
-    const isBullishRejection = lastBar.c > lastBar.o &&            // green candle
-                               lowerWick > bodySize * 0.5 &&       // wick ≥ 50% of body
-                               lastBar.c > pmrb.mid;              // closes above mid
-    if (isBullishRejection) {
-      score += 4; reasons.push(`Bullish rejection wick at mid ✅`);
-    } else if (lastBar.c > lastBar.o) {
-      score += 1; reasons.push(`Bullish close at mid ✅`);
-    } else {
-      score -= 2; reasons.push(`Bearish close at retest — wait for confirmation ⚠`);
-    }
-
-    // ── Previous bar also showed support ──────────────────────────────
-    if (prevBar.l <= pmrb.mid && prevBar.c >= pmrb.mid) {
-      score += 2; reasons.push(`Prior bar tagged mid and held ✅`);
-    }
-
-    // ── Don't enter if already too far from mid (missed entry) ────────
-    if (price > pmrb.high) {
-      return { signal:'HOLD', confidence:0, reasons:['Price already back above 8AM high — entry missed'] };
-    }
-
-  // ── SHORT setup (break DOWN → wait for retest of mid) ─────────────
-  } else if (pmrb.breakDir === 'down') {
-    direction = 'sell';
-
-    const troughBelow = Math.min(...bars5m
-      .filter(b => b.t && new Date(b.t).getTime() > (pmrb.breakTime || 0))
-      .map(b => b.l), pmrb.breakPrice || pmrb.low);
-    const hasExtended = troughBelow < pmrb.low - pmrb.width * 0.5;
-
-    if (!hasExtended) {
-      return { signal:'HOLD', confidence:0, reasons:['Break down — waiting for extension before retest entry'] };
-    }
-
-    const atMid = Math.abs(price - pmrb.mid) < rangeTol;
-    if (!atMid) {
-      const distPct = ((pmrb.mid - price) / pmrb.mid * 100).toFixed(2);
-      return { signal:'HOLD', confidence:0, reasons:[`Break down confirmed — waiting for retest of mid $${pmrb.mid.toFixed(2)} (currently ${distPct}% away)`] };
-    }
-
-    if (price > pmrb.high) {
-      return { signal:'HOLD', confidence:0, reasons:['Break failed — price above 8AM high'] };
-    }
-
-    score += 8; reasons.push(`🟥 8AM range break DOWN — retest of mid $${pmrb.mid.toFixed(2)} ✅`);
-
-    const upperWick = lastBar.h - lastBar.o;
-    const bodySize  = Math.abs(lastBar.c - lastBar.o);
-    const isBearishRejection = lastBar.c < lastBar.o &&
-                               upperWick > bodySize * 0.5 &&
-                               lastBar.c < pmrb.mid;
-    if (isBearishRejection) {
-      score += 4; reasons.push(`Bearish rejection wick at mid ✅`);
-    } else if (lastBar.c < lastBar.o) {
-      score += 1; reasons.push(`Bearish close at mid ✅`);
-    } else {
-      score -= 2; reasons.push(`Bullish close at retest — wait for confirmation ⚠`);
-    }
-
-    if (prevBar.h >= pmrb.mid && prevBar.c <= pmrb.mid) {
-      score += 2; reasons.push(`Prior bar tagged mid and rejected ✅`);
-    }
-
-    if (price < pmrb.low) {
-      return { signal:'HOLD', confidence:0, reasons:['Price already back below 8AM low — entry missed'] };
-    }
+  if (!pmrb.breakDir) {
+    return { signal:'HOLD', confidence:0, reasons:[`Watching for break of $${pmrb.low.toFixed(2)}–$${pmrb.high.toFixed(2)}`] };
   }
 
-  if (!direction) return { signal:'HOLD', confidence:0, reasons:['No PMRB direction'] };
-
-  // ── Volume at retest ──────────────────────────────────────────────
-  const volRatio = curVol / avgVol;
-  if (volRatio > 1.2) { score += 2; reasons.push(`Volume ${volRatio.toFixed(1)}× on retest ✅`); }
-  if (volRatio < 0.6) { score -= 1; reasons.push(`Low volume at retest ⚠`); }
-
-  // ── RSI at retest ─────────────────────────────────────────────────
-  const r = rsi(closes, 14);
-  if (direction === 'buy') {
-    if (r > 72) return { signal:'HOLD', confidence:0, reasons:[`RSI ${r.toFixed(0)} already overbought at retest`] };
-    if (r >= 40 && r <= 60) { score += 2; reasons.push(`RSI ${r.toFixed(0)} healthy for retest entry ✅`); }
-    if (r < 35)  { score -= 2; reasons.push(`RSI ${r.toFixed(0)} showing weakness at retest ⚠`); }
-  } else {
-    if (r < 28) return { signal:'HOLD', confidence:0, reasons:[`RSI ${r.toFixed(0)} already oversold at retest`] };
-    if (r >= 40 && r <= 60) { score += 2; reasons.push(`RSI ${r.toFixed(0)} healthy for retest entry ✅`); }
-    if (r > 65)  { score -= 2; reasons.push(`RSI ${r.toFixed(0)} showing strength at retest ⚠`); }
+  // ── HARD FILTER 2: One attempt per symbol per day ────────────────
+  const attempt = pmrbAttempted[sym];
+  if (attempt?.day === todayKey && attempt?.failed) {
+    return { signal:'HOLD', confidence:0, reasons:['PMRB attempt already failed today — no re-entry'] };
   }
 
-  // ── ATR: is the range wide enough to make the 1:3 worth it? ──────
-  const atrVal = atr(bars5m, 14);
-  const minRangeForTrade = atrVal * 0.5; // range should be at least 50% of ATR
-  if (pmrb.width < minRangeForTrade) {
-    return { signal:'HOLD', confidence:0, reasons:[`8AM range too tight ($${pmrb.width.toFixed(2)}) for clean 1:3 setup`] };
-  }
-  score += 1; reasons.push(`8AM range $${pmrb.width.toFixed(2)} — TP target ~$${(pmrb.width * 3).toFixed(2)} (3R) ✅`);
+  const price   = bars5m[bars5m.length-1].c;
+  const lastBar = bars5m[bars5m.length-1];
+  const prevBar = bars5m[bars5m.length-2];
+  const closes  = bars5m.map(b => b.c);
+  const vols    = bars5m.map(b => +b.v || 0);
+  const avgVol  = vols.slice(-8, -1).reduce((a,b)=>a+b,0) / 7 || 1;
+  const curVol  = vols[vols.length-1];
+  const atrVal  = atr(bars5m, 14);
+  const r       = rsi(closes, 14);
+  const reasons = [];
+  let score     = 0;
+  let direction = null;
+  let confluenceCount = 0; // hard gates passed — need ≥ 4 for a trade
 
-  // ── Session timing bonus ───────────────────────────────────────────
-  // Best retests happen 9:00–10:30 AM ET (full liquidity kicks in)
-  const etNow = getETTime();
-  const etMins = etNow.getHours() * 60 + etNow.getMinutes();
-  if (etMins >= 9*60 && etMins <= 10*60+30) {
-    score += 3; reasons.push(`Prime session window (9–10:30 AM ET) ✅`);
-  } else if (etMins >= 8*60 && etMins < 9*60) {
-    score += 1; reasons.push(`Pre-open retest (8–9 AM ET) ✅`);
-  }
-
-  // ── 15m alignment ─────────────────────────────────────────────────
-  if (bars15m?.length >= 3) {
-    const c15 = bars15m.map(b => b.c);
-    const last15 = c15[c15.length - 1];
-    const prev15 = c15[c15.length - 3];
-    const slope15 = (last15 - prev15) / prev15;
-    if (direction === 'buy'  && slope15 >  0.001) { score += 2; reasons.push(`15m uptrend aligned ✅`); }
-    if (direction === 'sell' && slope15 < -0.001) { score += 2; reasons.push(`15m downtrend aligned ✅`); }
-    if (direction === 'buy'  && slope15 < -0.003) { score -= 3; reasons.push(`15m downtrend against trade ⚠`); }
-    if (direction === 'sell' && slope15 >  0.003) { score -= 3; reasons.push(`15m uptrend against trade ⚠`); }
+  // ── HARD FILTER 3: ATR floor — need at least $1.50 daily move ───
+  // atrVal is the 5-min ATR. Daily ATR ≈ 5-min ATR × √78 (78 bars/day)
+  const dailyAtrEst = atrVal * Math.sqrt(78);
+  if (dailyAtrEst < 1.50) {
+    return { signal:'HOLD', confidence:0, reasons:[`ATR too low ($${dailyAtrEst.toFixed(2)} est daily) — not enough range for 1:3`] };
   }
 
-  // ── SPY alignment (macro direction) ──────────────────────────────
+  // ── HARD FILTER 4: SPY macro alignment ──────────────────────────
   const spyPMRB = pmrbRanges['SPY'];
+  let spyAligned = false;
   if (spyPMRB?.breakDir) {
-    if (spyPMRB.breakDir === 'up'   && direction === 'buy')  { score += 3; reasons.push(`SPY also broke 8AM range UP ✅`); }
-    if (spyPMRB.breakDir === 'down' && direction === 'sell') { score += 3; reasons.push(`SPY also broke 8AM range DOWN ✅`); }
-    if (spyPMRB.breakDir === 'up'   && direction === 'sell') { score -= 3; reasons.push(`SPY broke UP — fighting macro ⚠`); }
-    if (spyPMRB.breakDir === 'down' && direction === 'buy')  { score -= 3; reasons.push(`SPY broke DOWN — fighting macro ⚠`); }
+    if (pmrb.breakDir === 'up'   && spyPMRB.breakDir === 'up')   { spyAligned = true; }
+    if (pmrb.breakDir === 'down' && spyPMRB.breakDir === 'down') { spyAligned = true; }
+    if (!spyAligned && sym !== 'SPY') {
+      // Allow trade if SPY hasn't broken yet (neutral) but block if SPY broke opposite
+      return { signal:'HOLD', confidence:0, reasons:[`SPY broke ${spyPMRB.breakDir} — not taking ${pmrb.breakDir} trades against macro`] };
+    }
+  }
+  if (spyAligned) { confluenceCount++; score += 4; reasons.push(`✅ SPY macro aligned (broke ${spyPMRB.breakDir})`); }
+  else            { score += 1; reasons.push(`⚠ SPY neutral — proceeding cautiously`); }
+
+  // ── HARD FILTER 5: Box width quality ────────────────────────────
+  // Box must be at least 40% of daily ATR so the 3R target is reachable
+  const minBoxWidth = dailyAtrEst * 0.15;
+  if (pmrb.width < minBoxWidth) {
+    return { signal:'HOLD', confidence:0, reasons:[`Box too narrow ($${pmrb.width.toFixed(2)}) for clean 1:3 setup`] };
   }
 
-  // ── Implicit stop and target for logging ──────────────────────────
-  // Stop: opposite side of 8AM box (tight, preserves 1:3)
-  // Target: mid ± (range × 3) = 3R
-  const stopPrice  = direction === 'buy'  ? pmrb.low  - atrVal * 0.2 : pmrb.high + atrVal * 0.2;
-  const tpPrice    = direction === 'buy'  ? pmrb.mid  + pmrb.width * 3 : pmrb.mid - pmrb.width * 3;
-  const riskDollar = Math.abs(price - stopPrice);
-  const rwdDollar  = Math.abs(tpPrice - price);
-  const rrRatio    = riskDollar > 0 ? rwdDollar / riskDollar : 0;
-  if (rrRatio >= 2.5) { score += 2; reasons.push(`R:R = ${rrRatio.toFixed(1)}:1 ✅`); }
-  reasons.push(`Stop: $${stopPrice.toFixed(2)} | Target: $${tpPrice.toFixed(2)} | Range: $${pmrb.width.toFixed(2)}`);
+  // ── DIRECTION SETUP ──────────────────────────────────────────────
+  direction = pmrb.breakDir === 'up' ? 'buy' : 'sell';
 
-  if (score < 8) return { signal:'HOLD', confidence:0, score, reasons };
-  const conf = Math.min(97, 55 + score * 3);
+  // Extension check — price must have traveled meaningfully from the box
+  // before we look for the retest. Minimum = 50% of box width past the break level.
+  const minExtension = pmrb.width * 0.5;
+  if (pmrb.breakDir === 'up') {
+    const extended = pmrb.peakAfterBreak !== null && pmrb.peakAfterBreak > pmrb.high + minExtension;
+    if (!extended) {
+      return { signal:'HOLD', confidence:0, reasons:[`Break UP — waiting for extension ($${(pmrb.high + minExtension).toFixed(2)}+ needed, peak=$${(pmrb.peakAfterBreak||pmrb.high).toFixed(2)})`] };
+    }
+  } else {
+    const extended = pmrb.peakAfterBreak !== null && pmrb.peakAfterBreak < pmrb.low - minExtension;
+    if (!extended) {
+      return { signal:'HOLD', confidence:0, reasons:[`Break DOWN — waiting for extension ($${(pmrb.low - minExtension).toFixed(2)}- needed, trough=$${(pmrb.peakAfterBreak||pmrb.low).toFixed(2)})`] };
+    }
+  }
+
+  // ── RETEST ZONE: Price must be at the midpoint ───────────────────
+  const retestTol = pmrb.width * 0.3; // within 30% of mid = valid retest zone
+  const atMid     = Math.abs(price - pmrb.mid) < retestTol;
+  if (!atMid) {
+    const dir = price > pmrb.mid ? 'above' : 'below';
+    return { signal:'HOLD', confidence:0, reasons:[`Waiting for retest of mid $${pmrb.mid.toFixed(2)} (price $${price.toFixed(2)} — ${dir})`] };
+  }
+
+  // Break failure check — if retest goes through the whole box
+  if (pmrb.breakDir === 'up'   && price < pmrb.low)  return { signal:'HOLD', confidence:0, reasons:['Break failed — price below 8AM low'] };
+  if (pmrb.breakDir === 'down' && price > pmrb.high) return { signal:'HOLD', confidence:0, reasons:['Break failed — price above 8AM high'] };
+
+  score += 8; reasons.push(`📦 8AM range retest at mid $${pmrb.mid.toFixed(2)} ✅`);
+
+  // ── CONFLUENCE 1: Rejection wick (tape confirmation) ────────────
+  const bodySize  = Math.abs(lastBar.c - lastBar.o);
+  const bodyMin   = atrVal * 0.1; // body should be meaningful, not a doji
+
+  if (pmrb.breakDir === 'up') {
+    const lowerWick = Math.min(lastBar.o, lastBar.c) - lastBar.l;
+    const isBullishRej = lastBar.c > lastBar.o &&
+                         lowerWick >= bodySize * 0.6 &&
+                         lastBar.c >= pmrb.mid &&
+                         bodySize >= bodyMin;
+    if (isBullishRej) {
+      confluenceCount++; score += 5;
+      reasons.push(`✅ Bullish rejection wick at mid (wick=${(lowerWick/atrVal).toFixed(1)}× ATR)`);
+    } else if (lastBar.c > lastBar.o && lastBar.c >= pmrb.mid) {
+      score += 2; reasons.push(`⚠ Bullish close at mid (no strong wick)`);
+    } else {
+      score -= 3; reasons.push(`❌ Bearish close at mid retest — waiting for rejection`);
+    }
+  } else {
+    const upperWick = lastBar.h - Math.max(lastBar.o, lastBar.c);
+    const isBearishRej = lastBar.c < lastBar.o &&
+                         upperWick >= bodySize * 0.6 &&
+                         lastBar.c <= pmrb.mid &&
+                         bodySize >= bodyMin;
+    if (isBearishRej) {
+      confluenceCount++; score += 5;
+      reasons.push(`✅ Bearish rejection wick at mid (wick=${(upperWick/atrVal).toFixed(1)}× ATR)`);
+    } else if (lastBar.c < lastBar.o && lastBar.c <= pmrb.mid) {
+      score += 2; reasons.push(`⚠ Bearish close at mid (no strong wick)`);
+    } else {
+      score -= 3; reasons.push(`❌ Bullish close at mid retest — waiting for rejection`);
+    }
+  }
+
+  // ── CONFLUENCE 2: Institutional volume at retest ─────────────────
+  const volRatio = curVol / avgVol;
+  if (volRatio >= 2.0) {
+    confluenceCount++; score += 4;
+    reasons.push(`✅ Institutional volume ${volRatio.toFixed(1)}× at retest`);
+  } else if (volRatio >= 1.3) {
+    score += 2; reasons.push(`⚠ Elevated volume ${volRatio.toFixed(1)}× (want 2×+)`);
+  } else {
+    score -= 2; reasons.push(`❌ Low volume ${volRatio.toFixed(1)}× at retest — weak confirmation`);
+  }
+
+  // ── CONFLUENCE 3: Prior bar also tested mid and held ─────────────
+  const prevTaggedMid = pmrb.breakDir === 'up'
+    ? prevBar.l <= pmrb.mid + retestTol && prevBar.c >= pmrb.mid
+    : prevBar.h >= pmrb.mid - retestTol && prevBar.c <= pmrb.mid;
+  if (prevTaggedMid) {
+    confluenceCount++; score += 3;
+    reasons.push(`✅ Prior bar tagged mid and held — double confirmation`);
+  }
+
+  // ── CONFLUENCE 4: RSI in healthy retest zone ─────────────────────
+  if (pmrb.breakDir === 'up') {
+    if (r > 72) return { signal:'HOLD', confidence:0, reasons:[`RSI ${r.toFixed(0)} overbought — skip`] };
+    if (r >= 38 && r <= 62) { confluenceCount++; score += 3; reasons.push(`✅ RSI ${r.toFixed(0)} — healthy pullback zone`); }
+    else if (r < 38)        { score -= 2; reasons.push(`⚠ RSI ${r.toFixed(0)} showing unusual weakness at retest`); }
+    else                    { score += 1; reasons.push(`RSI ${r.toFixed(0)}`); }
+  } else {
+    if (r < 28) return { signal:'HOLD', confidence:0, reasons:[`RSI ${r.toFixed(0)} oversold — skip`] };
+    if (r >= 38 && r <= 62) { confluenceCount++; score += 3; reasons.push(`✅ RSI ${r.toFixed(0)} — healthy bounce zone`); }
+    else if (r > 62)        { score -= 2; reasons.push(`⚠ RSI ${r.toFixed(0)} showing unusual strength at retest`); }
+    else                    { score += 1; reasons.push(`RSI ${r.toFixed(0)}`); }
+  }
+
+  // ── CONFLUENCE 5: 15m trend aligned ─────────────────────────────
+  if (bars15m?.length >= 4) {
+    const c15    = bars15m.map(b => b.c);
+    const slope  = (c15[c15.length-1] - c15[c15.length-4]) / c15[c15.length-4];
+    if (pmrb.breakDir === 'up'   && slope >  0.001) { confluenceCount++; score += 3; reasons.push(`✅ 15m uptrend confirmed`); }
+    if (pmrb.breakDir === 'down' && slope < -0.001) { confluenceCount++; score += 3; reasons.push(`✅ 15m downtrend confirmed`); }
+    if (pmrb.breakDir === 'up'   && slope < -0.003) { score -= 4; reasons.push(`❌ 15m downtrend fights trade`); }
+    if (pmrb.breakDir === 'down' && slope >  0.003) { score -= 4; reasons.push(`❌ 15m uptrend fights trade`); }
+  }
+
+  // ── CONFLUENCE 6: Session timing ─────────────────────────────────
+  if (etMins >= 9*60 && etMins <= 10*60+30) {
+    confluenceCount++; score += 3;
+    reasons.push(`✅ Prime session window (9–10:30 AM ET)`);
+  } else if (etMins >= 8*60 && etMins < 9*60) {
+    score += 1; reasons.push(`⚠ Pre-open window (8–9 AM) — reduced liquidity`);
+  }
+
+  // ── HARD GATE: Require minimum confluence count ──────────────────
+  // Need at least 4 independent confluence factors to take the trade.
+  // This is what separates "valid signal" from "high-probability setup".
+  if (confluenceCount < 3) {
+    return {
+      signal: 'HOLD', confidence: 0, score, reasons,
+      _pmrbWaiting: `${confluenceCount}/4 confluence — need ${4 - confluenceCount} more`,
+    };
+  }
+  reasons.push(`🎯 Confluence: ${confluenceCount}/6 factors aligned`);
+
+  // ── Stop, target, R:R ────────────────────────────────────────────
+  // Stop: just outside the opposite side of the box + small ATR buffer
+  // For longs: stop below the LOW of the 8AM candle
+  // For shorts: stop above the HIGH of the 8AM candle
+  const stopBuffer = atrVal * 0.15;
+  const stopPrice  = pmrb.breakDir === 'up'
+    ? pmrb.low  - stopBuffer
+    : pmrb.high + stopBuffer;
+  const risk       = Math.abs(price - stopPrice);
+
+  // Target: mid ± (3 × box width), capped at 4× box for realism
+  const tpMult   = 3.0;
+  const tpPrice  = pmrb.breakDir === 'up'
+    ? pmrb.mid + pmrb.width * tpMult
+    : pmrb.mid - pmrb.width * tpMult;
+  const reward   = Math.abs(tpPrice - price);
+  const rrActual = risk > 0 ? reward / risk : 0;
+
+  if (rrActual >= 2.5) { score += 3; reasons.push(`✅ R:R ${rrActual.toFixed(1)}:1`); }
+  else if (rrActual < 1.5) {
+    return { signal:'HOLD', confidence:0, reasons:[`R:R ${rrActual.toFixed(1)}:1 — too low for PMRB`] };
+  }
+
+  reasons.push(`📍 Stop: $${stopPrice.toFixed(2)} | TP: $${tpPrice.toFixed(2)} | Risk: $${risk.toFixed(2)} | 3R target`);
+
+  // ── Scale flag: 60% entry now, 40% add on reclaim ────────────────
+  // The reclaim level is the break level (high for longs, low for shorts)
+  const reclaimLevel = pmrb.breakDir === 'up' ? pmrb.high : pmrb.low;
+  reasons.push(`📊 Scale plan: 60% now @ mid | add 40% on reclaim of $${reclaimLevel.toFixed(2)}`);
+
+  // Stamp that we've attempted this symbol today
+  pmrbAttempted[sym] = { day: todayKey, attempted: true, failed: false, stopPrice, tpPrice };
+
+  if (score < 10) return { signal:'HOLD', confidence:0, score, reasons };
+  const conf = Math.min(98, 52 + confluenceCount * 8 + Math.min(score, 20));
+
   return {
     signal:     direction === 'buy' ? 'BUY' : 'SELL',
     confidence: conf,
@@ -4307,11 +4314,24 @@ function signalPMRB(sym, bars5m, bars15m) {
     reasons,
     rsi:        r,
     atr:        atrVal,
-    pmrb:       { high: pmrb.high, low: pmrb.low, mid: pmrb.mid, breakDir: pmrb.breakDir, stopPrice, tpPrice },
+    pmrb: {
+      high: pmrb.high, low: pmrb.low, mid: pmrb.mid,
+      breakDir: pmrb.breakDir, stopPrice, tpPrice, confluenceCount,
+      reclaimLevel, rrActual,
+    },
   };
 }
 
-// Used by: Day-trading desks, prop firms, ORB legends (Tony Oz, etc.)
+// ── Mark PMRB attempt as failed when stop is hit ──────────────────
+// Called from exitPosition / coverShort when reason = STOP_LOSS
+function markPMRBFailed(sym) {
+  const etNow    = getETTime();
+  const todayKey = etNow.toISOString().slice(0, 10);
+  if (pmrbAttempted[sym]?.day === todayKey) {
+    pmrbAttempted[sym].failed = true;
+    log('sys', `🚫 PMRB ${sym}: attempt marked failed — no re-entry today`);
+  }
+}
 
 // Used by: Day-trading desks, prop firms, ORB legends (Tony Oz, etc.)
 // Edge: First 30 minutes set the day's directional bias for liquid names.
@@ -5427,7 +5447,13 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     if (safeQty < 1) { log('warn', `${sym}: position too risky even at 1 share — skipping`); return; }
     log('risk', `${sym}: reducing qty ${qty}→${safeQty} (implied loss $${impliedLoss.toFixed(0)} > max $${maxDollarLoss.toFixed(0)})`);
   }
-  const finalQty = Math.min(qty, Math.max(1, Math.floor(maxDollarLoss / (price * CONFIG.hardMaxLoss))));
+  // PMRB: 60% initial size — preserves capital for the 40% add-on at reclaim
+  const isPMRBScaled = CONFIG.strategy === 'pmrb' && sigInfo?.pmrb?.reclaimLevel;
+  let finalQty = Math.min(qty, Math.max(1, Math.floor(maxDollarLoss / (price * CONFIG.hardMaxLoss))));
+  if (isPMRBScaled) {
+    finalQty = Math.max(1, Math.floor(finalQty * 0.60));
+    log('pmrb', `${sym} PMRB 60% entry: ${finalQty} shares | add at reclaim $${sigInfo.pmrb.reclaimLevel.toFixed(2)}`);
+  }
 
   const atrVal    = bars && bars.length >= 14 ? atr(bars, 14) : price * CONFIG.stopLossPct;
   const srLevels  = calcSRLevels(bars || []);
@@ -5688,6 +5714,7 @@ async function coverShort(sym, price, reason) {
     const cooldownMins = lossAbs > 100 ? 15 : lossAbs > 30 ? 10 : 5;
     stopLossCooldown[sym] = Date.now() + cooldownMins * 60 * 1000;
     log('risk', `⏳ ${sym} re-entry cooldown: ${cooldownMins}min after SHORT ${reason} ($${pnl.toFixed(2)})`);
+    markPMRBFailed(sym); // PMRB: one attempt per symbol per day
   }
 
   const icon = { STOP_LOSS:'🛑', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰' }[reason] || '📤';
@@ -5892,6 +5919,7 @@ async function exitPosition(sym, price, reason) {
     const cooldownMins = lossAbs > 100 ? 15 : lossAbs > 30 ? 10 : 5;
     stopLossCooldown[sym] = Date.now() + cooldownMins * 60 * 1000;
     log('risk', `⏳ ${sym} re-entry cooldown: ${cooldownMins}min after ${reason} ($${pnl.toFixed(2)})`);
+    markPMRBFailed(sym); // PMRB: one attempt per symbol per day
   }
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
@@ -7285,6 +7313,7 @@ async function sendDailySummary() {
   // Reset daily state
   // Clear PMRB ranges so 8AM candle is re-captured for the new session
   Object.keys(pmrbRanges).forEach(k => delete pmrbRanges[k]);
+  Object.keys(pmrbAttempted).forEach(k => delete pmrbAttempted[k]);
   Object.keys(openingRanges).forEach(k => delete openingRanges[k]);
   dailyStartPortfolio  = portfolio;
   realDailyStartEquity = realEquity; // reset to current equity for new day
