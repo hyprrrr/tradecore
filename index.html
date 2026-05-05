@@ -916,7 +916,7 @@
           <div class="settings-section-title">⚡ Strategy</div>
           <div class="settings-row">
             <span class="settings-label">Strategy</span>
-            <select class="settings-select" id="setStrategy" style="width:auto;">
+            <select class="settings-select" id="setStrategy" style="width:auto;" onchange="saveSetting('strategy', this.value).then(() => { const s=$('settingsSaveStatus'); if(s){s.textContent='✓ Strategy saved'; s.style.color='var(--buy)'; setTimeout(()=>s.textContent='',2000);}})">
               <option value="rsi_macd">RSI + MACD (default)</option>
               <option value="smc">SMC</option>
               <option value="ict">ICT</option>
@@ -932,7 +932,7 @@
           </div>
           <div class="settings-row">
             <label class="settings-label">Market Sentiment</label>
-            <select class="settings-select" id="setMarketSentiment" style="width:auto;" title="Controls which directions are allowed. Auto = derived from SPY regime each scan.">
+            <select class="settings-select" id="setMarketSentiment" style="width:auto;" title="Controls which directions are allowed. Auto = derived from SPY regime each scan." onchange="saveSetting('marketSentiment', this.value).then(() => { const s=$('settingsSaveStatus'); if(s){s.textContent='✓ Sentiment saved'; s.style.color='var(--buy)'; setTimeout(()=>s.textContent='',2000);}})">
               <option value="auto">🤖 Auto (SPY-driven)</option>
               <option value="bullish">📈 Bullish — Longs only</option>
               <option value="bearish">📉 Bearish — Shorts only</option>
@@ -3066,7 +3066,34 @@ function removeSymbol(sym) {
 
 async function saveSetting(field, value) {
   const body = { [field]: value, updated_at: new Date().toISOString() };
-  await sbFetch('tc_settings?id=eq.1', 'PATCH', body);
+  try {
+    const rawRes = await fetch(`${CONFIG.sbUrl}/rest/v1/tc_settings?id=eq.1`, {
+      method: 'PATCH',
+      headers: {
+        'apikey':        CONFIG.sbKey,
+        'Authorization': `Bearer ${CONFIG.sbKey}`,
+        'Content-Type':  'application/json',
+        'Prefer':        'return=minimal',
+      },
+      body: JSON.stringify(body),
+    });
+    if (rawRes.status !== 204 && rawRes.status !== 200) {
+      const txt = await rawRes.text().catch(() => '');
+      // Column may not exist yet — log but don't surface as error to user
+      // for toggle fields (they're non-critical); DO surface for strategy
+      console.warn(`saveSetting(${field}) HTTP ${rawRes.status}:`, txt.slice(0, 200));
+      if (field === 'strategy' || field === 'marketSentiment') {
+        const statusEl = $('settingsSaveStatus');
+        if (statusEl) {
+          statusEl.textContent = `✗ Column '${field}' may not exist in tc_settings — run SQL migration`;
+          statusEl.style.color = 'var(--sell)';
+        }
+        console.error(`SQL needed: ALTER TABLE tc_settings ADD COLUMN IF NOT EXISTS ${field} text;`);
+      }
+    }
+  } catch(e) {
+    console.warn(`saveSetting(${field}) failed:`, e.message);
+  }
   // sync right sidebar toggles too
   if ($('scalpToggle')    && field === 'scalp_mode')     $('scalpToggle').checked    = value;
   if ($('shortsToggle')   && field === 'shorts_enabled') $('shortsToggle').checked   = value;
@@ -3104,18 +3131,63 @@ async function saveAllSettings() {
     symbols:           _symbols.join(','),
     updated_at:        new Date().toISOString(),
   };
-  // Remove undefined fields
-  Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
+  // Remove undefined AND null fields — null columns cause Supabase type errors
+  Object.keys(body).forEach(k => (body[k] === undefined || body[k] === null) && delete body[k]);
 
-  const res = await sbFetch('tc_settings?id=eq.1', 'PATCH', body);
-  if (res !== null) {
+  // Use PATCH with explicit id in body as fallback + better error reporting
+  let res = null;
+  let errMsg = '';
+  try {
+    // First try PATCH — works if row id=1 exists
+    const rawRes = await fetch(`${CONFIG.sbUrl}/rest/v1/tc_settings?id=eq.1`, {
+      method: 'PATCH',
+      headers: {
+        'apikey':        CONFIG.sbKey,
+        'Authorization': `Bearer ${CONFIG.sbKey}`,
+        'Content-Type':  'application/json',
+        'Prefer':        'return=minimal',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (rawRes.status === 204 || rawRes.status === 200) {
+      res = { ok: true };
+    } else if (rawRes.status === 404 || rawRes.status === 400) {
+      // Row may not exist — try UPSERT
+      const upsertBody = { ...body, id: 1 };
+      const upsertRes = await fetch(`${CONFIG.sbUrl}/rest/v1/tc_settings`, {
+        method: 'POST',
+        headers: {
+          'apikey':        CONFIG.sbKey,
+          'Authorization': `Bearer ${CONFIG.sbKey}`,
+          'Content-Type':  'application/json',
+          'Prefer':        'resolution=merge-duplicates,return=minimal',
+        },
+        body: JSON.stringify(upsertBody),
+      });
+      if (upsertRes.status === 204 || upsertRes.status === 200 || upsertRes.status === 201) {
+        res = { ok: true };
+      } else {
+        const errText = await upsertRes.text().catch(() => '');
+        errMsg = `HTTP ${upsertRes.status}: ${errText.slice(0, 120)}`;
+      }
+    } else {
+      const errText = await rawRes.text().catch(() => '');
+      errMsg = `HTTP ${rawRes.status}: ${errText.slice(0, 120)}`;
+    }
+  } catch (e) {
+    errMsg = e.message || 'Network error';
+  }
+
+  if (res?.ok) {
     if (statusEl) { statusEl.textContent = '✓ Saved!'; statusEl.style.color = 'var(--buy)'; }
     await fetchSettings();
-    // Keep sidebar toggles in sync
     updateSettingsUI(state.settings);
     setTimeout(() => { if(statusEl) statusEl.textContent = ''; }, 3000);
   } else {
-    if (statusEl) { statusEl.textContent = '✗ Save failed — check connection'; statusEl.style.color = 'var(--sell)'; }
+    const msg = errMsg ? `✗ ${errMsg}` : '✗ Save failed — check Supabase URL/key in Config';
+    if (statusEl) { statusEl.textContent = msg; statusEl.style.color = 'var(--sell)'; }
+    console.error('saveAllSettings failed:', errMsg);
   }
 }
 
