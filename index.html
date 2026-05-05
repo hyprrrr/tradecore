@@ -746,6 +746,7 @@
       </div>
       <div style="padding: 0 14px 10px; display: flex; gap: 8px;">
         <button class="btn btn-outline btn-sm" style="flex:1;" onclick="exportDiagnostics()" title="Bundle bot + dashboard + DB state into a JSON file for debugging">🩺 Export Diagnostics</button>
+        <button class="btn btn-outline btn-sm" style="flex:1;" onclick="runCleanupNow()" title="Delete old rows from Supabase to free up quota">🧹 Cleanup DB</button>
       </div>
 
       <!-- Account -->
@@ -932,7 +933,7 @@
           </div>
           <div class="settings-row">
             <label class="settings-label">Market Sentiment</label>
-            <select class="settings-select" id="setMarketSentiment" style="width:auto;" title="Controls which directions are allowed. Auto = derived from SPY regime each scan." onchange="saveSetting('marketSentiment', this.value).then(() => { const s=$('settingsSaveStatus'); if(s){s.textContent='✓ Sentiment saved'; s.style.color='var(--buy)'; setTimeout(()=>s.textContent='',2000);}})">
+            <select class="settings-select" id="setMarketSentiment" style="width:auto;" title="Controls which directions are allowed. Auto = derived from SPY regime each scan." onchange="saveSetting('market_sentiment', this.value).then(() => { const s=$('settingsSaveStatus'); if(s){s.textContent='✓ Sentiment saved'; s.style.color='var(--buy)'; setTimeout(()=>s.textContent='',2000);}})">
               <option value="auto">🤖 Auto (SPY-driven)</option>
               <option value="bullish">📈 Bullish — Longs only</option>
               <option value="bearish">📉 Bearish — Shorts only</option>
@@ -1703,6 +1704,55 @@ async function exitAll() {
 //  • Dashboard client state (CONFIG, mode, state object, chart settings)
 //  • Recent browser console output + uncaught errors (last 200 entries)
 //  • Environment info (URL, user agent, viewport, timestamps)
+async function runCleanupNow() {
+  const btn = event?.target;
+  if (btn) { btn.textContent = '🧹 Cleaning…'; btn.disabled = true; }
+  try {
+    // Call the bot's cleanup endpoint
+    const res = await botFetch('/cleanup');
+    if (res?.ok || res?.deleted !== undefined) {
+      const n = res.deleted || 0;
+      addLog('info', `🧹 Cleanup complete — removed ${n} rows from Supabase`);
+      if (btn) btn.textContent = `✓ Removed ${n} rows`;
+    } else {
+      // Bot endpoint not available — do it directly from dashboard
+      addLog('info', '🧹 Running cleanup directly from dashboard…');
+      let deleted = 0;
+      const trimTable = async (table, keepRows) => {
+        try {
+          const cutoffRes = await sbFetch(`${table}?select=created_at&order=created_at.desc&limit=1&offset=${keepRows}`, 'GET');
+          if (!cutoffRes?.length) return;
+          const cutoff = cutoffRes[0].created_at;
+          const del = await sbFetch(`${table}?created_at=lt.${encodeURIComponent(cutoff)}`, 'DELETE');
+          const n = Array.isArray(del) ? del.length : 0;
+          if (n) { deleted += n; addLog('info', `🗑 ${table}: -${n} rows`); }
+        } catch(e) { addLog('warn', `Cleanup ${table}: ${e.message}`); }
+      };
+      const trimByAge = async (table, days) => {
+        try {
+          const cutoff = new Date(Date.now() - days*86400000).toISOString();
+          const del = await sbFetch(`${table}?created_at=lt.${encodeURIComponent(cutoff)}`, 'DELETE');
+          const n = Array.isArray(del) ? del.length : 0;
+          if (n) { deleted += n; addLog('info', `🗑 ${table}: -${n} rows (>${days}d old)`); }
+        } catch(e) { addLog('warn', `Cleanup ${table}: ${e.message}`); }
+      };
+      await trimTable('tc_trades',       1000);
+      await trimTable('sim_tc_trades',    500);
+      await trimTable('tc_positions',     200);
+      await trimTable('sim_tc_positions', 100);
+      await trimByAge('tc_logs',            7);
+      await trimByAge('tc_equity',         30);
+      await trimByAge('sim_tc_equity',      7);
+      addLog('info', `✅ Cleanup done — removed ${deleted} total rows`);
+      if (btn) btn.textContent = `✓ Removed ${deleted} rows`;
+    }
+  } catch(e) {
+    addLog('error', `Cleanup failed: ${e.message}`);
+    if (btn) btn.textContent = '✗ Failed';
+  }
+  setTimeout(() => { if (btn) { btn.textContent = '🧹 Cleanup DB'; btn.disabled = false; } }, 4000);
+}
+
 async function exportDiagnostics() {
   addLog('info', '🩺 Gathering diagnostics…');
 
@@ -3008,7 +3058,7 @@ function populateSettingsForm() {
   const strat = $('setStrategy');
   if (strat && s.strategy) strat.value = s.strategy;
   const sentSel = $('setMarketSentiment');
-  if (sentSel && s.marketSentiment) sentSel.value = s.marketSentiment;
+  if (sentSel && (s.market_sentiment || s.marketSentiment)) sentSel.value = s.market_sentiment || s.marketSentiment;
 
   // Numbers
   const setN = (id, val) => { const e=$(id); if(e&&val!=null) e.value = val; };
@@ -3115,7 +3165,7 @@ async function saveAllSettings() {
     recovery_mode:     gb('setRecovery'),
     sim_mode:          gb('setSim'),
     strategy:          g('setStrategy'),
-    marketSentiment:   g('setMarketSentiment') || undefined,
+    market_sentiment:  g('setMarketSentiment') || undefined,  // snake_case matches Supabase column
     starting_capital:  +g('setStartCap') || undefined,
     max_positions:     +g('setMaxPos')   || undefined,
     max_position_pct:  +g('setPosPct')   || undefined,
@@ -3131,7 +3181,8 @@ async function saveAllSettings() {
     symbols:           _symbols.join(','),
     updated_at:        new Date().toISOString(),
   };
-  // Remove undefined AND null fields — null columns cause Supabase type errors
+  // Remove camelCase duplicate + undefined/null fields
+  delete body.marketSentiment; // use snake_case market_sentiment instead
   Object.keys(body).forEach(k => (body[k] === undefined || body[k] === null) && delete body[k]);
 
   // Use PATCH with explicit id in body as fallback + better error reporting
