@@ -135,6 +135,31 @@ const CONFIG = {
 // Secrets (API keys, webhook) stay in Render env vars only
 // Everything else can be changed from the dashboard
 // ─────────────────────────────────────────────
+async function ensureColumns() {
+  // Adds any new columns that don't exist yet in tc_settings.
+  // Runs once on startup — safe to re-run (IF NOT EXISTS).
+  // This prevents 400 errors when new fields are added to the bot.
+  const migrations = [
+    `ALTER TABLE tc_settings ADD COLUMN IF NOT EXISTS strategy text`,
+    `ALTER TABLE tc_settings ADD COLUMN IF NOT EXISTS "marketSentiment" text`,
+    `ALTER TABLE tc_settings ADD COLUMN IF NOT EXISTS market_sentiment text`,
+  ];
+  try {
+    const fetch = await getFetch();
+    for (const sql of migrations) {
+      await fetch(`${CONFIG.supabaseUrl}/rest/v1/rpc/exec_sql`, {
+        method: 'POST',
+        headers: {
+          'apikey': CONFIG.supabaseKey,
+          'Authorization': `Bearer ${CONFIG.supabaseKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query: sql }),
+      }).catch(() => {}); // ignore — RPC may not exist, column may already exist
+    }
+  } catch(e) {}
+}
+
 async function loadRemoteConfig() {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return;
   try {
@@ -154,6 +179,7 @@ async function loadRemoteConfig() {
     if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 200); // hard cap 200 (was 20)
     if (s.strategy)         CONFIG.strategy         = s.strategy;
     if (s.marketSentiment)  CONFIG.marketSentiment  = s.marketSentiment;
+    if (s.market_sentiment) CONFIG.marketSentiment  = s.market_sentiment; // snake_case fallback
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
     if (s.rsi_oversold)     CONFIG.rsiOversold      = +s.rsi_oversold;
     if (s.rsi_overbought)   CONFIG.rsiOverbought    = +s.rsi_overbought;
@@ -7606,6 +7632,115 @@ async function sendDiscordAlert(type, sym, qty, price, pnl, reason, sigInfo, ext
   } catch(e){ log('error',`Discord failed: ${e.message}`); }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// SUPABASE AUTO-CLEANUP
+// ═══════════════════════════════════════════════════════════════════
+// Runs weekly at daily-reset time. Trims all high-volume tables to
+// stay under Supabase free-tier row quota (500MB / ~50k rows).
+//
+// Retention policy:
+//   tc_trades         → keep last 1000 rows  (closed trades history)
+//   sim_tc_trades     → keep last 500  rows  (sim is disposable)
+//   tc_positions      → keep last 200  rows  (should be near-zero live)
+//   sim_tc_positions  → keep last 100  rows
+//   tc_logs           → keep last 7 days     (rolling window)
+//   tc_equity         → keep last 30 days    (chart data)
+//   sim_tc_equity     → keep last 7 days
+// ═══════════════════════════════════════════════════════════════════
+
+// Track last cleanup so we only run weekly
+let _lastCleanupDay = '';
+
+async function runSupabaseCleanup() {
+  const et      = getETTime();
+  const dayKey  = et.toISOString().slice(0, 10);
+  const dayNum  = Math.floor(Date.now() / 86400000); // days since epoch
+
+  // Run once per week (every 7 days)
+  if (_lastCleanupDay === dayKey) return;         // already ran today
+  if (dayNum % 7 !== 0) return;                  // only on weekly cadence
+  _lastCleanupDay = dayKey;
+
+  log('sys', '🧹 Running weekly Supabase cleanup to stay under quota…');
+  let deleted = 0;
+
+  // ── Helper: delete rows keeping only the latest N ─────────────────
+  // Uses Supabase's DELETE with a subquery via RPC isn't available in REST,
+  // so we: (1) fetch the Nth row's created_at, (2) delete everything older.
+  const trimTable = async (table, keepRows, dateCol = 'created_at') => {
+    try {
+      // Get total count
+      const countRes = await sbFetch(`${table}?select=id&limit=1`, 'GET');
+      if (!countRes?.length && countRes?.length !== 0) return;
+
+      // Fetch the cutoff row (the keepRows-th newest)
+      const cutoffRes = await sbFetch(
+        `${table}?select=${dateCol}&order=${dateCol}.desc&limit=1&offset=${keepRows}`,
+        'GET'
+      );
+      if (!cutoffRes?.length) return; // fewer rows than limit — nothing to delete
+
+      const cutoffDate = cutoffRes[0][dateCol];
+      if (!cutoffDate) return;
+
+      // Delete everything older than the cutoff
+      const delRes = await sbFetch(
+        `${table}?${dateCol}=lt.${encodeURIComponent(cutoffDate)}`,
+        'DELETE'
+      );
+      // Supabase returns deleted rows array on DELETE without return=minimal
+      const n = Array.isArray(delRes) ? delRes.length : 0;
+      if (n > 0) {
+        deleted += n;
+        log('sys', `🗑 ${table}: removed ${n} old rows (keeping ${keepRows})`);
+      }
+    } catch (e) {
+      log('error', `Cleanup ${table}: ${e.message}`);
+    }
+  };
+
+  // ── Helper: delete rows older than N days ─────────────────────────
+  const trimByAge = async (table, days, dateCol = 'created_at') => {
+    try {
+      const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+      const delRes = await sbFetch(
+        `${table}?${dateCol}=lt.${encodeURIComponent(cutoff)}`,
+        'DELETE'
+      );
+      const n = Array.isArray(delRes) ? delRes.length : 0;
+      if (n > 0) {
+        deleted += n;
+        log('sys', `🗑 ${table}: removed ${n} rows older than ${days}d`);
+      }
+    } catch (e) {
+      log('error', `Cleanup ${table} age-trim: ${e.message}`);
+    }
+  };
+
+  // ── Run all cleanups ───────────────────────────────────────────────
+  await trimTable('tc_trades',         1000);
+  await trimTable('sim_tc_trades',      500);
+  await trimTable('tc_positions',       200);
+  await trimTable('sim_tc_positions',   100);
+  await trimByAge('tc_logs',              7);  // 7 days of logs
+  await trimByAge('tc_equity',           30);  // 30 days of equity snapshots
+  await trimByAge('sim_tc_equity',        7);  // 7 days of sim equity
+
+  if (deleted > 0) {
+    log('sys', `✅ Cleanup complete — removed ${deleted} total rows`);
+    if (CONFIG.discordWebhook) {
+      const fetch = await getFetch();
+      fetch(CONFIG.discordWebhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: `🧹 **Weekly cleanup**: removed **${deleted} rows** from Supabase to stay under quota.` }),
+      }).catch(() => {});
+    }
+  } else {
+    log('sys', `✅ Cleanup ran — no rows needed removal (tables within limits)`);
+  }
+}
+
 async function sendDailySummary() {
   if (!CONFIG.discordWebhook) return;
   const fetch = await getFetch();
@@ -7637,6 +7772,11 @@ async function sendDailySummary() {
       timestamp: new Date().toISOString(),
     }]}),
   }).catch(e => log('error', `Daily summary failed: ${e.message}`));
+
+  // ── Weekly Supabase cleanup ───────────────────────────────────────
+  // Runs every 7 days to keep row counts under free-tier quota.
+  // Keeps last 1000 trades, 500 sim trades, 7 days of positions.
+  await runSupabaseCleanup();
 
   // Reset daily state
   // Clear PMRB ranges so 8AM candle is re-captured for the new session
@@ -8755,6 +8895,7 @@ cron.schedule('55 8 * * 1-5',  storePrevClose,   { timezone: 'America/New_York' 
 cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' }); // run at market open
 
 // Startup — prewarm data then scan immediately
+ensureColumns().catch(() => {});
 loadRemoteConfig().then(async () => {
   await updateDayBias();
   if (isMarketOpen()) {
@@ -9092,6 +9233,20 @@ function readBody(req) {
 
 http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
+
+  // ── Global CORS — must be first, covers every route + preflight ──
+  // Without this the dashboard at tradecoreai.vercel.app can't talk to
+  // the bot at tradecore.up.railway.app (different origins = blocked).
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey');
+
+  // Handle preflight OPTIONS request browsers send before cross-origin POSTs
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
   // ── GET /setup-discord — register slash commands (visit once in browser) ──
   if (req.method === 'GET' && url === '/setup-discord') {
