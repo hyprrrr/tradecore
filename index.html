@@ -558,7 +558,7 @@
         <span id="modeText">LIVE</span>
       </div>
       <div class="header-pill" id="sessionPill">--</div>
-      <div class="header-pill" id="clock">--:--:-- ET</div>
+      <div class="header-pill" id="clock" style="min-width:max-content;font-size:11px;letter-spacing:0.02em;">--:--:-- local</div>
       <button class="btn btn-outline btn-sm" onclick="toggleConfig()">Config</button>
       <button class="btn btn-accent btn-sm" id="simBtn" onclick="toggleSimMode()">Enter Sim</button>
     </div>
@@ -1083,9 +1083,9 @@
    ═══════════════════════════════════════════════════════════════ */
 
 const $ = id => document.getElementById(id);
-const fmt = n => typeof n === 'number' ? n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '--';
+const fmt = n => typeof n === 'number' ? n.toLocaleString([],{minimumFractionDigits:2,maximumFractionDigits:2}) : '--';
 const fmtP = n => typeof n === 'number' ? (n>=0?'+':'') + n.toFixed(2) + '%' : '--';
-const fmt$ = n => typeof n === 'number' ? (n>=0?'+':'') + '$' + Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '--';
+const fmt$ = n => typeof n === 'number' ? (n>=0?'+':'') + '$' + Math.abs(n).toLocaleString([],{minimumFractionDigits:2,maximumFractionDigits:2}) : '--';
 
 // Strip _SHORT / _SCALP suffixes from symbols for display.
 // Bot uses these suffixes internally so a symbol can appear in multiple
@@ -2111,7 +2111,7 @@ function renderTrades(trades) {
     const up = (t.pnl||0) >= 0;
     const side = t.side || 'BUY';
     const tagClass = side.includes('SELL')||side.includes('SHORT')||side.includes('COVER') ? 'tag-sell' : 'tag-buy';
-    const time = t.created_at ? new Date(t.created_at).toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '--';
+    const time = t.created_at ? new Date(t.created_at).toLocaleTimeString([],{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '--';
     return `<tr>
       <td>${time}</td>
       <td><b>${t.symbol}</b></td>
@@ -2127,7 +2127,7 @@ function renderTrades(trades) {
 function renderLogs(logs) {
   const panel = $('miniLogs');
   panel.innerHTML = logs.map(l => {
-    const t = l.created_at ? new Date(l.created_at).toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '--';
+    const t = l.created_at ? new Date(l.created_at).toLocaleTimeString([],{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '--';
     const type = (l.type||'info').toLowerCase();
     return `<div class="log-line"><span class="log-time">${t}</span><span class="log-type ${type}">${type.toUpperCase()}</span>${escapeHtml(l.message||'')}</div>`;
   }).join('');
@@ -2136,7 +2136,7 @@ function renderLogs(logs) {
 
 function addLog(type, msg) {
   const panel = $('miniLogs');
-  const t = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const t = new Date().toLocaleTimeString([],{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
   const div = document.createElement('div');
   div.className = 'log-line';
   div.innerHTML = `<span class="log-time">${t}</span><span class="log-type ${type}">${type.toUpperCase()}</span>${escapeHtml(msg)}`;
@@ -2416,7 +2416,7 @@ function _redrawChartImmediate() {
       i === 0 || i === gridSteps ? '1' : '0.5',
       i === 0 || i === gridSteps ? null : '4,4'));
     const t = svgText(W - pad.r + 5, y + 3.5,
-      price >= 1000 ? '$' + price.toLocaleString('en-US',{maximumFractionDigits:0}) : '$' + price.toFixed(2),
+      price >= 1000 ? '$' + price.toLocaleString([],{maximumFractionDigits:0}) : '$' + price.toFixed(2),
       '9.5', 'var(--text-dim)', 'start');
     t.setAttribute('font-family', 'var(--font-mono)');
     svg.appendChild(t);
@@ -2527,7 +2527,7 @@ function _redrawChartImmediate() {
   lbg.setAttribute('fill', last.close >= last.open ? 'var(--buy)' : 'var(--sell)');
   svg.appendChild(lbg);
   const lt = svgText(W - pad.r + 36, ly + 3.5,
-    '$' + last.close.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}),
+    '$' + last.close.toLocaleString([],{minimumFractionDigits:2,maximumFractionDigits:2}),
     '9.5', 'var(--bg-0)', 'middle');
   lt.setAttribute('font-weight', '700');
   lt.setAttribute('font-family', 'var(--font-mono)');
@@ -2816,8 +2816,17 @@ function renderTicker() {
 // ═══════════════════════════════════════ CLOCK ═══════════════════════════════════════
 function updateClock() {
   const now = new Date();
+  // Local time — auto-detects user's timezone (e.g. PST/PDT for California)
+  const local = now.toLocaleString([],{ hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const localTZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  // Short timezone label (e.g. "PDT", "CDT", "EDT")
+  const tzLabel = now.toLocaleString('en-US', { timeZoneName: 'short' }).split(' ').pop();
+  // ET always shown alongside so trading sessions make sense
   const et = now.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  $('clock').textContent = et + ' ET';
+  const sameAsET = localTZ === 'America/New_York';
+  $('clock').textContent = sameAsET
+    ? `${et} ET`
+    : `${local} ${tzLabel}  (${et} ET)`;
 }
 
 // ═══════════════════════════════════════ TABS ═══════════════════════════════════════
@@ -2915,7 +2924,7 @@ async function refreshAnalytics() {
   const dayLoss = dayTrades.filter(t => (t.pnl||0) < 0).length;
 
   // Update cards
-  $('aTotalPnL').textContent = (totalPnL >= 0 ? '+$' : '-$') + Math.abs(totalPnL).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  $('aTotalPnL').textContent = (totalPnL >= 0 ? '+$' : '-$') + Math.abs(totalPnL).toLocaleString([],{minimumFractionDigits:2,maximumFractionDigits:2});
   $('aTotalPnL').style.color = totalPnL >= 0 ? 'var(--buy)' : 'var(--sell)';
   const pctBase = startCap > 0 ? startCap : (eq - totalPnL) || 1;
   $('aTotalPct').textContent = (totalPnL >= 0 ? '+' : '') + (pctBase > 0 ? (totalPnL/pctBase*100).toFixed(2) : '0.00') + '% all-time';
@@ -3013,7 +3022,7 @@ async function refreshAnalytics() {
     const up = (t.pnl||0) >= 0;
     const side = t.side || 'BUY';
     const tagCls = side.includes('SELL')||side.includes('SHORT')||side.includes('COVER') ? 'tag-sell' : 'tag-buy';
-    const time = t.created_at ? new Date(t.created_at).toLocaleString('en-US',{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '--';
+    const time = t.created_at ? new Date(t.created_at).toLocaleString([],{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '--';
     return `<tr>
       <td style="color:var(--text-dim);font-size:10px;">${time}</td>
       <td><b>${t.symbol||'?'}</b></td>
@@ -3282,7 +3291,7 @@ function renderLogsTable(logs) {
   tbody.innerHTML = filtered.map(l => {
     const type = (l.type||'info').toLowerCase();
     const color = colorMap[type] || 'var(--text-muted)';
-    const time = l.created_at ? new Date(l.created_at).toLocaleString('en-US',{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '--';
+    const time = l.created_at ? new Date(l.created_at).toLocaleString([],{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '--';
     // Highlight $ amounts and symbols in message
     const msg = escapeHtml(l.message||'')
       .replace(/(\+\$[\d,.]+)/g, '<span class="pos">$1</span>')
