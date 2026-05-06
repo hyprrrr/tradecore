@@ -330,10 +330,25 @@ async function loadRemoteConfig() {
           circuitBreakerOn = false;
           wsSubscribed.clear(); // don't stream live prices during sim
 
-          // Reset portfolio to starting capital
-          portfolio            = CONFIG.startingCapital;
-          realEquity           = CONFIG.startingCapital;
-          realDailyStartEquity = CONFIG.startingCapital;
+          // Reset portfolio — use actual Alpaca equity not hardcoded startingCapital
+          // This prevents day P&L showing -$7k on restart due to wrong baseline
+          try {
+            const _acct = await getAccount();
+            if (_acct?.equity && +_acct.equity > 0) {
+              portfolio            = +parseFloat(_acct.equity).toFixed(2);
+              realEquity           = portfolio;
+              realDailyStartEquity = _acct.last_equity ? +parseFloat(_acct.last_equity).toFixed(2) : portfolio;
+              log('sys', `📊 Live baseline: equity=$${portfolio.toFixed(2)} dailyStart=$${realDailyStartEquity.toFixed(2)}`);
+            } else {
+              portfolio            = CONFIG.startingCapital;
+              realEquity           = CONFIG.startingCapital;
+              realDailyStartEquity = CONFIG.startingCapital;
+            }
+          } catch(e) {
+            portfolio            = CONFIG.startingCapital;
+            realEquity           = CONFIG.startingCapital;
+            realDailyStartEquity = CONFIG.startingCapital;
+          }
 
           // Force bar reload on next sim scan
           simState.loaded  = false;
@@ -1732,7 +1747,7 @@ async function syncPortfolio() {
     }, 0);
     const equity = portfolio + openVal + shortPnl;
     const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
-    if (equity > 0) { realEquity = equity; if (!realDailyStartEquity) realDailyStartEquity = CONFIG.startingCapital; }
+    if (equity > 0) { realEquity = equity; if (!realDailyStartEquity) realDailyStartEquity = equity; } // use live equity as baseline, not startingCapital
     await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
       cash: +portfolio.toFixed(2), total_value: +equity.toFixed(2), day_pnl: +dayPnl.toFixed(2),
       total_wins: totalWins, total_losses: totalLosses, circuit_breaker: circuitBreakerOn,
@@ -7189,6 +7204,13 @@ async function runScan() {
 
   // Always sync live Alpaca positions first
   await syncAlpacaPositions();
+  // Throttle scan size during off-hours — rate limits hit hardest outside US hours
+  const isUSOpen = isMarketOpen();
+  const maxScanSize = isUSOpen ? symbolsToScan.length : Math.min(40, symbolsToScan.length);
+  if (symbolsToScan.length > maxScanSize) {
+    symbolsToScan = symbolsToScan.slice(0, maxScanSize);
+    log('scan', `Off-hours: scanning ${maxScanSize} symbols (reduced from full list to stay under rate limit)`);
+  }
   log('scan', `Prefetching bars for ${symbolsToScan.length} symbols in parallel…`);
   const prefetchStart = Date.now();
   const allBarData = await fetchAllBarsParallel(symbolsToScan);
@@ -8455,12 +8477,22 @@ log('sys', `Current session: ${getCurrentSession()}`);
 // Avoid re-fetching the same bars multiple times per scan cycle.
 // Bars change at most every minute, so an 8-second cache is safe.
 const barCache = new Map(); // `SYM_TF` → { bars, ts }
-const BAR_CACHE_TTL = 8000;
+// TTL by timeframe — no point re-fetching a 5m bar before the next 5m closes.
+// This is the single biggest API call reducer: cache hit = zero network req.
+const BAR_CACHE_TTL_MAP = {
+  '1Min':  30_000,   //  30s  — scalp bars change fast
+  '5Min':  90_000,   //  90s  — new bar every 5min, cache ~1 scan cycle
+  '15Min': 240_000,  //   4min — new bar every 15min
+  '1Hour': 900_000,  //  15min
+  '1Day':  3_600_000,// 1hr
+};
+const BAR_CACHE_TTL_DEFAULT = 90_000;
 
 async function fetchBarsCached(symbol, timeframe, limit) {
   const key = `${symbol}_${timeframe}`;
+  const ttl = BAR_CACHE_TTL_MAP[timeframe] || BAR_CACHE_TTL_DEFAULT;
   const hit  = barCache.get(key);
-  if (hit && Date.now() - hit.ts < BAR_CACHE_TTL) return hit.bars;
+  if (hit && Date.now() - hit.ts < ttl) return hit.bars;
   const bars = await fetchBars(symbol, timeframe, limit);
   if (bars) barCache.set(key, { bars, ts: Date.now() });
   return bars;
@@ -8471,10 +8503,19 @@ async function fetchBarsCached(symbol, timeframe, limit) {
 // New: fetch all symbols simultaneously → scan time drops ~10x
 async function fetchAllBarsParallel(symbols) {
   // Stagger requests in batches of 3 to avoid rate limiting
-  // Alpaca free tier: 200 requests/min — 15 symbols × 2 timeframes = 30 requests
-  // Batching with 150ms delays keeps us well under the limit
-  const BATCH_SIZE = 3;
+  // Alpaca free tier: 200 req/min. Each symbol needs 2 calls (5m + 15m).
+  // 102 symbols = 204 calls. At 200/min limit we need ≥ 61s — we achieve
+  // this by batching 5 symbols (10 calls) with 350ms gap = ~7s/batch × 21 batches = 147s total.
+  // BUT: in-memory cache (fetchBarsCached) skips re-fetching bars < 90s old,
+  // so subsequent scans within the same minute are nearly free.
+  //
+  // Target: stay under 180 req/min (10% safety margin).
+  // Formula: delay = Math.ceil((BATCH_SIZE * 2) / (180/60) * 1000) = 333ms per batch of 5
+  const BATCH_SIZE = 5;
+  const BATCH_DELAY = 350; // ms between batches — keeps us at ~171 req/min max
   const results = [];
+  let rateLimitBackoff = 0; // increases if we still hit limits
+
   for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
     const batch = symbols.slice(i, i + BATCH_SIZE);
     const batchResults = await Promise.allSettled(
@@ -8486,10 +8527,21 @@ async function fetchAllBarsParallel(symbols) {
         return { sym, bars5m, bars15m };
       })
     );
+
+    // Check if this batch hit rate limits — increase backoff if so
+    const hadRateLimit = batchResults.some(r =>
+      r.status === 'rejected' && r.reason?.message?.includes('rate limit')
+    );
+    if (hadRateLimit) {
+      rateLimitBackoff = Math.min(rateLimitBackoff + 200, 1000);
+    } else if (rateLimitBackoff > 0) {
+      rateLimitBackoff = Math.max(0, rateLimitBackoff - 50); // recover slowly
+    }
+
     results.push(...batchResults);
-    // Small delay between batches to stay under rate limit
+
     if (i + BATCH_SIZE < symbols.length) {
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, BATCH_DELAY + rateLimitBackoff));
     }
   }
   return results
