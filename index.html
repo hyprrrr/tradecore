@@ -180,8 +180,8 @@
     display: grid;
     grid-template-columns: 260px 1fr 300px;
     grid-template-rows: 1fr 240px;
-    gap: 5px;
-    padding: 5px;
+    gap: 8px;
+    padding: 8px;
     background: transparent;
     overflow: hidden;
     position: relative;
@@ -219,7 +219,7 @@
   .panel-action:hover { background: rgba(255,255,255,0.08); color: var(--text); }
 
   /* ═══════════════════════════════════════ LEFT SIDEBAR ═══════════════════════════════════════ */
-  .leftbar { grid-row: 1 / -1; }
+  .leftbar { grid-row: 1 / -1; border-radius: 16px; overflow: hidden; }
   .leftbar .panel-body { flex: 1; overflow-y: auto; }
 
   .watch-search {
@@ -246,24 +246,26 @@
 
   .watch-row {
     display: grid; grid-template-columns: 1fr auto auto;
-    align-items: center; padding: 9px 14px;
-    cursor: pointer; transition: background .15s;
+    align-items: center; padding: 11px 12px;
+    cursor: pointer; transition: background .12s;
     border-left: 2px solid transparent;
+    border-radius: 10px;
+    margin: 2px 6px;
   }
   .watch-row:hover { background: rgba(255,255,255,0.06); }
-  .watch-row.active { background: rgba(255,255,255,0.07); border-left-color: var(--accent); }
-  .watch-name { font-size: 12.5px; font-weight: 600; color: var(--text); }
-  .watch-name span { font-size: 10.5px; font-weight: 500; color: var(--text-dim); margin-left: 4px; }
-  .watch-price { font-family: var(--font-mono); font-size: 12px; font-weight: 600; text-align: right; padding-right: 10px; }
+  .watch-row.active { background: rgba(255,255,255,0.08); border-left-color: var(--accent); }
+  .watch-name { font-size: 13.5px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
+  .watch-name span { font-size: 10px; font-weight: 500; color: var(--text-dim); margin-left: 5px; }
+  .watch-price { font-family: var(--font-mono); font-size: 13px; font-weight: 700; text-align: right; padding-right: 10px; }
   .watch-change {
-    font-family: var(--font-mono); font-size: 11px; font-weight: 600;
-    padding: 2px 6px; border-radius: var(--radius-sm); text-align: right;
+    font-family: var(--font-mono); font-size: 12px; font-weight: 700;
+    padding: 3px 7px; border-radius: 7px; text-align: right; min-width: 54px;
   }
-  .watch-change.up { color: var(--buy); background: var(--buy-dim); }
-  .watch-change.down { color: var(--sell); background: var(--sell-dim); }
+  .watch-change.up { color: var(--buy); background: rgba(5,216,144,0.12); }
+  .watch-change.down { color: var(--sell); background: rgba(255,64,96,0.12); }
 
   /* ═══════════════════════════════════════ CENTER CHART ═══════════════════════════════════════ */
-  .chart-area { grid-column: 2; grid-row: 1; }
+  .chart-area { grid-column: 2; grid-row: 1; border-radius: 16px; overflow: hidden; }
 
   .chart-topbar {
     display: flex; align-items: center; justify-content: space-between;
@@ -279,8 +281,8 @@
   }
   .pair-stats { display: flex; align-items: center; gap: 14px; }
   .pair-stat { display: flex; flex-direction: column; align-items: flex-start; }
-  .pair-stat-label { font-size: 9.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
-  .pair-stat-value { font-family: var(--font-mono); font-size: 12.5px; font-weight: 700; color: var(--text); }
+  .pair-stat-label { font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 2px; }
+  .pair-stat-value { font-family: var(--font-mono); font-size: 15px; font-weight: 700; color: var(--text); line-height: 1.1; }
   .pair-stat-value.up { color: var(--buy); }
   .pair-stat-value.down { color: var(--sell); }
 
@@ -330,14 +332,15 @@
   /* ═══════════════════════════════════════ BOTTOM PANELS ═══════════════════════════════════════ */
   .bottom-panels {
     grid-column: 2; grid-row: 2; display: grid;
-    grid-template-columns: 1.4fr 1fr; gap: 1px; background: var(--border);
+    grid-template-columns: 1.4fr 1fr; gap: 8px; background: transparent;
   }
 
   .data-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
   .data-table th {
-    text-align: left; padding: 7px 10px; color: var(--text-dim); font-weight: 600;
-    font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px;
-    background: rgba(255,255,255,0.04); border-bottom: 1px solid rgba(255,255,255,0.08); white-space: nowrap;
+    text-align: left; padding: 9px 12px; color: rgba(255,255,255,0.3); font-weight: 600;
+    font-size: 9.5px; text-transform: uppercase; letter-spacing: .8px;
+    background: rgba(255,255,255,0.03); border-bottom: 1px solid rgba(255,255,255,0.07); white-space: nowrap;
+    position: sticky; top: 0; z-index: 2;
   }
   .data-table td {
     padding: 7px 10px; color: var(--text-muted);
@@ -371,23 +374,28 @@
   .progress-fill { height: 100%; border-radius: 2px; transition: width .5s; }
 
   /* ═══════════════════════════════════════ RIGHT SIDEBAR ═══════════════════════════════════════ */
-  .rightbar { grid-column: 3; grid-row: 1 / -1; }
+  .rightbar { grid-column: 3; grid-row: 1 / -1; border-radius: 16px; overflow: hidden; }
 
   .stat-grid {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border);
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0; background: transparent;
   }
+  /* Subtle dividers between stat cells — no boxes, just hairlines */
+  .stat-card:nth-child(odd)  { border-right: 1px solid rgba(255,255,255,0.05); }
+  .stat-card:nth-child(-n+4) { border-bottom: 1px solid rgba(255,255,255,0.05); }
   .stat-card {
     background: transparent; padding: 12px 14px;
     display: flex; flex-direction: column; gap: 4px;
   }
   .stat-card-label {
-    font-size: 9.5px; color: var(--text-dim);
-    text-transform: uppercase; letter-spacing: .5px; font-weight: 600;
+    font-size: 9px; color: rgba(255,255,255,0.28);
+    text-transform: uppercase; letter-spacing: .8px; font-weight: 600;
+    margin-bottom: 4px;
   }
   .stat-card-value {
-    font-family: var(--font-mono); font-size: 16px; font-weight: 700; color: var(--text);
+    font-family: var(--font-mono); font-size: 22px; font-weight: 700; color: var(--text);
+    letter-spacing: -0.03em; line-height: 1.1;
   }
-  .stat-card-sub { font-size: 10.5px; color: var(--text-muted); font-family: var(--font-mono); }
+  .stat-card-sub { font-size: 11px; color: rgba(255,255,255,0.35); font-family: var(--font-mono); margin-top: 2px; }
 
   .control-grid {
     display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
@@ -438,18 +446,22 @@
 
   /* ═══════════════════════════════════════ TICKER TAPE ═══════════════════════════════════════ */
   .ticker-tape {
-    display: flex; align-items: center; background: transparent;
-    border-top: 1px solid var(--border); overflow: hidden; white-space: nowrap; padding: 6px 0;
+    display: flex; align-items: center;
+    background: rgba(255,255,255,0.025);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid rgba(255,255,255,0.07);
+    overflow: hidden; white-space: nowrap; height: 32px;
   }
   .ticker-content {
-    display: inline-flex; align-items: center; gap: 24px;
-    animation: ticker 40s linear infinite; padding-left: 100%;
+    display: inline-flex; align-items: center; gap: 28px;
+    animation: ticker 60s linear infinite; padding-left: 100%;
   }
   @keyframes ticker { 0%{transform:translateX(0)} 100%{transform:translateX(-100%)} }
-  .ticker-item { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-family: var(--font-mono); }
-  .ticker-pair { color: var(--text-muted); font-weight: 600; }
+  .ticker-item { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-family: var(--font-mono); }
+  .ticker-sep { color: rgba(255,255,255,0.12); margin: 0 4px; }
+  .ticker-pair { color: rgba(255,255,255,0.5); font-weight: 600; font-size: 10.5px; letter-spacing: 0.05em; }
   .ticker-price { color: var(--text); font-weight: 700; }
-  .ticker-chg { font-weight: 700; }
+  .ticker-chg { font-weight: 700; font-size: 10.5px; }
 
   /* ═══════════════════════════════════════ CONNECTION STATUS ═══════════════════════════════════════ */
   .conn-status {
@@ -792,11 +804,11 @@
     border-bottom: 1px solid rgba(255,255,255,0.07) !important;
   }
   .panel-title {
-    font-size: 10px !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.12em !important;
+    font-size: 9.5px !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.14em !important;
     text-transform: uppercase !important;
-    color: var(--text-muted) !important;
+    color: rgba(255,255,255,0.35) !important;
   }
 
   /* Equity bar — pill stats row */
@@ -886,18 +898,16 @@
   }
 
   /* Performance stat cards */
+  /* stat-card: no box — values sit directly on panel glass */
   .stat-card, .perf-card {
-    background: var(--glass-2) !important;
-    border: 1px solid var(--glass-border) !important;
-    border-radius: var(--radius) !important;
-    padding: 14px !important;
-    transition: border-color .2s !important;
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    padding: 14px 16px 12px !important;
   }
-  .stat-card:hover, .perf-card:hover {
-    border-color: var(--glass-border-bright) !important;
-  }
-  .stat-value { font-size: 22px !important; font-weight: 600 !important; letter-spacing: -0.02em !important; }
-  .stat-label { font-size: 9.5px !important; letter-spacing: 0.1em !important; text-transform: uppercase !important; color: var(--text-dim) !important; }
+  .stat-card:hover, .perf-card:hover { background: transparent !important; }
+  .stat-value { font-size: 24px !important; font-weight: 700 !important; letter-spacing: -0.03em !important; line-height: 1.1 !important; }
+  .stat-label { font-size: 9px !important; letter-spacing: 0.12em !important; text-transform: uppercase !important; color: rgba(255,255,255,0.28) !important; margin-bottom: 6px !important; display: block !important; }
 
   /* Log entries */
   .log-entry {
@@ -986,10 +996,11 @@
 
   /* Bot account card */
   .account-card {
-    background: var(--glass-2) !important;
-    border: 1px solid var(--glass-border) !important;
-    border-radius: var(--radius) !important;
+    background: rgba(255,255,255,0.05) !important;
+    border: 1px solid rgba(255,255,255,0.09) !important;
+    border-radius: 14px !important;
     margin: 8px !important;
+    padding: 12px !important;
   }
 
   /* Glow on accent numbers */
@@ -1107,7 +1118,7 @@
           <div class="pair-stats">
             <div class="pair-stat">
               <span class="pair-stat-label">Equity</span>
-              <span class="pair-stat-value" id="mainEquity">--</span>
+              <span class="pair-stat-value" id="mainEquity" style="font-size:20px;letter-spacing:-0.03em;">--</span>
             </div>
             <div class="pair-stat">
               <span class="pair-stat-label">24h P&L</span>
@@ -2948,9 +2959,15 @@ function _redrawChartImmediate() {
   const prices = visible.flatMap(d => [d.high, d.low]).filter(isFinite);
   const minP   = Math.min(...prices);
   const maxP   = Math.max(...prices);
-  const rng    = maxP - minP || maxP * 0.01 || 1;
-  const yMin   = minP - rng * 0.08;
-  const yMax   = maxP + rng * 0.08;
+  const rawRng = maxP - minP || 1;
+
+  // Force minimum visual range = 0.25% of price
+  // Without this, a $8 swing on a $92k equity looks like a vertical spike
+  const minVisualRng = maxP * 0.0025;
+  const rng    = Math.max(rawRng, minVisualRng);
+  const midP   = (minP + maxP) / 2;
+  const yMin   = Math.min(minP - rng * 0.15, midP - rng * 0.6);
+  const yMax   = Math.max(maxP + rng * 0.15, midP + rng * 0.6);
   const yRng   = yMax - yMin;
 
   const xOf  = i  => pad.l + (i / Math.max(visible.length - 1, 1)) * cw;
