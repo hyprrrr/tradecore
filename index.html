@@ -6,29 +6,56 @@
 <title>ALPHACORE // Trading Bot Command Center</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2300e5c7'/><text x='16' y='22' font-family='Inter,system-ui,sans-serif' font-size='19' font-weight='800' text-anchor='middle' fill='%23070708'>A</text></svg>" />
 <style>
+  /* ── Google Fonts ── */
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
   :root {
-    --bg-0: #070708;
-    --bg-1: #0e0e10;
-    --bg-2: #141419;
-    --bg-3: #1c1c22;
-    --bg-4: #22222a;
-    --border: #2a2a32;
-    --border-light: #353540;
-    --text: #e8e8ec;
-    --text-muted: #8a8a95;
-    --text-dim: #55555f;
-    --accent: #00e5c7;
-    --accent-dim: rgba(0,229,199,0.12);
-    --buy: #00c48c;
-    --buy-dim: rgba(0,196,140,0.15);
-    --sell: #ff4757;
-    --sell-dim: rgba(255,71,87,0.15);
-    --warn: #ffa502;
-    --info: #3498db;
-    --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
-    --font-mono: 'SF Mono', 'Fira Code', 'Consolas', monospace;
-    --radius: 8px;
-    --radius-sm: 4px;
+    /* ── Palette — deep space with aurora accent ── */
+    --bg-0:   #060609;
+    --bg-1:   #0a0a0f;
+    --bg-2:   #0f0f17;
+    --bg-3:   #14141e;
+    --bg-4:   #1a1a26;
+
+    /* Glass surfaces */
+    --glass-1: rgba(255,255,255,0.03);
+    --glass-2: rgba(255,255,255,0.055);
+    --glass-3: rgba(255,255,255,0.08);
+    --glass-border: rgba(255,255,255,0.08);
+    --glass-border-bright: rgba(255,255,255,0.14);
+
+    /* Borders */
+    --border: rgba(255,255,255,0.07);
+    --border-light: rgba(255,255,255,0.12);
+
+    /* Text */
+    --text:       #f0f0f5;
+    --text-muted: #8888a0;
+    --text-dim:   #44445a;
+
+    /* Brand accent — electric teal */
+    --accent:       #00e5c7;
+    --accent-2:     #00b4d8;
+    --accent-glow:  0 0 20px rgba(0,229,199,0.25);
+    --accent-dim:   rgba(0,229,199,0.1);
+
+    /* Trade colors */
+    --buy:      #05d890;
+    --buy-dim:  rgba(5,216,144,0.12);
+    --sell:     #ff4060;
+    --sell-dim: rgba(255,64,96,0.12);
+    --warn:     #ffb020;
+    --info:     #4080ff;
+
+    /* Typography */
+    --font:      'DM Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+
+    /* Geometry */
+    --radius:    12px;
+    --radius-sm: 8px;
+    --radius-lg: 18px;
+    --radius-xl: 24px;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -39,27 +66,45 @@
     font-family: var(--font);
     font-size: 13px;
     overflow: hidden;
+    -webkit-font-smoothing: antialiased;
   }
 
-  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  /* Ambient background gradient — subtle aurora */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 50% at 10% 0%, rgba(0,229,199,0.04) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 40% at 90% 100%, rgba(0,180,216,0.03) 0%, transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--bg-4); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 99px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
 
   .app {
     display: grid;
     grid-template-rows: 52px 1fr;
     height: 100vh;
     width: 100vw;
+    position: relative;
+    z-index: 1;
   }
 
   /* ═══════════════════════════════════════ HEADER ═══════════════════════════════════════ */
   .header {
     display: flex; align-items: center; justify-content: space-between;
     padding: 0 20px;
-    background: var(--bg-1);
-    border-bottom: 1px solid var(--border);
+    background: rgba(10,10,15,0.85);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border-bottom: 1px solid var(--glass-border);
     position: relative; z-index: 100;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.04);
   }
   .header-left, .header-right { display: flex; align-items: center; gap: 14px; }
 
@@ -78,7 +123,7 @@
   .nav-tabs { display: flex; align-items: center; gap: 2px; margin-left: 24px; }
   .nav-tab {
     padding: 7px 16px; border-radius: var(--radius-sm);
-    color: var(--text-muted); font-size: 12.5px; font-weight: 500;
+    color: var(--text-muted); font-size: 12px; font-weight: 500; letter-spacing: 0.02em;
     cursor: pointer; transition: all .2s; user-select: none;
     border: 1px solid transparent; position: relative;
   }
@@ -130,19 +175,23 @@
     display: grid;
     grid-template-columns: 260px 1fr 300px;
     grid-template-rows: 1fr 240px;
-    gap: 1px;
-    background: var(--border);
+    gap: 6px;
+    padding: 6px;
+    background: var(--bg-0);
     overflow: hidden;
     position: relative;
   }
 
   .panel {
-    background: var(--bg-1); display: flex; flex-direction: column;
+    background: var(--glass-1);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    display: flex; flex-direction: column;
     overflow: hidden;
   }
   .panel-header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 14px; border-bottom: 1px solid var(--border); min-height: 40px;
+    padding: 10px 16px; border-bottom: 1px solid var(--glass-border); min-height: 42px;
   }
   .panel-title {
     font-size: 12px; font-weight: 700; letter-spacing: 0.5px;
@@ -716,6 +765,251 @@
   @media (min-width: 769px) {
     .mobile-tab-bar { display: none !important; }
   }
+
+  /* ═══════════════════════════════════════════════════
+     GLASS CARD SYSTEM — iOS-inspired frosted surfaces
+  ═══════════════════════════════════════════════════ */
+
+  /* Every panel gets card treatment */
+  .panel {
+    border-radius: var(--radius-lg) !important;
+    border: 1px solid var(--glass-border) !important;
+    box-shadow:
+      0 4px 24px rgba(0,0,0,0.4),
+      0 1px 0 rgba(255,255,255,0.06) inset !important;
+  }
+
+  /* Panel headers — subtle separator */
+  .panel-header {
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0 !important;
+    background: var(--glass-2) !important;
+  }
+  .panel-title {
+    font-size: 10px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.12em !important;
+    text-transform: uppercase !important;
+    color: var(--text-muted) !important;
+  }
+
+  /* Equity bar — pill stats row */
+  .equity-bar {
+    background: var(--glass-2) !important;
+    border-bottom: 1px solid var(--glass-border) !important;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0 !important;
+    padding: 10px 16px !important;
+    gap: 20px !important;
+  }
+  .eq-label { font-size: 9px !important; letter-spacing: 0.1em !important; text-transform: uppercase !important; color: var(--text-dim) !important; }
+  .eq-value { font-size: 18px !important; font-weight: 600 !important; letter-spacing: -0.02em !important; }
+  .eq-sub   { font-size: 10.5px !important; }
+
+  /* Timeframe buttons — pill style */
+  .tf-btn {
+    border-radius: 99px !important;
+    border: 1px solid transparent !important;
+    font-size: 10.5px !important;
+    font-weight: 500 !important;
+    padding: 4px 10px !important;
+    transition: all .15s ease !important;
+  }
+  .tf-btn:hover { background: var(--glass-3) !important; border-color: var(--glass-border) !important; }
+  .tf-btn.active {
+    background: var(--accent-dim) !important;
+    border-color: rgba(0,229,199,0.3) !important;
+    color: var(--accent) !important;
+    box-shadow: 0 0 12px rgba(0,229,199,0.15) !important;
+  }
+
+  /* Buttons — glass pill style */
+  .btn {
+    border-radius: var(--radius-sm) !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.02em !important;
+    transition: all .15s ease !important;
+  }
+  .btn-primary {
+    background: var(--accent) !important;
+    box-shadow: 0 0 20px rgba(0,229,199,0.2), 0 2px 8px rgba(0,0,0,0.3) !important;
+  }
+  .btn-primary:hover { box-shadow: 0 0 28px rgba(0,229,199,0.35), 0 4px 12px rgba(0,0,0,0.4) !important; transform: translateY(-1px) !important; }
+  .btn-danger { background: var(--sell) !important; box-shadow: 0 0 16px rgba(255,64,96,0.2) !important; }
+  .btn-outline {
+    background: var(--glass-2) !important;
+    border-color: var(--glass-border) !important;
+    color: var(--text-muted) !important;
+  }
+  .btn-outline:hover { background: var(--glass-3) !important; border-color: var(--glass-border-bright) !important; color: var(--text) !important; }
+
+  /* Header pills */
+  .header-pill {
+    background: var(--glass-2) !important;
+    border: 1px solid var(--glass-border) !important;
+    border-radius: 99px !important;
+    backdrop-filter: blur(12px) !important;
+  }
+  #modeIndicator {
+    border-radius: 99px !important;
+    font-weight: 600 !important;
+    font-size: 10.5px !important;
+    letter-spacing: 0.08em !important;
+  }
+
+  /* Toggles — iOS style */
+  .toggle-track {
+    border-radius: 99px !important;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.4) !important;
+  }
+  input:checked + .toggle-track {
+    background: var(--accent) !important;
+    box-shadow: 0 0 12px rgba(0,229,199,0.3), inset 0 1px 3px rgba(0,0,0,0.2) !important;
+  }
+  .toggle-thumb {
+    border-radius: 99px !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.4) !important;
+  }
+
+  /* Watchlist / position rows */
+  .watch-item, .pos-row {
+    border-radius: var(--radius-sm) !important;
+    transition: background .1s !important;
+  }
+  .watch-item:hover, .pos-row:hover {
+    background: var(--glass-2) !important;
+  }
+
+  /* Performance stat cards */
+  .stat-card, .perf-card {
+    background: var(--glass-2) !important;
+    border: 1px solid var(--glass-border) !important;
+    border-radius: var(--radius) !important;
+    padding: 14px !important;
+    transition: border-color .2s !important;
+  }
+  .stat-card:hover, .perf-card:hover {
+    border-color: var(--glass-border-bright) !important;
+  }
+  .stat-value { font-size: 22px !important; font-weight: 600 !important; letter-spacing: -0.02em !important; }
+  .stat-label { font-size: 9.5px !important; letter-spacing: 0.1em !important; text-transform: uppercase !important; color: var(--text-dim) !important; }
+
+  /* Log entries */
+  .log-entry {
+    border-radius: var(--radius-sm) !important;
+    margin: 1px 4px !important;
+  }
+  .log-entry:hover { background: var(--glass-2) !important; }
+
+  /* Table */
+  th {
+    background: var(--glass-2) !important;
+    font-size: 9.5px !important;
+    letter-spacing: 0.1em !important;
+    text-transform: uppercase !important;
+    color: var(--text-dim) !important;
+    border-bottom: 1px solid var(--glass-border) !important;
+    font-weight: 600 !important;
+  }
+  tr:hover td { background: var(--glass-1) !important; }
+  td { border-bottom: 1px solid rgba(255,255,255,0.03) !important; }
+
+  /* Trade side badges */
+  .side-badge {
+    border-radius: 6px !important;
+    font-size: 9px !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.08em !important;
+    padding: 3px 7px !important;
+  }
+
+  /* Overlay panels */
+  .tab-overlay {
+    background: rgba(6,6,9,0.92) !important;
+    backdrop-filter: blur(32px) saturate(200%) !important;
+    -webkit-backdrop-filter: blur(32px) saturate(200%) !important;
+  }
+  .overlay-panel {
+    background: var(--glass-2) !important;
+    border: 1px solid var(--glass-border) !important;
+    border-radius: var(--radius-xl) !important;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.7), 0 1px 0 rgba(255,255,255,0.08) inset !important;
+    backdrop-filter: blur(40px) !important;
+  }
+
+  /* Settings inputs */
+  .settings-input, .settings-select {
+    background: var(--glass-1) !important;
+    border: 1px solid var(--glass-border) !important;
+    border-radius: var(--radius-sm) !important;
+    color: var(--text) !important;
+    transition: border-color .15s !important;
+  }
+  .settings-input:focus, .settings-select:focus {
+    outline: none !important;
+    border-color: rgba(0,229,199,0.4) !important;
+    box-shadow: 0 0 0 3px rgba(0,229,199,0.08) !important;
+  }
+
+  /* Tooltip */
+  .chart-tooltip {
+    background: rgba(10,10,18,0.95) !important;
+    border: 1px solid var(--glass-border-bright) !important;
+    border-radius: var(--radius) !important;
+    backdrop-filter: blur(20px) !important;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.6), 0 1px 0 rgba(255,255,255,0.08) inset !important;
+  }
+
+  /* Chart legend pills */
+  .chart-legend { gap: 10px !important; }
+  .legend-item {
+    background: var(--glass-2) !important;
+    border: 1px solid var(--glass-border) !important;
+    border-radius: 99px !important;
+    padding: 3px 10px !important;
+    font-size: 10px !important;
+  }
+
+  /* Recovery / circuit breaker cards */
+  .recovery-card, .circuit-card {
+    border-radius: var(--radius) !important;
+    border: 1px solid var(--glass-border) !important;
+    background: var(--glass-2) !important;
+  }
+
+  /* Bot account card */
+  .account-card {
+    background: var(--glass-2) !important;
+    border: 1px solid var(--glass-border) !important;
+    border-radius: var(--radius) !important;
+    margin: 8px !important;
+  }
+
+  /* Glow on accent numbers */
+  .pnl-positive { color: var(--buy) !important; text-shadow: 0 0 20px rgba(5,216,144,0.3) !important; }
+  .pnl-negative { color: var(--sell) !important; text-shadow: 0 0 20px rgba(255,64,96,0.2) !important; }
+
+  /* Section dividers */
+  .section-divider {
+    height: 1px !important;
+    background: var(--glass-border) !important;
+    margin: 0 12px !important;
+  }
+
+  /* LIVE dot pulse */
+  @keyframes live-pulse {
+    0%, 100% { box-shadow: 0 0 4px var(--accent); opacity: 1; }
+    50% { box-shadow: 0 0 10px var(--accent); opacity: 0.6; }
+  }
+  .live-dot { animation: live-pulse 2s ease-in-out infinite !important; }
+
+  /* Smooth entrance animations */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .panel { animation: fadeUp 0.3s ease both; }
+  .panel:nth-child(2) { animation-delay: 0.05s; }
+  .panel:nth-child(3) { animation-delay: 0.10s; }
+  .panel:nth-child(4) { animation-delay: 0.15s; }
 </style>
 </head>
 <body>
@@ -1836,7 +2130,7 @@ async function toggleSimMode() {
   state.portfolio            = null;       // force re-fetch
   chart.allCandles           = [];
   chart.viewStart            = 0;
-  chart.viewCount            = 60;
+  chart.viewCount            = 100;
   chart.isDragging           = false;
   chart.dragStartX           = null;
   chart.lastMouseX           = null;
@@ -2396,7 +2690,7 @@ function renderEquityChart(snapshots) {
 const chart = {
   allCandles: [],      // full dataset
   viewStart:  0,       // index of leftmost visible candle
-  viewCount:  60,      // how many candles visible
+  viewCount:  100,     // how many candles visible — tighter candles = more history
   isDragging: false,
   dragStartX: 0,
   dragStartView: 0,
@@ -2557,7 +2851,7 @@ function setTF(tf) {
   chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
   if (!chart.allCandles.length) return;
   // Default view: show last 60 candles (or all if fewer)
-  chart.viewCount = Math.min(60, chart.allCandles.length);
+  chart.viewCount = Math.min(100, chart.allCandles.length);
   chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
   if (!chart.isDragging) redrawChart();
 }
@@ -2574,6 +2868,9 @@ function redrawChart() {
 }
 
 function _redrawChartImmediate() {
+  // Subtle chart area gradient tint
+  const chartSvg = document.getElementById('chartSvg');
+  if (chartSvg) chartSvg.style.background = 'linear-gradient(180deg, rgba(6,6,12,0) 0%, rgba(41,98,255,0.015) 100%)';
   const candles = chart.allCandles;
   if (!candles.length) return;
 
@@ -2673,42 +2970,76 @@ function _redrawChartImmediate() {
     // Band fill
     let fill = bpU;
     for (let i = bb.length - 1; i >= 0; i--) { if (bb[i]) fill += ` L${xOf(i)},${yOf(bb[i].lower)}`; }
-    svg.appendChild(svgPath(fill + ' Z', 'rgba(52,152,219,0.05)', null, null));
-    svg.appendChild(svgPath(bpU, 'none', 'rgba(52,152,219,0.3)', '1', '3,3'));
-    svg.appendChild(svgPath(bpL, 'none', 'rgba(52,152,219,0.3)', '1', '3,3'));
+    svg.appendChild(svgPath(fill + ' Z', 'rgba(0,229,199,0.03)', null, null));
+    svg.appendChild(svgPath(bpU, 'none', 'rgba(0,229,199,0.2)', '1'));
+    svg.appendChild(svgPath(bpL, 'none', 'rgba(0,229,199,0.2)', '1'));
   }
 
-  // ── Candles ───────────────────────────────────────────────────
-  const candleW = Math.max(1.5, Math.min(18, (cw / visible.length) * 0.7));
-  visible.forEach((d, i) => {
-    const x      = xOf(i);
-    const up     = d.close >= d.open;
-    const color  = up ? 'var(--buy)' : 'var(--sell)';
-    const yo     = yOf(d.open);
-    const yc     = yOf(d.close);
-    const yh     = yOf(d.high);
-    const yl     = yOf(d.low);
-    const top    = Math.min(yo, yc);
-    const bodyH  = Math.max(Math.abs(yo - yc), 1.5);
+  // ── Candles — TradingView-style tight layout ─────────────────
+  // Key: slot = total space per candle. Body uses 72% of slot.
+  // 1px gap on each side = natural breathing room without looking sparse.
+  // Minimum body height 1px (doji), max candle width 16px.
+  const slotW  = cw / Math.max(visible.length, 1);
+  const candleW = Math.max(2, Math.min(16, slotW * 0.72));
+  const wickW   = Math.max(1, Math.min(1.5, candleW * 0.13));
 
-    // Wick
-    svg.appendChild(svgLine(x, yh, x, yl, color, '1'));
+  // TV color scheme: bull = #2962ff solid, bear = dark body + blue border
+  const BULL_FILL   = '#2962ff';
+  const BEAR_FILL   = '#131722';
+  const BEAR_STROKE = '#2962ff';
+  const WICK_COL    = '#2962ff';
+
+  visible.forEach((d, i) => {
+    const x       = xOf(i);
+    const up      = d.close >= d.open;
+    const yo      = yOf(d.open);
+    const yc      = yOf(d.close);
+    const yh      = yOf(d.high);
+    const yl      = yOf(d.low);
+    const bodyTop = Math.min(yo, yc);
+    const bodyH   = Math.max(Math.abs(yo - yc), 1.5);
+
+    // Upper wick
+    if (yh < bodyTop - 0.3) {
+      const uw = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      uw.setAttribute('x1', x); uw.setAttribute('y1', yh);
+      uw.setAttribute('x2', x); uw.setAttribute('y2', bodyTop);
+      uw.setAttribute('stroke', WICK_COL);
+      uw.setAttribute('stroke-width', wickW);
+      uw.setAttribute('stroke-linecap', 'round');
+      svg.appendChild(uw);
+    }
+
+    // Lower wick
+    if (yl > bodyTop + bodyH + 0.3) {
+      const lw = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      lw.setAttribute('x1', x); lw.setAttribute('y1', bodyTop + bodyH);
+      lw.setAttribute('x2', x); lw.setAttribute('y2', yl);
+      lw.setAttribute('stroke', WICK_COL);
+      lw.setAttribute('stroke-width', wickW);
+      lw.setAttribute('stroke-linecap', 'round');
+      svg.appendChild(lw);
+    }
 
     // Body
-    const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    rect.setAttribute('x', x - candleW / 2);
-    rect.setAttribute('y', top);
-    rect.setAttribute('width', candleW);
-    rect.setAttribute('height', bodyH);
-    rect.setAttribute('fill', color);
-    rect.setAttribute('fill-opacity', up ? '0.25' : '0.9');
-    rect.setAttribute('stroke', color);
-    rect.setAttribute('stroke-width', '1');
-    rect.setAttribute('rx', '1');
-    svg.appendChild(rect);
+    const body = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    const rx = candleW > 4 ? Math.min(2, candleW * 0.18) : 0.5;
+    body.setAttribute('x', x - candleW / 2);
+    body.setAttribute('y', bodyTop);
+    body.setAttribute('width', candleW);
+    body.setAttribute('height', bodyH);
+    body.setAttribute('rx', rx);
+    body.setAttribute('ry', rx);
+    if (up) {
+      body.setAttribute('fill', BULL_FILL);
+    } else {
+      body.setAttribute('fill', BEAR_FILL);
+      body.setAttribute('stroke', BEAR_STROKE);
+      body.setAttribute('stroke-width', '1');
+    }
+    svg.appendChild(body);
 
-    // Hit area
-    const slotW = cw / visible.length;
+    // Invisible hit area (full slot width)
     const hit = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
     hit.setAttribute('x', x - slotW / 2);
     hit.setAttribute('y', pad.t);
@@ -2716,7 +3047,7 @@ function _redrawChartImmediate() {
     hit.setAttribute('height', ch);
     hit.setAttribute('fill', 'transparent');
     hit.style.cursor = 'crosshair';
-    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, top, up, color); });
+    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, bodyTop, up, up ? BULL_FILL : BEAR_STROKE); });
     hit.addEventListener('mouseleave', hideTooltip);
     svg.appendChild(hit);
   });
