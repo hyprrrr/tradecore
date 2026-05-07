@@ -2530,10 +2530,11 @@ let _lastForceEquityMs = 0;
 function pushEquitySnapshot(equity) {
   if (!Number.isFinite(equity) || equity <= 0) return;
   const now = Date.now();
-  // Throttle to at most one push per 1s to avoid spamming during rapid exits
-  if (now - _lastForceEquityMs < 1000) return;
+  // Throttle: max one push per 60s (was 1s — was generating ~1440 rows/day per symbol)
+  // On-trade pushes still fire immediately (called directly from exitPosition)
+  if (now - _lastForceEquityMs < 60000) return;
   _lastForceEquityMs = now;
-  lastEquitySnapshot = now; // also resets the regular interval guard
+  lastEquitySnapshot = now;
   sbFetch(tbl('tc_equity'), 'POST', {
     value: +equity.toFixed(2),
     created_at: new Date().toISOString(),
@@ -9087,7 +9088,7 @@ setInterval(async () => {
 let lastConfigCheck = 0;
 setInterval(async () => {
   const now = Date.now();
-  if (now - lastConfigCheck < 4500) return; // poll every 5s — fast enough to catch toggles
+  if (now - lastConfigCheck < 28000) return; // poll every 30s — was 5s, killing egress quota
   lastConfigCheck = now;
   try {
     const prevMode     = CONFIG.mode;
@@ -9160,7 +9161,7 @@ setInterval(async () => {
   if (!isSimMode() && CONFIG.alpacaKey && Object.keys(positions).length + Object.keys(shortPositions).length > 0) {
     await syncPricesOnly();
   }
-}, 5000);
+}, 15000); // was 5000 — reduced to cut egress
 
 // ── OVERNIGHT GUARDIAN — runs every 60 seconds, completely independent of scan loop ──
 // If market is closed and we still have open positions, close them immediately.
