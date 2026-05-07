@@ -5719,24 +5719,28 @@ async function edgeGate(sym, direction, sigInfo, bars5m) {
       return { pass: false, reason: `bear regime — longs blocked (${regime.reasons})` };
     }
     if (direction === 'short' && regime.state === 'bull') {
-      return { pass: false, reason: `bull regime — shorts blocked (${regime.reasons})` };
+      // Scalps exempt — fading a 1-min spike in a bull market is fine,
+      // they're mean-reversion not trend bets. Only block swing shorts.
+      const isScalp = sigInfo?.isScalp || sigInfo?.scalp;
+      if (!isScalp) {
+        return { pass: false, reason: `bull regime — swing shorts blocked (${regime.reasons})` };
+      }
     }
 
     // ── Market Sentiment Bias ──────────────────────────────────────
-    // Prevents counter-trend trades during strong directional moves.
-    // 'auto' derives from SPY regime. Manual override via dashboard setting.
-    // Live experiment insight: counter-trend trades in trending markets
-    // were the single biggest P&L drag — cutting them = cleaner equity curve.
     const sentiment = resolveMarketSentiment(regime.state);
-    if (!sentimentAllows(direction === 'long' ? 'buy' : 'sell', sentiment)) {
+    const isScalpTrade = sigInfo?.isScalp || sigInfo?.scalp;
+    // Scalps exempt from sentiment gate — they're direction-agnostic by design
+    if (!isScalpTrade && !sentimentAllows(direction === 'long' ? 'buy' : 'sell', sentiment)) {
       return { pass: false, reason: `Sentiment ${sentiment.toUpperCase()} — ${direction} blocked` };
     }
     if (regime.state === 'chop') {
       // Full block in chop — the video experiment proved sideways markets
       // destroy bot performance. Half-size entries still lose, just slower.
       // Exception: PMRB has its own time/structure gate and can survive chop.
-      if (CONFIG.strategy !== 'pmrb') {
-        return { pass: false, sizeMultiplier: 0, reason: `chop market — all entries blocked (strategy=${CONFIG.strategy})` };
+      const activeStrat = CONFIG._activeStrategy || CONFIG.strategy;
+      if (activeStrat !== 'pmrb') {
+        return { pass: false, sizeMultiplier: 0, reason: `chop market — all entries blocked (strategy=${activeStrat})` };
       }
       return { pass: true, sizeMultiplier: 0.6, reason: `chop — PMRB reduced size` };
     }
@@ -8130,6 +8134,39 @@ function generateScalpSignal(sym, bars1m) {
   if (rh[3]>rh[2] && rh[2]>rh[1] && buy>sell)  { buy  += 10; reasons.push(`Higher highs structure ✅`); }
   if (rl[3]<rl[2] && rl[2]<rl[1] && sell>buy)  { sell += 10; reasons.push(`Lower lows structure ✅`); }
 
+  // ── H. Micro breakout — price broke above/below last 5 bars H/L ──
+  // This is the highest-precision scalp signal: clean structure break with volume
+  const recent5H = Math.max(...highs.slice(-6, -1));
+  const recent5L = Math.min(...lows.slice(-6, -1));
+  if (price > recent5H && volRatio >= 1.2) {
+    buy += 20; reasons.push(`🚀 5-bar high breakout $${recent5H.toFixed(2)} ✅`);
+  }
+  if (price < recent5L && volRatio >= 1.2) {
+    sell += 20; reasons.push(`📉 5-bar low breakdown $${recent5L.toFixed(2)} ✅`);
+  }
+
+  // ── I. 1m RSI momentum divergence — extra precision ──
+  // RSI accelerating in trend direction = momentum building
+  const r1mPrev = rsi(closes.slice(0,-1), 9);
+  if (buy > sell && r1m > r1mPrev + 3)  { buy  += 10; reasons.push(`RSI accelerating up (${r1mPrev.toFixed(0)}→${r1m.toFixed(0)}) ✅`); }
+  if (sell > buy && r1m < r1mPrev - 3)  { sell += 10; reasons.push(`RSI accelerating down (${r1mPrev.toFixed(0)}→${r1m.toFixed(0)}) ✅`); }
+
+  // ── J. Inside/outside bar pattern ──
+  const prev2Bar = bars1m[bars1m.length-3];
+  const prev1Bar = bars1m[bars1m.length-2];
+  // Outside bar (engulfs prior) = strong directional signal
+  if (lastBar.h > prev1Bar.h && lastBar.l < prev1Bar.l) {
+    lastBar.c > lastBar.o ? buy += 12 : sell += 12;
+    reasons.push(`Outside bar (engulfing) ✅`);
+  }
+  // Bull/bear engulfing
+  if (lastBar.c > lastBar.o && lastBar.c > prev1Bar.h && prev1Bar.c < prev1Bar.o) {
+    buy += 15; reasons.push(`Bullish engulf ✅`);
+  }
+  if (lastBar.c < lastBar.o && lastBar.c < prev1Bar.l && prev1Bar.c > prev1Bar.o) {
+    sell += 15; reasons.push(`Bearish engulf ✅`);
+  }
+
   // ── FINAL DECISION ──
   // Need strong directional conviction — buy must be 2x sell (or vice versa)
   // and total score must exceed threshold
@@ -8138,13 +8175,21 @@ function generateScalpSignal(sym, bars1m) {
   const conf     = total > 0 ? Math.round(Math.max(buy,sell)/total*100) : 0;
 
   // Require clear direction AND minimum score AND volume present
-  if (buy >= minScore && buy >= sell * 2.0 && volRatio >= 0.8) {
-    reasons.push(`✅ Scalp BUY: score=${buy} conf=${conf}% ATR=${(atrPct*100).toFixed(3)}%`);
-    return { signal:'BUY',  confidence:conf, score:buy,  reasons, atr:atrVal, vwap:vw, rsi:r1m };
+  // Lower threshold to 60 (was 70) — takes more trades but still requires 2:1 ratio
+  // Added precision: VWAP and momentum must agree with direction
+  const vwapAgreesLong  = vwapDist > 0;   // above VWAP = bullish bias
+  const vwapAgreesShort = vwapDist < 0;   // below VWAP = bearish bias
+  const momAgreesLong   = last >= prev;    // last 2 bars green
+  const momAgreesShort  = last <= prev;    // last 2 bars red
+  const effectiveMin    = CONFIG.scalpMinScore || 60;
+
+  if (buy >= effectiveMin && buy >= sell * 1.8 && volRatio >= 0.7 && (vwapAgreesLong || momAgreesLong)) {
+    reasons.push(`✅ Scalp BUY: score=${buy} conf=${conf}% vol=${volRatio.toFixed(1)}x`);
+    return { signal:'BUY',  confidence:conf, score:buy,  reasons, atr:atrVal, vwap:vw, rsi:r1m, isScalp:true };
   }
-  if (sell >= minScore && sell >= buy * 2.0 && volRatio >= 0.8) {
-    reasons.push(`✅ Scalp SELL: score=${sell} conf=${conf}% ATR=${(atrPct*100).toFixed(3)}%`);
-    return { signal:'SELL', confidence:conf, score:sell, reasons, atr:atrVal, vwap:vw, rsi:r1m };
+  if (sell >= effectiveMin && sell >= buy * 1.8 && volRatio >= 0.7 && (vwapAgreesShort || momAgreesShort)) {
+    reasons.push(`✅ Scalp SELL: score=${sell} conf=${conf}% vol=${volRatio.toFixed(1)}x`);
+    return { signal:'SELL', confidence:conf, score:sell, reasons, atr:atrVal, vwap:vw, rsi:r1m, isScalp:true };
   }
 
   return { signal:'HOLD', confidence:conf, score:Math.max(buy,sell),
@@ -8173,8 +8218,9 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   }
 
   // ── EDGE GATE ── (scalps get same regime + volume + time-of-day filters)
-  // bars parameter might not be available here; pass null — MTF check skipped
-  const edge = await edgeGate(sym, direction, sigInfo, null);
+  // Mark as scalp so edge gate exempts it from sentiment/swing direction blocks
+  const scalpSigInfo = { ...sigInfo, isScalp: true, scalp: true };
+  const edge = await edgeGate(sym, direction, scalpSigInfo, null);
   if (!edge.pass) {
     const _k = sym + '_scalp_edge_' + direction, _n = Date.now();
     if (!dupWarnThrottle[_k] || _n - dupWarnThrottle[_k] > 60000) {
