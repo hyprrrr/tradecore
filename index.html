@@ -1469,7 +1469,7 @@ async function fetchEquity() {
   const tbl = state.mode === 'sim' ? 'sim_tc_equity' : 'tc_equity';
   const since = new Date(Date.now() - 30*24*60*60*1000).toISOString();
   const data = await sbFetch(
-    `${tbl}?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=5000`,
+    `${tbl}?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=500`,
     'GET'
   );
 
@@ -1648,13 +1648,13 @@ async function fetchAll() {
 
 const pollTimers = { fast: null, medium: null, slow: null, liveTick: null };
 const POLL_INTERVALS = {
-  fast:   { healthy: 2000, degraded: 1000 },
-  medium: { healthy: 5000, degraded: 3000 },
-  slow:   30000,
-  // liveTick updates the "current" candle from state.portfolio in-memory —
-  // no Supabase fetch needed. This gives TradingView-smooth animation of
-  // the right-most candle between the slower fetchEquity polls.
-  liveTick: 500,
+  // Slowed down to reduce Supabase egress — was burning 7.5GB/mo at 2s fast poll
+  // Egress math: 2s poll × 10KB payload × 86400s/day × 30days = ~12GB/mo
+  // At 8s: ~3GB/mo — comfortably under the 5GB free tier limit
+  fast:   { healthy: 8000, degraded: 4000 },  // was 2000/1000
+  medium: { healthy: 15000, degraded: 8000 }, // was 5000/3000
+  slow:   60000,                               // was 30000
+  liveTick: 500, // canvas only — no Supabase fetch, keep smooth
 };
 let realtimeChannel = null;
 let realtimeHealthy = false;
@@ -2016,10 +2016,10 @@ async function exportDiagnostics() {
       pull('tc_portfolio?id=eq.1&select=*',                            'tc_portfolio'),
       pull('sim_tc_portfolio?id=eq.1&select=*',                        'sim_tc_portfolio'),
       pull('tc_settings?id=eq.1&select=*',                             'tc_settings'),
-      pull('tc_positions?select=*&order=entry_time.desc&limit=50',     'tc_positions'),
-      pull('sim_tc_positions?select=*&order=entry_time.desc&limit=50', 'sim_tc_positions'),
-      pull('tc_trades?select=*&order=created_at.desc&limit=100',       'tc_trades_recent'),
-      pull('sim_tc_trades?select=*&order=created_at.desc&limit=100',   'sim_tc_trades_recent'),
+      pull('tc_positions?select=*&order=entry_time.desc&limit=20',     'tc_positions'),
+      pull('sim_tc_positions?select=*&order=entry_time.desc&limit=20', 'sim_tc_positions'),
+      pull('tc_trades?select=*&order=created_at.desc&limit=50',        'tc_trades_recent'),
+      pull('sim_tc_trades?select=*&order=created_at.desc&limit=50',    'sim_tc_trades_recent'),
       pull('tc_logs?select=*&order=created_at.desc&limit=100',         'tc_logs_recent'),
       pull('sim_tc_logs?select=*&order=created_at.desc&limit=100',     'sim_tc_logs_recent'),
       pull('tc_equity?select=*&order=created_at.desc&limit=50',        'tc_equity_recent'),
@@ -3126,7 +3126,7 @@ async function refreshAnalytics() {
   // Fetch all trades (not just 24h)
   const tbl = state.mode === 'sim' ? 'sim_tc_trades' : 'tc_trades';
   // Fetch up to 5000 trades — 500 was losing ~80% of history on active bots
-  const data = await sbFetch(`${tbl}?select=*&order=created_at.desc&limit=5000`, 'GET');
+  const data = await sbFetch(`${tbl}?select=*&order=created_at.desc&limit=1000`, 'GET');
   if (!data || !Array.isArray(data)) return;
   const trades = data;
 
