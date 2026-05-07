@@ -2951,10 +2951,13 @@ function _redrawChartImmediate() {
   svg.innerHTML = '';
 
   // Clamp view
+  // viewStart/viewCount are floats for sub-candle precision — floor for slice
   chart.viewCount  = Math.max(5, Math.min(chart.allCandles.length, chart.viewCount));
-  chart.viewStart  = Math.max(0, Math.min(chart.allCandles.length - chart.viewCount, chart.viewStart));
+  chart.viewStart  = Math.max(0, Math.min(chart.allCandles.length - Math.ceil(chart.viewCount), chart.viewStart));
 
-  const visible = candles.slice(chart.viewStart, chart.viewStart + chart.viewCount);
+  const vsInt  = Math.floor(chart.viewStart);
+  const vcInt  = Math.ceil(chart.viewCount);
+  const visible = candles.slice(vsInt, vsInt + vcInt);
   if (!visible.length) return;
 
   const pad = { t: 20, r: 72, b: 28, l: 8 };
@@ -2968,15 +2971,22 @@ function _redrawChartImmediate() {
   const rawRng = maxP - minP || 1;
 
   // Force minimum visual range = 0.25% of price
-  // Without this, a $8 swing on a $92k equity looks like a vertical spike
   const minVisualRng = maxP * 0.0025;
   const rng    = Math.max(rawRng, minVisualRng);
   const midP   = (minP + maxP) / 2;
-  const yMin   = Math.min(minP - rng * 0.15, midP - rng * 0.6);
-  const yMax   = Math.max(maxP + rng * 0.15, midP + rng * 0.6);
-  const yRng   = yMax - yMin;
 
-  const xOf  = i  => pad.l + (i / Math.max(visible.length - 1, 1)) * cw;
+  // Apply Y-axis scale (from drag on price axis or ctrl+scroll)
+  // yScale > 1 = zoomed in (tighter range), < 1 = zoomed out (wider range)
+  const yScl   = chart.yScale || 1.0;
+  const yOff   = chart.yOffset || 0;
+  const halfRng = (rng * 0.75) / yScl;   // half of visible range
+  const yMin   = midP - halfRng + yOff;
+  const yMax   = midP + halfRng + yOff;
+  const yRng   = yMax - yMin || 1;
+
+  // Sub-candle pan offset: fractional part of viewStart shifts candles left/right
+  const fracOffset = chart.viewStart - Math.floor(chart.viewStart);
+  const xOf  = i  => pad.l + ((i - fracOffset) / Math.max(vcInt - 1, 1)) * cw;
   const yOf  = p  => pad.t + ch - ((p - yMin) / yRng) * ch;
 
   // ── Grid ──────────────────────────────────────────────────────
@@ -3159,99 +3169,277 @@ function _redrawChartImmediate() {
   }
 }
 
-// ── Mouse / touch interaction ──────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+// CHART INTERACTION — TradingView-quality 60fps engine
+// ══════════════════════════════════════════════════════════════════
+//
+// Features:
+//  • Wheel zoom: anchors to cursor position (TV behaviour)
+//  • Ctrl+wheel or vertical drag on Y-axis: Y-axis scale zoom
+//  • Left drag: pan X axis with momentum/inertia
+//  • Pinch-to-zoom (touch): X zoom anchored to pinch midpoint
+//  • Double-click: reset to default view
+//  • All rendering queued through rAF — guaranteed 60fps, no jank
+//  • Fractional viewStart for sub-candle pan precision
+//
+// State lives on the `chart` object:
+//   viewStart  — float: leftmost visible candle index (fractional for smooth pan)
+//   viewCount  — float: number of visible candles (fractional for smooth zoom)
+//   yScale     — float: manual Y scale multiplier (1 = auto, >1 = zoomed in)
+//   yOffset    — float: manual Y pan offset in price units
+// ══════════════════════════════════════════════════════════════════
+
 function initChartInteraction() {
   const wrap = $('chartWrap');
   if (!wrap || wrap._chartInited) return;
   wrap._chartInited = true;
 
-  // Scroll wheel = zoom
+  // ── Extra chart state for Y-axis control ──────────────────────
+  if (chart.yScale  === undefined) chart.yScale  = 1.0;
+  if (chart.yOffset === undefined) chart.yOffset = 0;
+
+  // ── RAF-batched render ─────────────────────────────────────────
+  // All interaction handlers write to chart state then call this.
+  // requestAnimationFrame dedupes multiple events in same frame.
+  let _rafPending = false;
+  function scheduleRedraw() {
+    if (_rafPending) return;
+    _rafPending = true;
+    requestAnimationFrame(() => {
+      _rafPending = false;
+      _redrawChartImmediate();
+    });
+  }
+
+  // ── Clamp helpers ─────────────────────────────────────────────
+  function clampView() {
+    const total = chart.allCandles?.length || 1;
+    chart.viewCount = Math.max(5, Math.min(total, chart.viewCount));
+    chart.viewStart = Math.max(0, Math.min(total - chart.viewCount, chart.viewStart));
+  }
+
+  // ── WHEEL — X zoom (default) or Y zoom (ctrl/meta held) ───────
+  // Zoom anchors to cursor: candle under mouse stays in place.
+  // This is the key TV behaviour — deltaY < 0 = scroll up = zoom in.
   wrap.addEventListener('wheel', e => {
     e.preventDefault();
-    const zoomFactor = e.deltaY > 0 ? 1.15 : 0.87; // scroll down = zoom out
-    const newCount   = Math.round(chart.viewCount * zoomFactor);
-    const clamped    = Math.max(5, Math.min(chart.allCandles.length, newCount));
-    // Zoom toward mouse position
-    const rect    = wrap.getBoundingClientRect();
-    const mouseRatio = (e.clientX - rect.left) / rect.width;
-    const delta   = clamped - chart.viewCount;
-    chart.viewStart = Math.max(0, Math.min(
-      chart.allCandles.length - clamped,
-      chart.viewStart - Math.round(delta * mouseRatio)
-    ));
-    chart.viewCount = clamped;
-    redrawChart();
+    if (!chart.allCandles?.length) return;
+
+    const rect = wrap.getBoundingClientRect();
+
+    if (e.ctrlKey || e.metaKey) {
+      // ── Y-axis zoom (ctrl+scroll) ──────────────────────────────
+      // Zoom the price range around the price at cursor Y position
+      const yFactor = e.deltaY < 0 ? 0.85 : 1.18; // ctrl+up = zoom in price axis
+      chart.yScale = Math.max(0.2, Math.min(20, chart.yScale * yFactor));
+    } else {
+      // ── X-axis zoom (normal scroll) ───────────────────────────
+      // deltaY < 0 = wheel up = zoom IN (fewer candles)
+      // deltaY > 0 = wheel down = zoom OUT (more candles)
+      const zoomFactor = e.deltaY < 0 ? 0.85 : 1.18;
+      const prevCount  = chart.viewCount;
+      const newCount   = prevCount * zoomFactor;
+      const clamped    = Math.max(5, Math.min(chart.allCandles.length, newCount));
+
+      // Anchor zoom to mouse X — candle under cursor stays fixed
+      const mouseRatio  = (e.clientX - rect.left) / rect.width;
+      // Index of candle under cursor before zoom
+      const anchorIndex = chart.viewStart + mouseRatio * prevCount;
+      chart.viewCount   = clamped;
+      // Recompute viewStart so anchorIndex stays at same screen position
+      chart.viewStart   = anchorIndex - mouseRatio * clamped;
+    }
+
+    clampView();
+    scheduleRedraw();
   }, { passive: false });
 
-  // Mouse drag = pan
+  // ── MOUSEDOWN — start pan or Y-axis drag ──────────────────────
+  let _dragMode       = null; // 'pan' | 'yaxis'
+  let _dragStartX     = 0;
+  let _dragStartY     = 0;
+  let _dragStartView  = 0;
+  let _dragStartYOff  = 0;
+  let _dragStartYScl  = 0;
+  // Momentum
+  let _velX           = 0;
+  let _lastDragX      = 0;
+  let _lastDragTime   = 0;
+  let _momentumRAF    = null;
+
+  const YAXIS_ZONE = 72; // px from right edge = Y axis drag zone
+
   wrap.addEventListener('mousedown', e => {
     if (e.button !== 0) return;
-    chart.isDragging   = true;
-    chart.dragStartX   = e.clientX;
-    chart.dragStartView = chart.viewStart;
-    wrap.style.cursor  = 'grabbing';
-    hideTooltip();
     e.preventDefault();
+    cancelAnimationFrame(_momentumRAF);
+    _velX = 0;
+
+    const rect = wrap.getBoundingClientRect();
+    const fromRight = rect.right - e.clientX;
+
+    if (fromRight < YAXIS_ZONE) {
+      // Drag on Y-axis price labels = scale Y
+      _dragMode      = 'yaxis';
+      _dragStartY    = e.clientY;
+      _dragStartYOff = chart.yOffset;
+      _dragStartYScl = chart.yScale;
+    } else {
+      // Drag on chart body = pan X
+      _dragMode      = 'pan';
+      _dragStartX    = e.clientX;
+      _dragStartView = chart.viewStart;
+      _lastDragX     = e.clientX;
+      _lastDragTime  = performance.now();
+      chart.isDragging = true;
+      wrap.style.cursor = 'grabbing';
+      hideTooltip();
+    }
   });
+
   window.addEventListener('mousemove', e => {
-    if (!chart.isDragging || !chart.allCandles.length) return;
-    const rect     = wrap.getBoundingClientRect();
-    const dx       = e.clientX - chart.dragStartX;
-    const pxPerCandle = rect.width / chart.viewCount;
-    const shift    = Math.round(-dx / pxPerCandle);
-    chart.viewStart = Math.max(0, Math.min(
-      chart.allCandles.length - chart.viewCount,
-      chart.dragStartView + shift
-    ));
-    redrawChart();
-  });
-  window.addEventListener('mouseup', () => {
-    if (!chart.isDragging) return;
-    chart.isDragging  = false;
-    const wrap = $('chartWrap');
-    if (wrap) wrap.style.cursor = 'crosshair';
+    if (!_dragMode || !chart.allCandles?.length) return;
+
+    const rect = wrap.getBoundingClientRect();
+
+    if (_dragMode === 'pan') {
+      const dx           = e.clientX - _dragStartX;
+      const pxPerCandle  = rect.width / chart.viewCount;
+      chart.viewStart    = _dragStartView - dx / pxPerCandle;
+
+      // Track velocity for momentum
+      const now = performance.now();
+      const dt  = now - _lastDragTime;
+      if (dt > 0) _velX = (e.clientX - _lastDragX) / dt; // px/ms
+      _lastDragX   = e.clientX;
+      _lastDragTime = now;
+
+    } else if (_dragMode === 'yaxis') {
+      // Drag up = zoom in Y (smaller range), drag down = zoom out
+      const dy = _dragStartY - e.clientY;
+      chart.yScale  = Math.max(0.2, Math.min(20, _dragStartYScl * Math.pow(1.004, dy)));
+    }
+
+    clampView();
+    scheduleRedraw();
   });
 
-  // Touch support
-  let lastTouchX = 0;
-  let lastTouchDist = 0;
-  wrap.addEventListener('touchstart', e => {
-    if (e.touches.length === 1) {
-      lastTouchX = e.touches[0].clientX;
-      chart.dragStartView = chart.viewStart;
-    } else if (e.touches.length === 2) {
-      lastTouchDist = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY
-      );
-    }
-    e.preventDefault();
-  }, { passive: false });
-  wrap.addEventListener('touchmove', e => {
-    if (e.touches.length === 1) {
-      const dx = e.touches[0].clientX - lastTouchX;
-      const rect = wrap.getBoundingClientRect();
+  window.addEventListener('mouseup', e => {
+    if (!_dragMode) return;
+
+    if (_dragMode === 'pan' && Math.abs(_velX) > 0.1) {
+      // ── Momentum / inertia ────────────────────────────────────
+      // Decelerates at TV-like rate (~20% per frame)
+      let vel = _velX;
+      const rect = ($('chartWrap') || wrap).getBoundingClientRect();
       const pxPerCandle = rect.width / chart.viewCount;
-      chart.viewStart = Math.max(0, Math.min(
-        chart.allCandles.length - chart.viewCount,
-        chart.dragStartView - Math.round(dx / pxPerCandle)
-      ));
-      redrawChart();
-    } else if (e.touches.length === 2) {
-      const dist = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY
-      );
-      const factor = lastTouchDist / dist;
-      chart.viewCount = Math.max(5, Math.min(chart.allCandles.length, Math.round(chart.viewCount * factor)));
-      lastTouchDist = dist;
-      redrawChart();
+
+      function momentum() {
+        vel *= 0.88; // friction
+        if (Math.abs(vel) < 0.02 || !chart.allCandles?.length) {
+          _momentumRAF = null; return;
+        }
+        chart.viewStart -= vel * 16 / pxPerCandle; // ~16ms/frame
+        clampView();
+        scheduleRedraw();
+        _momentumRAF = requestAnimationFrame(momentum);
+      }
+      _momentumRAF = requestAnimationFrame(momentum);
     }
+
+    _dragMode = null;
+    chart.isDragging = false;
+    const w = $('chartWrap');
+    if (w) w.style.cursor = 'crosshair';
+  });
+
+  // ── DOUBLE-CLICK — reset view to default ─────────────────────
+  wrap.addEventListener('dblclick', () => {
+    chart.viewCount = Math.min(100, chart.allCandles?.length || 100);
+    chart.viewStart = Math.max(0, (chart.allCandles?.length || 0) - chart.viewCount);
+    chart.yScale    = 1.0;
+    chart.yOffset   = 0;
+    scheduleRedraw();
+  });
+
+  // ── TOUCH — pinch zoom + single-finger pan ────────────────────
+  let _touch1 = null, _touch2 = null;
+  let _touchStartView = 0, _touchStartCount = 0;
+  let _touchStartDist = 0, _touchMidRatio = 0.5;
+  let _touchLastX = 0;
+
+  wrap.addEventListener('touchstart', e => {
     e.preventDefault();
+    cancelAnimationFrame(_momentumRAF); _velX = 0;
+    if (e.touches.length === 1) {
+      _touch1 = e.touches[0];
+      _touchStartView  = chart.viewStart;
+      _touchLastX      = _touch1.clientX;
+      _lastDragX       = _touch1.clientX;
+      _lastDragTime    = performance.now();
+    } else if (e.touches.length === 2) {
+      _touch1 = e.touches[0]; _touch2 = e.touches[1];
+      _touchStartView  = chart.viewStart;
+      _touchStartCount = chart.viewCount;
+      _touchStartDist  = Math.hypot(
+        _touch2.clientX - _touch1.clientX,
+        _touch2.clientY - _touch1.clientY
+      );
+      const rect = wrap.getBoundingClientRect();
+      _touchMidRatio = ((_touch1.clientX + _touch2.clientX) / 2 - rect.left) / rect.width;
+    }
   }, { passive: false });
 
-  wrap.style.cursor = 'crosshair';
+  wrap.addEventListener('touchmove', e => {
+    e.preventDefault();
+    if (!chart.allCandles?.length) return;
+    const rect = wrap.getBoundingClientRect();
+
+    if (e.touches.length === 1) {
+      const t  = e.touches[0];
+      const dx = t.clientX - _touchLastX;
+      const pxPerCandle = rect.width / chart.viewCount;
+      chart.viewStart = _touchStartView - (t.clientX - _touch1.clientX) / pxPerCandle;
+
+      const now = performance.now(), dt = now - _lastDragTime;
+      if (dt > 0) _velX = (t.clientX - _lastDragX) / dt;
+      _lastDragX = t.clientX; _lastDragTime = now;
+
+    } else if (e.touches.length === 2) {
+      const t1 = e.touches[0], t2 = e.touches[1];
+      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+      const scaleFactor  = _touchStartDist / dist; // pinch in = fewer candles
+      const newCount     = Math.max(5, Math.min(chart.allCandles.length, _touchStartCount * scaleFactor));
+      // Anchor to pinch midpoint
+      const anchorIndex  = _touchStartView + _touchMidRatio * _touchStartCount;
+      chart.viewCount    = newCount;
+      chart.viewStart    = anchorIndex - _touchMidRatio * newCount;
+    }
+
+    clampView();
+    scheduleRedraw();
+  }, { passive: false });
+
+  wrap.addEventListener('touchend', e => {
+    if (e.touches.length === 0 && Math.abs(_velX) > 0.1) {
+      let vel = _velX;
+      const rect = ($('chartWrap') || wrap).getBoundingClientRect();
+      function momentum() {
+        vel *= 0.88;
+        if (Math.abs(vel) < 0.02 || !chart.allCandles?.length) return;
+        const pxPerCandle = rect.width / chart.viewCount;
+        chart.viewStart -= vel * 16 / pxPerCandle;
+        clampView(); scheduleRedraw();
+        _momentumRAF = requestAnimationFrame(momentum);
+      }
+      _momentumRAF = requestAnimationFrame(momentum);
+    }
+    _touch1 = _touch2 = null;
+  }, { passive: false });
+
+  wrap.style.cursor     = 'crosshair';
   wrap.style.userSelect = 'none';
+  wrap.style.touchAction = 'none';
 }
 
 // ── Compatibility wrapper so old code calling drawCandlestickChart still works ──
