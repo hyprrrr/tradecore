@@ -54,7 +54,7 @@ const CONFIG = {
 
   symbols: (process.env.SYMBOLS || 'NVDA,AAPL,MSFT,TSLA,META,AMZN,GOOGL,AMD,SPY,QQQ,MSTR,COIN,PLTR,SOFI,HOOD').split(',').map(s => s.trim().toUpperCase()),
 
-  strategy:      process.env.STRATEGY      || 'pmrb', // default: pre-market range breakout
+  strategy:      process.env.STRATEGY      || 'auto', // auto = switches strategy based on regime/time
   // marketSentiment: 'auto' | 'bullish' | 'bearish' | 'neutral'
   // auto  = derived from SPY regime each scan
   // bullish  = only take long signals (market is trending up)
@@ -2733,10 +2733,11 @@ async function fetchBars(symbol, timeframe, limit) {
   } catch (e) {}
 
   // Fallback: Yahoo Finance (free, no key)
+  // Uses 7d range to guarantee 30+ 5-min bars even during pre-market
   try {
     const fetch = await getFetch();
     const interval = timeframe === '5Min' ? '5m' : timeframe === '15Min' ? '15m' : '1d';
-    const range    = timeframe === '1Day' ? '3mo' : '5d';
+    const range    = timeframe === '1Day' ? '3mo' : '7d';
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${interval}&range=${range}`;
     const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     const data = await res.json();
@@ -2749,13 +2750,21 @@ async function fetchBars(symbol, timeframe, limit) {
       o: q.open?.[i], h: q.high?.[i], l: q.low?.[i],
       c: q.close?.[i], v: q.volume?.[i] || 0,
     })).filter(b => b.c != null);
-    if (bars.length >= 5) {
+    if (bars.length >= 10) {
       log('data', `${symbol} using Yahoo Finance fallback (${bars.length} bars)`);
       return bars;
     }
   } catch (e) {}
 
-  log('error', `fetchBars ${symbol} ${timeframe}: all sources failed`);
+  log('warn', `No data for ${symbol}`);
+  // Auto-bench after repeated failures to stop wasting scan slots
+  if (!fetchBars._failCount) fetchBars._failCount = {};
+  fetchBars._failCount[symbol] = (fetchBars._failCount[symbol] || 0) + 1;
+  if (fetchBars._failCount[symbol] >= 5) {
+    log('sys', `🚫 Auto-benching ${symbol} — no data after 5 attempts`);
+    if (typeof benchSym === 'function') benchSym(symbol, 'no_data');
+    fetchBars._failCount[symbol] = 0;
+  }
   return null;
 }
 
@@ -4940,7 +4949,8 @@ function signalBBDivergence(sym, bars5m, bars15m) {
 }
 
 function generateSignalByStrategy(sym, bars5m, bars15m) {
-  const strategy = CONFIG.strategy || 'rsi_macd';
+  // _activeStrategy is set by auto-switcher each scan; falls back to CONFIG.strategy
+  const strategy = CONFIG._activeStrategy || CONFIG.strategy || 'rsi_macd';
 
   switch(strategy) {
     case 'smc':            return signalSMC(sym, bars5m, bars15m);
@@ -5554,6 +5564,122 @@ function resolveMarketSentiment(regimeState) {
     case 'blowoff':return 'bearish'; // parabolic = expect reversal, fade longs
     default:       return 'neutral';
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// AUTO-STRATEGY SELECTOR
+// ═══════════════════════════════════════════════════════════════════
+// Picks the best strategy based on current market regime, time of day,
+// and session. Runs every scan cycle when CONFIG.strategy === 'auto'.
+//
+// Decision matrix:
+//
+// BLOWOFF (VIX spike, ATR > 0.6%/bar):
+//   → rsi_macd: fastest to react, no structural bias needed
+//
+// BULL + 8:00–10:30 AM ET window:
+//   → pmrb: pre-market range break has highest edge in early trending bull
+//
+// BULL + market open (9:30 AM+), 4H range formed:
+//   → 4hrs: 4H range fade — institutions defending levels in trend
+//
+// BULL + outside PMRB/4HRS window:
+//   → trend_pullback: ride the trend on pullbacks
+//
+// BEAR:
+//   → smc: smart money concepts catches distribution/breakdown patterns
+//
+// CHOP:
+//   → vwap_reversion: mean reversion to VWAP works best in ranging markets
+//   → bb_divergence: second choice for chop (Bollinger Band fades)
+//
+// Override: if CONFIG.strategy !== 'auto', this function is skipped.
+// ═══════════════════════════════════════════════════════════════════
+
+let _autoStrategyLast = { strategy: null, reason: '', changedAt: 0 };
+
+async function resolveAutoStrategy(regime) {
+  if (!regime) return CONFIG.strategy || 'rsi_macd';
+
+  const etNow  = getETTime();
+  const etMins = etNow.getHours() * 60 + etNow.getMinutes();
+  const { state, spyTrendScore, volScore, uvxySpike } = regime;
+
+  let chosen = 'rsi_macd';
+  let reason = '';
+
+  // ── BLOWOFF: high volatility, news-driven panic ───────────────────
+  if (state === 'blowoff' || uvxySpike) {
+    chosen = 'rsi_macd';
+    reason = `Blowoff/UVXY spike — RSI+MACD fastest to react`;
+
+  // ── BULL market ────────────────────────────────────────────────────
+  } else if (state === 'bull' || spyTrendScore >= 1) {
+
+    // 8:00–10:30 AM ET = PMRB prime window
+    if (etMins >= 8*60 && etMins <= 10*60+30) {
+      chosen = 'pmrb';
+      reason = `Bull + ${Math.floor(etMins/60)}:${String(etMins%60).padStart(2,'0')} ET = PMRB prime window`;
+
+    // 10:30 AM–2 PM ET = 4H range formed, fade breakouts  
+    } else if (etMins > 10*60+30 && etMins <= 14*60) {
+      chosen = '4hrs';
+      reason = `Bull + midday = 4H range fade (institutions defending levels)`;
+
+    // 2–4 PM ET or pre-market = trend pullback
+    } else {
+      chosen = 'trend_pullback';
+      reason = `Bull outside prime windows = ride trend on pullbacks`;
+    }
+
+  // ── BEAR market ────────────────────────────────────────────────────
+  } else if (state === 'bear' || spyTrendScore <= -2) {
+    // During prime hours, SMC catches distribution/breakdown best
+    if (etMins >= 9*60 && etMins <= 15*60) {
+      chosen = 'smc';
+      reason = `Bear regime — SMC catches distribution/breakdown patterns`;
+    } else {
+      chosen = 'rsi_macd';
+      reason = `Bear + off-hours — RSI+MACD with short bias`;
+    }
+
+  // ── CHOP: mean reversion ───────────────────────────────────────────
+  } else {
+    // VWAP reversion is the cleanest chop strategy
+    if (etMins >= 9*60 && etMins <= 15*60) {
+      chosen = 'vwap_reversion';
+      reason = `Chop regime — VWAP reversion works best in ranging market`;
+    } else {
+      chosen = 'bb_divergence';
+      reason = `Chop + off-hours — BB divergence for slow mean reversion`;
+    }
+  }
+
+  // Only log when strategy actually changes
+  if (chosen !== _autoStrategyLast.strategy) {
+    const prev = _autoStrategyLast.strategy;
+    _autoStrategyLast = { strategy: chosen, reason, changedAt: Date.now() };
+    log('sys', `🔀 Auto-strategy: ${prev || 'none'} → ${chosen.toUpperCase()} | ${reason}`);
+
+    // Notify Discord on strategy switch
+    if (CONFIG.discordWebhook && prev) {
+      const fetch = await getFetch();
+      fetch(CONFIG.discordWebhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          embeds: [{
+            title: `🔀 Strategy Auto-Switched`,
+            description: `**${(prev||'').toUpperCase()}** → **${chosen.toUpperCase()}**`,
+            fields: [{ name: 'Reason', value: reason }],
+            color: 0x00e5c7,
+          }]
+        }),
+      }).catch(() => {});
+    }
+  }
+
+  return chosen;
 }
 
 // Returns true if signal direction is allowed under current sentiment bias
@@ -8918,6 +9044,15 @@ setInterval(async () => {
     const prevStrategy  = CONFIG.strategy;
     const prevSentiment = CONFIG.marketSentiment;
     await loadRemoteConfig();
+    // Auto-strategy: resolve best strategy from regime if set to 'auto'
+    if (CONFIG.strategy === 'auto' || !CONFIG.strategy) {
+      const regime = await classifyRegime().catch(() => null);
+      const autoStrat = await resolveAutoStrategy(regime);
+      CONFIG._activeStrategy = autoStrat; // use _activeStrategy for signal dispatch
+    } else {
+      CONFIG._activeStrategy = CONFIG.strategy;
+    }
+
     // Only log if something actually changed
     const strategyChanged  = CONFIG.strategy !== prevStrategy;
     const sentimentChanged = CONFIG.marketSentiment !== prevSentiment;
