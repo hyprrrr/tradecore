@@ -559,14 +559,20 @@
   }
 
   /* Analytics */
-  .analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
   .analytics-card {
-    background: rgba(255,255,255,0.04); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px; display: flex; flex-direction: column; gap: 6px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    padding: 18px 16px 14px;
+    backdrop-filter: blur(20px);
+    display: flex; flex-direction: column; gap: 5px;
+    transition: border-color .15s, background .15s;
   }
-  .analytics-card-label { font-size: 9.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
-  .analytics-card-value { font-family: var(--font-mono); font-size: 22px; font-weight: 700; }
-  .analytics-card-sub { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+  .analytics-card:hover { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.13); }
+  .analytics-card-label { font-size: 9px; color: rgba(255,255,255,0.28); text-transform: uppercase; letter-spacing: .9px; font-weight: 600; }
+  .analytics-card-value { font-family: var(--font-mono); font-size: 24px; font-weight: 700; letter-spacing: -0.03em; line-height: 1.1; }
+  .analytics-card-sub { font-size: 10.5px; color: rgba(255,255,255,0.3); font-family: var(--font-mono); }
 
   .analytics-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
   .analytics-section {
@@ -3519,17 +3525,29 @@ document.querySelectorAll('.tf-btn').forEach(btn => {
 
 // ═══════════════════════════════════════ ANALYTICS ═══════════════════════════════════════
 async function refreshAnalytics() {
-  // Fetch all trades (not just 24h)
-  const tbl = state.mode === 'sim' ? 'sim_tc_trades' : 'tc_trades';
-  // Fetch up to 5000 trades — 500 was losing ~80% of history on active bots
-  const data = await sbFetch(`${tbl}?select=*&order=created_at.desc&limit=1000`, 'GET');
-  if (!data || !Array.isArray(data)) return;
-  const trades = data;
+  // ALWAYS use live trades for analytics — sim trades are practice, not real performance
+  // Never mix sim + live: live trades are in tc_trades, sim in sim_tc_trades
+  // Analytics tab should always reflect real account performance
+  const isLive = state.mode !== 'sim';
+  const liveTbl = 'tc_trades';
+  const simTbl  = 'sim_tc_trades';
 
-  const startCap = state.settings.starting_capital || 100000;
+  // Fetch live trades (always) + optionally sim trades if in sim mode
+  const [liveData, simData] = await Promise.all([
+    sbFetch(`${liveTbl}?select=*&order=created_at.desc&limit=1000`, 'GET'),
+    isLive ? Promise.resolve([]) : sbFetch(`${simTbl}?select=*&order=created_at.desc&limit=1000`, 'GET'),
+  ]);
+
+  // Analytics always shows LIVE trades — sim has its own context
+  const trades = Array.isArray(liveData) ? liveData : [];
+  const simTrades = Array.isArray(simData) ? simData : [];
+
+  const startCap = state.settings.starting_capital
+    || state.portfolio?.starting_capital
+    || 100000;
   const eq = state.portfolio?.total_value || startCap;
 
-  // Core metrics
+  // Core metrics — LIVE only
   const closed = trades.filter(t => t.pnl != null);
   const wins   = closed.filter(t => (t.pnl||0) > 0);
   const losses = closed.filter(t => (t.pnl||0) < 0);
@@ -3549,22 +3567,33 @@ async function refreshAnalytics() {
   const scalps = closed.filter(t => (t.reason||'').toUpperCase().startsWith('SCALP') || (t.side||'').toUpperCase().includes('SCALP'));
   const swings = closed.filter(t => !((t.reason||'').toUpperCase().startsWith('SCALP') || (t.side||'').toUpperCase().includes('SCALP')));
 
-  // Compute day P&L by summing today's closed trades in local time
-  // portfolio.day_pnl is unreliable — it's not always updated correctly by Alpaca paper
+  // Day P&L — priority order:
+  // 1. Alpaca portfolio.day_pnl (most accurate — comes directly from broker)
+  // 2. Sum of today's LIVE closed trades (fallback)
+  // NEVER use sim trades for day P&L display
+  const alpacaDayPnl = state.portfolio?.day_pnl;
   const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York' });
   const dayTrades = closed.filter(t => {
     if (!t.created_at) return false;
     return new Date(t.created_at).toLocaleDateString('en-US', { timeZone: 'America/New_York' }) === todayStr;
   });
-  const dayPnl = dayTrades.reduce((s, t) => s + (t.pnl || 0), 0);
+  const tradeSumDayPnl = dayTrades.reduce((s, t) => s + (t.pnl || 0), 0);
+  // Use Alpaca's figure if it's non-zero and reasonable, else fall back to trade sum
+  const dayPnl = (alpacaDayPnl !== undefined && alpacaDayPnl !== null && Math.abs(alpacaDayPnl) > 0.01)
+    ? +alpacaDayPnl
+    : tradeSumDayPnl;
   const dayWins = dayTrades.filter(t => (t.pnl||0) > 0).length;
   const dayLoss = dayTrades.filter(t => (t.pnl||0) < 0).length;
 
   // Update cards
-  $('aTotalPnL').textContent = (totalPnL >= 0 ? '+$' : '-$') + Math.abs(totalPnL).toLocaleString([],{minimumFractionDigits:2,maximumFractionDigits:2});
-  $('aTotalPnL').style.color = totalPnL >= 0 ? 'var(--buy)' : 'var(--sell)';
-  const pctBase = startCap > 0 ? startCap : (eq - totalPnL) || 1;
-  $('aTotalPct').textContent = (totalPnL >= 0 ? '+' : '') + (pctBase > 0 ? (totalPnL/pctBase*100).toFixed(2) : '0.00') + '% all-time';
+  // Total P&L: use (current equity - starting capital) as the authoritative figure
+  // This matches what Alpaca shows and accounts for fees/slippage not in trade records
+  const alpacaTotalPnL = (eq && startCap && eq !== startCap) ? (eq - startCap) : totalPnL;
+  const displayTotalPnL = alpacaTotalPnL;
+  $('aTotalPnL').textContent = (displayTotalPnL >= 0 ? '+$' : '-$') + Math.abs(displayTotalPnL).toLocaleString([],{minimumFractionDigits:2,maximumFractionDigits:2});
+  $('aTotalPnL').style.color = displayTotalPnL >= 0 ? 'var(--buy)' : 'var(--sell)';
+  const pctBase = startCap > 0 ? startCap : eq || 1;
+  $('aTotalPct').textContent = (displayTotalPnL >= 0 ? '+' : '') + (pctBase > 0 ? (displayTotalPnL/pctBase*100).toFixed(2) : '0.00') + '% all-time';
   // Show active auto-strategy if in auto mode
   const stratDisplay = $('activeStratDisplay');
   if (stratDisplay && state.settings?.strategy === 'auto') {
@@ -3584,8 +3613,11 @@ async function refreshAnalytics() {
   $('aDayPct').textContent = dayTrades.length > 0
     ? `${dayTrades.length} trades today (${dayWins}W/${dayLoss}L)`
     : (dayPnl >= 0 ? '+' : '') + (startCap > 0 ? (dayPnl/startCap*100).toFixed(2) : '0.00') + '% today';
+  // Total trades = live only. Show sim count separately so it's clear.
   $('aTotalTrades').textContent = closed.length;
-  $('aScalpTrades').textContent = scalps.length + ' scalp / ' + swings.length + ' swing';
+  const simClosed = simTrades.filter(t => t.pnl != null);
+  $('aScalpTrades').textContent = scalps.length + ' scalp / ' + swings.length + ' swing'
+    + (simClosed.length > 0 ? ` (+${simClosed.length} sim)` : '');
   $('aLargestWin').textContent  = largestWin  ? '+$' + largestWin.pnl.toFixed(2)   : '--';
   $('aLargestWinSym').textContent  = largestWin  ? (largestWin.symbol  || '--') : '--';
   $('aLargestLoss').textContent = largestLoss ? '-$' + Math.abs(largestLoss.pnl).toFixed(2) : '--';
