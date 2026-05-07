@@ -533,6 +533,189 @@
   .log-msg .pos { color: var(--buy); font-weight: 700; }
   .log-msg .neg { color: var(--sell); font-weight: 700; }
   .log-msg .sym { color: var(--accent); font-weight: 700; }
+
+  /* ═══════════════════════════════════════════════════════════
+     MOBILE RESPONSIVE — screens < 768px (phones)
+     Strategy: single column, bottom tab bar, swipeable panels
+  ═══════════════════════════════════════════════════════════ */
+  @media (max-width: 768px) {
+
+    /* ── Root tweaks ── */
+    html, body { font-size: 13px; }
+
+    /* ── App shell: header + tab bar + content ── */
+    .app {
+      grid-template-rows: 48px 1fr 56px;
+      height: 100dvh; /* dynamic viewport height — handles mobile browser chrome */
+    }
+
+    /* ── Header: shrink to logo + clock + mode pill only ── */
+    .header { padding: 0 12px; }
+    .brand-sub { display: none; }
+    .brand { font-size: 15px; gap: 7px; }
+    .brand-icon { width: 26px; height: 26px; font-size: 13px; }
+
+    /* Hide desktop nav tabs — replaced by bottom tab bar */
+    .nav-tabs { display: none; }
+
+    /* Collapse header-right to just mode + clock */
+    .header-right { gap: 6px; }
+    .header-pill { padding: 4px 8px; font-size: 10px; }
+    /* Hide config/exit sim buttons in header on mobile */
+    .header-right .btn:not(#modeIndicator):not(#exitSimBtn) { display: none; }
+
+    /* ── Mobile bottom tab bar ── */
+    .mobile-tab-bar {
+      display: flex !important;
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      height: 56px;
+      background: var(--bg-1);
+      border-top: 1px solid var(--border);
+      z-index: 200;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .mobile-tab-btn {
+      flex: 1;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 3px;
+      color: var(--text-dim);
+      font-size: 9.5px; font-weight: 500;
+      cursor: pointer;
+      transition: color .15s;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .mobile-tab-btn.active { color: var(--accent); }
+    .mobile-tab-btn svg { width: 20px; height: 20px; }
+    .mobile-tab-btn .mtab-dot {
+      width: 4px; height: 4px; border-radius: 50%;
+      background: var(--accent); margin-top: -2px;
+      box-shadow: 0 0 5px var(--accent);
+    }
+
+    /* ── Main: single column, full height, scrollable ── */
+    .main {
+      display: flex !important;
+      flex-direction: column;
+      gap: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      background: var(--bg-0);
+      padding-bottom: 56px; /* room for tab bar */
+    }
+
+    /* Hide left/right sidebars by default on mobile — shown via tab */
+    .leftbar { display: none; }
+    .rightbar { display: none; }
+
+    /* Chart area takes full width */
+    .chart-area {
+      grid-column: unset !important;
+      grid-row: unset !important;
+      width: 100%;
+      min-height: 280px;
+    }
+
+    /* Bottom section (positions + trades) stacks vertically */
+    .bottom-section {
+      grid-column: unset !important;
+      display: flex !important;
+      flex-direction: column;
+      width: 100%;
+    }
+    .positions-panel, .trades-panel { min-height: 220px; }
+
+    /* ── Mobile view switching ── */
+    .main.mobile-view-chart   .chart-area    { display: flex !important; }
+    .main.mobile-view-chart   .bottom-section { display: none !important; }
+    .main.mobile-view-trades  .chart-area    { display: none !important; }
+    .main.mobile-view-trades  .bottom-section { display: flex !important; }
+    .main.mobile-view-left    .leftbar       { display: flex !important; width: 100%; }
+    .main.mobile-view-left    .chart-area    { display: none !important; }
+    .main.mobile-view-left    .bottom-section { display: none !important; }
+    .main.mobile-view-right   .rightbar      { display: flex !important; width: 100%; flex-direction: column; }
+    .main.mobile-view-right   .chart-area    { display: none !important; }
+    .main.mobile-view-right   .bottom-section { display: none !important; }
+
+    /* ── Equity header bar: wrap onto 2 lines ── */
+    .equity-bar {
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      padding: 8px 12px;
+      font-size: 11px;
+    }
+    .equity-bar > * { white-space: nowrap; }
+    .tf-group { gap: 3px; }
+    .tf-btn { padding: 4px 8px; font-size: 10px; }
+    .indicator-toggles { gap: 6px; font-size: 10px; }
+
+    /* ── Chart itself ── */
+    .chart-wrap { min-height: 250px; }
+
+    /* ── Stats cards in right panel: 2-col grid ── */
+    .perf-grid { grid-template-columns: 1fr 1fr !important; gap: 10px; }
+
+    /* ── Bot controls: full width buttons ── */
+    .controls-grid { grid-template-columns: 1fr 1fr !important; }
+
+    /* ── Analytics overlay: single column ── */
+    .analytics-grid { grid-template-columns: 1fr 1fr !important; }
+    .analytics-row  { grid-template-columns: 1fr !important; }
+    .session-perf-grid { grid-template-columns: 1fr !important; }
+
+    /* ── Settings overlay: single column ── */
+    .settings-grid { grid-template-columns: 1fr !important; }
+
+    /* ── Tables: make scrollable, pin key columns ── */
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table { min-width: 480px; font-size: 11.5px; }
+    th, td { padding: 7px 8px !important; }
+
+    /* ── Overlay panels: full screen on mobile ── */
+    .overlay-panel {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100% !important;
+      max-width: 100% !important;
+      border-radius: 0 !important;
+      z-index: 300;
+    }
+
+    /* ── Log entries: smaller text ── */
+    .log-entry { font-size: 10.5px; padding: 4px 10px; }
+    .log-time  { min-width: 52px; font-size: 9.5px; }
+
+    /* ── Positions list ── */
+    .pos-row { padding: 8px 12px; font-size: 11.5px; }
+    .pos-sym { font-size: 14px; }
+
+    /* ── Touch targets: minimum 44px ── */
+    .btn, .nav-tab, .mobile-tab-btn, .tf-btn { min-height: 36px; }
+
+    /* ── Watchlist: bigger touch targets ── */
+    .watch-item { padding: 8px 12px; min-height: 44px; }
+  }
+
+  /* Tablet: 768–1024px — 2 column layout */
+  @media (min-width: 769px) and (max-width: 1024px) {
+    .main {
+      grid-template-columns: 220px 1fr !important;
+      grid-template-rows: 1fr 220px !important;
+    }
+    .rightbar {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+    }
+    .chart-area { grid-column: 2; }
+    .bottom-section { grid-column: 2; }
+  }
+
+  /* Hide mobile tab bar on desktop */
+  @media (min-width: 769px) {
+    .mobile-tab-bar { display: none !important; }
+  }
 </style>
 </head>
 <body>
@@ -854,6 +1037,26 @@
     <span class="conn-time" id="connPing">--ms</span>
   </div>
 
+  <!-- ── Mobile bottom tab bar ── -->
+  <div class="mobile-tab-bar" id="mobileTabBar">
+    <div class="mobile-tab-btn active" id="mtab-chart" onclick="setMobileView('chart')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      <span>Chart</span>
+    </div>
+    <div class="mobile-tab-btn" id="mtab-trades" onclick="setMobileView('trades')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="9" x2="9" y2="21"/></svg>
+      <span>Trades</span>
+    </div>
+    <div class="mobile-tab-btn" id="mtab-left" onclick="setMobileView('left')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <span>Bot</span>
+    </div>
+    <div class="mobile-tab-btn" id="mtab-right" onclick="setMobileView('right')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+      <span>Stats</span>
+    </div>
+  </div>
+
   <!-- ═══════════════════════════════════════ ANALYTICS OVERLAY ═══════════════════════════════════════ -->
   <div class="tab-overlay" id="overlay-analytics">
     <div style="max-width:1200px;">
@@ -924,6 +1127,7 @@
               <option value="vwap_reversion">VWAP Reversion</option>
               <option value="order_flow">Order Flow</option>
               <option value="wyckoff">Wyckoff</option>
+              <option value="auto">🤖 Auto (regime-based)</option>
               <option value="4hrs">4-Hour Range Scalp</option>
               <option value="pmrb">Pre-Market Range Break (8AM)</option>
               <option value="orb">Opening Range Breakout</option>
@@ -2829,6 +3033,43 @@ function updateClock() {
     : `${local} ${tzLabel}  (${et} ET)`;
 }
 
+// ═══════════════════════════════════════ MOBILE VIEW ═══════════════════════════════════════
+let _mobileView = 'chart';
+function setMobileView(view) {
+  if (window.innerWidth > 768) return;
+  _mobileView = view;
+  const main = $('mainGrid');
+  if (!main) return;
+  // Remove all mobile-view-* classes
+  main.className = main.className.replace(/mobile-view-\S+/g, '').trim();
+  main.classList.add('mobile-view-' + view);
+  // Update tab bar active state
+  ['chart','trades','left','right'].forEach(v => {
+    const btn = $('mtab-' + v);
+    if (btn) btn.classList.toggle('active', v === view);
+  });
+  // Trigger chart redraw when switching to chart tab (canvas needs resize)
+  if (view === 'chart') setTimeout(() => { try { redrawChart(); } catch(e){} }, 50);
+}
+
+// Auto-init mobile view on load + resize
+function initMobileLayout() {
+  if (window.innerWidth <= 768) {
+    const main = $('mainGrid');
+    if (main && !main.classList.contains('mobile-view-chart') &&
+        !main.classList.contains('mobile-view-trades') &&
+        !main.classList.contains('mobile-view-left') &&
+        !main.classList.contains('mobile-view-right')) {
+      main.classList.add('mobile-view-chart');
+    }
+  } else {
+    // Desktop: remove all mobile classes
+    const main = $('mainGrid');
+    if (main) main.className = main.className.replace(/mobile-view-\S+/g, '').trim();
+  }
+}
+window.addEventListener('resize', initMobileLayout);
+
 // ═══════════════════════════════════════ TABS ═══════════════════════════════════════
 function switchTab(name) {
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
@@ -2928,6 +3169,13 @@ async function refreshAnalytics() {
   $('aTotalPnL').style.color = totalPnL >= 0 ? 'var(--buy)' : 'var(--sell)';
   const pctBase = startCap > 0 ? startCap : (eq - totalPnL) || 1;
   $('aTotalPct').textContent = (totalPnL >= 0 ? '+' : '') + (pctBase > 0 ? (totalPnL/pctBase*100).toFixed(2) : '0.00') + '% all-time';
+  // Show active auto-strategy if in auto mode
+  const stratDisplay = $('activeStratDisplay');
+  if (stratDisplay && state.settings?.strategy === 'auto') {
+    stratDisplay.textContent = state.botStatus?._activeStrategy
+      ? `Auto → ${(state.botStatus._activeStrategy||'').toUpperCase()}`
+      : 'Auto (regime-based)';
+  }
   $('aWinRate').textContent = wr.toFixed(1) + '%';
   $('aWinRate').style.color = wr >= 50 ? 'var(--buy)' : 'var(--sell)';
   $('aWinLoss').textContent = wins.length + 'W / ' + losses.length + 'L';
@@ -3319,6 +3567,7 @@ document.querySelectorAll('.logs-filter-btn').forEach(btn => {
 function init() {
   updateClock();
   setInterval(updateClock, 1000);
+  initMobileLayout(); // set initial mobile view state
 
   // Auto-connect if credentials exist
   if (CONFIG.sbUrl && CONFIG.sbKey) {
