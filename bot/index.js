@@ -2638,6 +2638,12 @@ function log(type, msg, data = null) {
 // MARKET HOURS
 // ─────────────────────────────────────────────
 function getETTime() {
+  // In sim mode, use the current bar's timestamp so time-gated strategies
+  // (PMRB 8-10:30 AM window, session detection, etc.) work correctly
+  // against the replayed bar's date/time instead of real wall-clock time.
+  if (isSimMode() && simState?.currentTime) {
+    return new Date(new Date(simState.currentTime).toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  }
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
 }
 
@@ -9046,9 +9052,11 @@ setInterval(async () => {
     await loadRemoteConfig();
     // Auto-strategy: resolve best strategy from regime if set to 'auto'
     if (CONFIG.strategy === 'auto' || !CONFIG.strategy) {
-      const regime = await classifyRegime().catch(() => null);
+      // In sim: skip live regime fetch (would return today's data, not sim date's)
+      // Use a simplified time-based selection using sim bar time via getETTime()
+      const regime = isSimMode() ? _regimeCache.state : await classifyRegime().catch(() => null);
       const autoStrat = await resolveAutoStrategy(regime);
-      CONFIG._activeStrategy = autoStrat; // use _activeStrategy for signal dispatch
+      CONFIG._activeStrategy = autoStrat;
     } else {
       CONFIG._activeStrategy = CONFIG.strategy;
     }
