@@ -54,7 +54,7 @@ const CONFIG = {
 
   symbols: (process.env.SYMBOLS || 'NVDA,AAPL,MSFT,TSLA,META,AMZN,GOOGL,AMD,SPY,QQQ,MSTR,COIN,PLTR,SOFI,HOOD').split(',').map(s => s.trim().toUpperCase()),
 
-  strategy:      process.env.STRATEGY      || 'auto', // auto = switches strategy based on regime/time
+  strategy:      process.env.STRATEGY      || 'rsi_macd', // default fallback — overridden by Supabase
   // marketSentiment: 'auto' | 'bullish' | 'bearish' | 'neutral'
   // auto  = derived from SPY regime each scan
   // bullish  = only take long signals (market is trending up)
@@ -177,7 +177,7 @@ async function loadRemoteConfig() {
 
     // Apply remote settings over CONFIG — secrets never overwritten
     if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 200); // hard cap 200 (was 20)
-    if (s.strategy)         CONFIG.strategy         = s.strategy;
+    if (s.strategy)         CONFIG.strategy         = s.strategy || 'rsi_macd';
     if (s.marketSentiment)  CONFIG.marketSentiment  = s.marketSentiment;
     if (s.market_sentiment) CONFIG.marketSentiment  = s.market_sentiment; // snake_case fallback
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
@@ -1747,7 +1747,17 @@ async function syncPortfolio() {
     }, 0);
     const equity = portfolio + openVal + shortPnl;
     const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
-    if (equity > 0) { realEquity = equity; if (!realDailyStartEquity) realDailyStartEquity = equity; } // use live equity as baseline, not startingCapital
+    if (equity > 0) {
+      realEquity = equity;
+      // Set daily baseline from Alpaca's last_equity (previous day close)
+      // This is what Alpaca uses for their own day P&L calculation
+      if (!realDailyStartEquity || realDailyStartEquity === CONFIG.startingCapital) {
+        const acctSnap = await getAccount().catch(() => null);
+        realDailyStartEquity = (acctSnap?.last_equity && +acctSnap.last_equity > 0)
+          ? +parseFloat(acctSnap.last_equity)
+          : equity; // fallback: use current equity (day P&L = 0)
+      }
+    }
     await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
       cash: +portfolio.toFixed(2), total_value: +equity.toFixed(2), day_pnl: +dayPnl.toFixed(2),
       total_wins: totalWins, total_losses: totalLosses, circuit_breaker: circuitBreakerOn,
@@ -5740,10 +5750,14 @@ async function edgeGate(sym, direction, sigInfo, bars5m) {
       // destroy bot performance. Half-size entries still lose, just slower.
       // Exception: PMRB has its own time/structure gate and can survive chop.
       const activeStrat = CONFIG._activeStrategy || CONFIG.strategy;
-      if (activeStrat !== 'pmrb') {
-        return { pass: false, sizeMultiplier: 0, reason: `chop market — all entries blocked (strategy=${activeStrat})` };
+      // In chop: only block if a specific non-mean-reversion strategy is set
+      // null/auto/rsi_macd/vwap_reversion/bb_divergence can still trade in chop
+      const chopFriendly = ['pmrb','vwap_reversion','bb_divergence','rsi_macd',null,undefined,'auto'];
+      if (!chopFriendly.includes(activeStrat)) {
+        return { pass: false, sizeMultiplier: 0, reason: `chop market — ${activeStrat} blocked (use VWAP/BB/RSI in chop)` };
       }
-      return { pass: true, sizeMultiplier: 0.6, reason: `chop — PMRB reduced size` };
+      // Chop-friendly strategies trade at reduced size
+      return { pass: true, sizeMultiplier: 0.65, reason: `chop — reduced size (${activeStrat || 'auto'})` };
     }
     // Counter-regime trades (short in bull when regime allows) still allowed at half
     if ((direction === 'long' && regime.spyTrendScore <= 0) ||
@@ -9099,13 +9113,11 @@ setInterval(async () => {
     await loadRemoteConfig();
     // Auto-strategy: resolve best strategy from regime if set to 'auto'
     if (CONFIG.strategy === 'auto' || !CONFIG.strategy) {
-      // In sim: skip live regime fetch (would return today's data, not sim date's)
-      // Use a simplified time-based selection using sim bar time via getETTime()
       const regime = isSimMode() ? _regimeCache.state : await classifyRegime().catch(() => null);
       const autoStrat = await resolveAutoStrategy(regime);
-      CONFIG._activeStrategy = autoStrat;
+      CONFIG._activeStrategy = autoStrat || 'rsi_macd';
     } else {
-      CONFIG._activeStrategy = CONFIG.strategy;
+      CONFIG._activeStrategy = CONFIG.strategy || 'rsi_macd';
     }
 
     // Only log if something actually changed
