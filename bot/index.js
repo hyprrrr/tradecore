@@ -80,6 +80,7 @@ const CONFIG = {
   trailT3At:         0.020,  // trail 1.5% once up 2%
   trailT4At:         0.040,  // trail 2.0% once up 4%
   minConfidence:     62,    // lowered from 70 — was blocking too many valid setups
+  confirmCount:      2,     // consecutive scans before entry (longs=2, shorts=3)
   adaptTargetWR:     0.75,  // was 0.60 — target 75% WR
   adaptEmergencyWR:  0.40,
   confirmCount:      1,  // 1 scan = 15s delay — fast enough for open market moves
@@ -433,11 +434,11 @@ const ADAPT_EMERGENCY   = CONFIG.adaptEmergencyWR || 0.40; // emergency mode thr
 const ADAPT_ALPHA       = 0.3;  // EMA weight for recent trades (higher = more reactive)
 
 const ADAPT_DEFAULTS = {
-  rsiOversold:    35,
+  rsiOversold:    35,   // reset on every restart if adaptive drifted too tight
   rsiOverbought:  65,
-  minConfidence:  62,        // lowered from 70
+  minConfidence:  62,
   atrStopMult:    2.0,
-  maxPositionPct: 0.15,
+  maxPositionPct: 0.10, // hard cap 10% — RBLX trade was 30%, wiped weeks of gains
   tp1Pct:         0.015,
   tp2Pct:         0.030,
   tp3Pct:         0.050,
@@ -445,11 +446,11 @@ const ADAPT_DEFAULTS = {
 };
 
 const ADAPT_BOUNDS = {
-  rsiOversold:    { min: 18, max: 45 },
-  rsiOverbought:  { min: 55, max: 82 },
+  rsiOversold:    { min: 25, max: 40 }, // was 18-45 — cap at 40 so never blocks liquid stocks
+  rsiOverbought:  { min: 60, max: 75 }, // was 55-82 — floor at 60
   minConfidence:  { min: 55, max: 75 }, // was 60-80, cap at 75 so bot doesn't freeze   // was 60-92 — 92 was so high almost nothing qualified, paralyzed the bot
   atrStopMult:    { min: 1.5, max: 2.5 }, // hard cap — 3.5x caused $2900 loss
-  maxPositionPct: { min: 0.03, max: 0.25 },
+  maxPositionPct: { min: 0.03, max: 0.12 }, // hard cap 12% — RBLX -$7k was 30%
   tp1Pct:         { min: 0.010, max: 0.030 },
   tp2Pct:         { min: 0.025, max: 0.060 },
   tp3Pct:         { min: 0.040, max: 0.100 },
@@ -5008,14 +5009,19 @@ function generateSignal(sym, bars5m, bars15m) {
   // In live mode reject stocks that don't move enough to reach TP1
   const atrNow = atr(bars5m, 14);
   const atrPct = price > 0 ? atrNow / price : 0;
-  if (!isSimMode() && atrPct < 0.002) { // 0.2% ATR minimum for live only
+  if (!isSimMode() && atrPct < 0.001) { // 0.1% ATR minimum (was 0.2% — too aggressive, blocked liquid stocks)
     return { signal: 'HOLD', confidence: 0, score: 0,
-      reasons: [`ATR too low (${(atrPct*100).toFixed(2)}% < 0.2% min) — not moving`], rsi: 50 };
+      reasons: [`ATR too low (${(atrPct*100).toFixed(2)}% < 0.1% min) — not moving`], rsi: 50 };
   }
 
   const reasons = [];
   let passedGates = 0;
   let direction   = null;
+
+  // Ensure we have enough data for RSI before any gates
+  if (c5.length < 15) {
+    return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Need 15+ bars for RSI'], rsi: 50 };
+  }
 
   // ── GATE 0: Price slope — no catching falling knives ─────────
   // If price is in a steep downtrend (dropped >1% in last 3 bars),
@@ -5096,7 +5102,19 @@ function generateSignal(sym, bars5m, bars15m) {
     rsiScore = 1; direction = 'sell';
     reasons.push(`Momentum short: RSI ${r.toFixed(1)} + EMA bear stack + MACD falling ✅`);
   } else {
-    return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no trend or extreme`], rsi: r };
+    // RSI neutral but check for volume breakout — institutions move in neutral RSI
+    const volSpike  = vol[vol.length-1] > (vol.slice(-6,-1).reduce((a,b)=>a+b,0)/5) * 1.8;
+    const priceUp3  = c5[c5.length-1] > c5[c5.length-4];
+    const priceDn3  = c5[c5.length-1] < c5[c5.length-4];
+    if (volSpike && priceUp3) {
+      rsiScore = 1; direction = 'buy';
+      reasons.push(`Volume breakout (${(vol[vol.length-1]/(vol.slice(-6,-1).reduce((a,b)=>a+b,0)/5)).toFixed(1)}x) with price up ✅`);
+    } else if (volSpike && priceDn3 && CONFIG.shortsEnabled) {
+      rsiScore = 1; direction = 'sell';
+      reasons.push(`Volume breakdown (${(vol[vol.length-1]/(vol.slice(-6,-1).reduce((a,b)=>a+b,0)/5)).toFixed(1)}x) with price down ✅`);
+    } else {
+      return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no edge`], rsi: r };
+    }
   }
   passedGates++;
 
@@ -5110,12 +5128,13 @@ function generateSignal(sym, bars5m, bars15m) {
   const macdAgrees = (direction === 'buy' && macdBull) || (direction === 'sell' && !macdBull);
   let macdScore = 0; // declared here so score formula below can always reference it
   if (!macdAgrees) {
-    const rsiExtreme = (direction === 'buy' && r < 25) || (direction === 'sell' && r > 75);
-    if (!rsiExtreme) {
+    const rsiModerate = (direction === 'buy' && r < 40) || (direction === 'sell' && r > 60);
+    if (!rsiModerate) {
       return { signal:'HOLD', confidence:0, score:0,
         reasons:[...reasons, `MACD disagrees with ${direction} — blocked`], rsi:r };
     }
-    reasons.push(`MACD disagrees but RSI extreme (${r.toFixed(1)}) — proceeding`);
+    macdScore = -1; // penalty for disagreement but allow if RSI moderately extended
+    reasons.push(`MACD disagrees but RSI ${r.toFixed(1)} warrants caution entry`);
   } else {
     macdScore = macdCross ? 2 : 1;
     if (macdCross) reasons.push(`MACD crossover ${direction==='buy'?'↑':'↓'} ✅`);
@@ -5986,7 +6005,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   // This is the most important risk rule. One bad trade (RBLX -$7k) erases
   // weeks of small wins. 10% cap = max possible loss on one trade is 1% of
   // account (10% position × 10% adverse move before stop fires).
-  const maxPositionDollars = displayEquity * 0.10; // 10% of account
+  const maxPositionDollars = (realEquity > 0 ? realEquity : CONFIG.startingCapital) * 0.10; // 10% of account
   const maxQtyByCap = Math.floor(maxPositionDollars / price);
   if (finalQty > maxQtyByCap && maxQtyByCap >= 1) {
     log('risk', `📏 ${sym} qty capped: ${finalQty} → ${maxQtyByCap} (10% account cap, $${maxPositionDollars.toFixed(0)} max)`);
@@ -8854,9 +8873,9 @@ function confirmSignal(sym, sig) {
     prev.sigInfo = sig;
     pendingSignals.set(sym, prev);
 
-    // Shorts need 3 consecutive confirmations, longs need 2
-    // 4 confirmations = 60s delay — move is often over before entry
-    const required = sig.signal === 'SELL' ? 3 : (CONFIG.confirmCount || 2);
+    // Require 2 consecutive scans for longs, 3 for shorts
+    // Enough to filter noise without missing the move
+    const required = sig.signal === 'SELL' ? 3 : 2;
 
     if (prev.count >= required) {
       pendingSignals.delete(sym);
@@ -8866,9 +8885,10 @@ function confirmSignal(sym, sig) {
     log('signal', `⏳ ${sym} ${sig.signal} pending (${prev.count}/${required})`);
     return false;
   }
-  const required = sig.signal === 'SELL' ? 5 : 4;
+  // First time seeing this signal — store it, require one more scan to confirm
+  const required = sig.signal === 'SELL' ? 3 : 2;
   pendingSignals.set(sym, { signal: sig.signal, count: 1, sigInfo: sig });
-  log('signal', `⏳ ${sym} new signal (${sig.signal} conf:${sig.confidence}%) — need ${required - 1} more confirmations`);
+  log('signal', `⏳ ${sym} new signal (${sig.signal} conf:${sig.confidence}%) — need ${required - 1} more confirmation`);
   return false;
 }
 
@@ -9208,6 +9228,21 @@ cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' 
 
 // Startup — prewarm data then scan immediately
 ensureColumns().catch(() => {});
+// Reset adaptive RSI thresholds to defaults on startup
+// Prevents the adaptive engine from persisting paralytic values across restarts
+if (CONFIG.rsiOversold > 40) {
+  log('sys', `⚙️ Resetting rsiOversold: ${CONFIG.rsiOversold} → 35 (was too tight)`);
+  CONFIG.rsiOversold = 35;
+}
+if (CONFIG.rsiOverbought < 62) {
+  log('sys', `⚙️ Resetting rsiOverbought: ${CONFIG.rsiOverbought} → 65 (was too tight)`);
+  CONFIG.rsiOverbought = 65;
+}
+if (CONFIG.maxPositionPct > 0.12) {
+  log('sys', `⚙️ Resetting maxPositionPct: ${(CONFIG.maxPositionPct*100).toFixed(0)}% → 10% (was too large)`);
+  CONFIG.maxPositionPct = 0.10;
+}
+
 loadRemoteConfig().then(async () => {
   await updateDayBias();
   if (isMarketOpen()) {
