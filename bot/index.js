@@ -79,7 +79,7 @@ const CONFIG = {
   trailT2At:         0.010,  // trail 0.8% once up 1%
   trailT3At:         0.020,  // trail 1.5% once up 2%
   trailT4At:         0.040,  // trail 2.0% once up 4%
-  minConfidence:     70,    // was 60 — don't take mediocre setups
+  minConfidence:     62,    // lowered from 70 — was blocking too many valid setups
   adaptTargetWR:     0.75,  // was 0.60 — target 75% WR
   adaptEmergencyWR:  0.40,
   confirmCount:      1,  // 1 scan = 15s delay — fast enough for open market moves
@@ -111,7 +111,7 @@ const CONFIG = {
   scalpMode:           process.env.SCALP_MODE === 'true',
   shortsEnabled:       process.env.ENABLE_SHORTS === 'true',
   recoveryMode:        process.env.RECOVERY_MODE === 'true',
-  minConfidence:       +(process.env.MIN_CONFIDENCE || 70), // adaptive — auto-adjusted by learning engine (was 60)
+  minConfidence:       +(process.env.MIN_CONFIDENCE || 62),
   scalpSymbols:        (process.env.SCALP_SYMBOLS || 'NVDA,TSLA,MSTR,COIN,AMD,META,AAPL,SPY,QQQ').split(',').map(s => s.trim().toUpperCase()),
   scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.3)  / 100, // 0.3% TP (2x ATR)
   scalpSlPct:          +(process.env.SCALP_SL_PCT        || 0.15) / 100, // 0.15% SL (1x ATR)
@@ -177,7 +177,7 @@ async function loadRemoteConfig() {
 
     // Apply remote settings over CONFIG — secrets never overwritten
     if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 200); // hard cap 200 (was 20)
-    if (s.strategy)         CONFIG.strategy         = s.strategy || 'rsi_macd';
+    CONFIG.strategy = s.strategy || CONFIG.strategy || 'rsi_macd';
     if (s.marketSentiment)  CONFIG.marketSentiment  = s.marketSentiment;
     if (s.market_sentiment) CONFIG.marketSentiment  = s.market_sentiment; // snake_case fallback
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
@@ -435,7 +435,7 @@ const ADAPT_ALPHA       = 0.3;  // EMA weight for recent trades (higher = more r
 const ADAPT_DEFAULTS = {
   rsiOversold:    35,
   rsiOverbought:  65,
-  minConfidence:  70,        // was 60 — adaptive default (floor also raised)
+  minConfidence:  62,        // lowered from 70
   atrStopMult:    2.0,
   maxPositionPct: 0.15,
   tp1Pct:         0.015,
@@ -447,7 +447,7 @@ const ADAPT_DEFAULTS = {
 const ADAPT_BOUNDS = {
   rsiOversold:    { min: 18, max: 45 },
   rsiOverbought:  { min: 55, max: 82 },
-  minConfidence:  { min: 60, max: 80 },   // was 60-92 — 92 was so high almost nothing qualified, paralyzed the bot
+  minConfidence:  { min: 55, max: 75 }, // was 60-80, cap at 75 so bot doesn't freeze   // was 60-92 — 92 was so high almost nothing qualified, paralyzed the bot
   atrStopMult:    { min: 1.5, max: 2.5 }, // hard cap — 3.5x caused $2900 loss
   maxPositionPct: { min: 0.03, max: 0.25 },
   tp1Pct:         { min: 0.010, max: 0.030 },
@@ -1187,7 +1187,7 @@ async function runAdaptiveTuning() {
     log(log_prefix, `🚨 EMERGENCY: EWMA win rate ${(effectiveWR*100).toFixed(0)}% — aggressive correction`);
 
     // 1. Drastically raise minimum confidence
-    const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, CONFIG.minConfidence + _step(CONFIG.minConfidence, 80, 2));
+    const newConf = Math.min(75, CONFIG.minConfidence + _step(CONFIG.minConfidence, 75, 2)); // hard cap 75
     if (newConf !== CONFIG.minConfidence) { CONFIG.minConfidence = Math.round(newConf); changes.minConfidence = CONFIG.minConfidence; reasons.push('Emergency: raise confidence threshold'); }
 
     // 2. Tighten RSI to only deepest extremes
@@ -1884,14 +1884,15 @@ async function syncPortfolio() {
 async function syncPositions() {
   const allPositions = [];
 
-  // Price resolver: Alpaca's current_price is the source of truth when available
-  // (set by reconcileWithAlpaca). Fall back to priceHistory5m for sim mode or
-  // when Alpaca hasn't been polled yet. Entry price is the last resort.
+  // Price resolver: alpacaLivePrice is the source of truth (refreshed every 5s).
+  // priceHistory5m is 5-min bar close — can be 5 minutes stale, causes wrong P&L display.
   const livePrice = (sym, pos) => {
     if (alpacaLivePrice[sym] > 0) return alpacaLivePrice[sym];
+    // Only fall back to bar history if no live price (e.g. pre-market, no positions)
     const hist = priceHistory5m[sym];
-    if (hist && hist.length) return hist[hist.length - 1];
-    return pos.highWater || pos.entryPrice;
+    const barPrice = hist?.length ? hist[hist.length - 1] : 0;
+    if (barPrice > 0) return barPrice;
+    return pos.entryPrice; // last resort — no stale highWater
   };
 
   // Swing longs
@@ -4967,7 +4968,9 @@ function signalBBDivergence(sym, bars5m, bars15m) {
 
 function generateSignalByStrategy(sym, bars5m, bars15m) {
   // _activeStrategy is set by auto-switcher each scan; falls back to CONFIG.strategy
+  // Guarantee strategy is never null — rsi_macd is always the fallback
   const strategy = CONFIG._activeStrategy || CONFIG.strategy || 'rsi_macd';
+  if (!CONFIG._activeStrategy) CONFIG._activeStrategy = strategy; // cache for edge gate
 
   switch(strategy) {
     case 'smc':            return signalSMC(sym, bars5m, bars15m);
@@ -5874,6 +5877,18 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     return;
   }
 
+  // ── CONFLICT GUARD: no opposite-direction position on same symbol ──
+  // Prevents bot from being long + short RBLX simultaneously (proven to
+  // net to zero while burning commission on both sides)
+  if (direction === 'long' && (shortPositions[sym] || alpacaShorts.has(sym))) {
+    log('risk', `🚫 ${sym} — already SHORT, blocking LONG entry (no hedging)`);
+    return;
+  }
+  if (direction === 'short' && (positions[sym] || alpacaPositions.has(sym))) {
+    log('risk', `🚫 ${sym} — already LONG, blocking SHORT entry (no hedging)`);
+    return;
+  }
+
   // Re-entry cooldown after stop loss — prevents immediately re-entering the same losing trade
   // In sim mode this maps to real-time clock so it blocks within a sim loop cycle too
   if (stopLossCooldown[sym] && Date.now() < stopLossCooldown[sym]) {
@@ -5965,6 +5980,17 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   if (isPMRBScaled) {
     finalQty = Math.max(1, Math.floor(finalQty * 0.60));
     log('pmrb', `${sym} PMRB 60% entry: ${finalQty} shares | add at reclaim $${sigInfo.pmrb.reclaimLevel.toFixed(2)}`);
+  }
+
+  // ── ABSOLUTE DOLLAR CAP: max 10% of account in any single position ──
+  // This is the most important risk rule. One bad trade (RBLX -$7k) erases
+  // weeks of small wins. 10% cap = max possible loss on one trade is 1% of
+  // account (10% position × 10% adverse move before stop fires).
+  const maxPositionDollars = displayEquity * 0.10; // 10% of account
+  const maxQtyByCap = Math.floor(maxPositionDollars / price);
+  if (finalQty > maxQtyByCap && maxQtyByCap >= 1) {
+    log('risk', `📏 ${sym} qty capped: ${finalQty} → ${maxQtyByCap} (10% account cap, $${maxPositionDollars.toFixed(0)} max)`);
+    finalQty = maxQtyByCap;
   }
 
   const atrVal    = bars && bars.length >= 14 ? atr(bars, 14) : price * CONFIG.stopLossPct;
@@ -6374,7 +6400,23 @@ async function coverPartialShort(sym, price, qty, reason) {
   log('short', `🎯 PARTIAL COVER ${reason}: ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
   trades.push({ time: new Date(), sym, side: 'COVER', qty, price, pnl, reason });
   await syncTrade({ sym, side: 'COVER', qty, price, pnl, reason });
-  await syncAll();
+  // PATCH the existing position row in-place instead of full syncAll
+  // syncAll deletes + re-inserts which creates a duplicate flash on the dashboard
+  const remainingPos = shortPositions[sym];
+  if (remainingPos) {
+    const remQty = remainingPos.qtyRemaining || remainingPos.qty || 0;
+    const curP   = alpacaLivePrice[sym] || price;
+    await sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}_SHORT`, 'PATCH', {
+      qty:           -remQty,
+      pnl:           +((remainingPos.entryPrice - curP) * remQty).toFixed(2),
+      current_price: +curP.toFixed(4),
+      updated_at:    new Date().toISOString(),
+    }).catch(() => {});
+  } else {
+    // Position fully closed — delete the row
+    sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}_SHORT`, 'DELETE').catch(() => {});
+  }
+  await syncPortfolio();
 }
 
 async function partialExit(sym, price, qtyToSell, reason) {
@@ -6399,8 +6441,24 @@ async function partialExit(sym, price, qtyToSell, reason) {
   await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
   await syncLog('sell', `${icon} PARTIAL ${reason} ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
 
-  if (positions[sym].qtyRemaining <= 0) { delete positions[sym]; }
-  await syncAll();
+  if (positions[sym]?.qtyRemaining <= 0) {
+    delete positions[sym];
+    sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'DELETE').catch(() => {});
+  } else {
+    // PATCH remaining qty in-place — avoid delete+reinsert duplicate flash
+    const rem = positions[sym];
+    if (rem) {
+      const remQty = rem.qtyRemaining || rem.qty || 0;
+      const curP   = alpacaLivePrice[sym] || price;
+      await sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}`, 'PATCH', {
+        qty:           remQty,
+        pnl:           +((curP - rem.entryPrice) * remQty).toFixed(2),
+        current_price: +curP.toFixed(4),
+        updated_at:    new Date().toISOString(),
+      }).catch(() => {});
+    }
+  }
+  await syncPortfolio();
 }
 
 async function exitPosition(sym, price, reason) {
