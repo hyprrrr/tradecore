@@ -3133,18 +3133,33 @@ function _redrawChartImmediate() {
     svg.appendChild(hit);
   });
 
-  // ── Current price line ────────────────────────────────────────
-  const last = visible[visible.length - 1];
-  const ly   = yOf(last.close);
-  svg.appendChild(svgLine(pad.l, ly, W - pad.r, ly, 'var(--text)', '0.5', '4,3', '0.4'));
+  // ── Current price line + label ───────────────────────────────
+  const last     = visible[visible.length - 1];
+  // Always use the most recent candle's close for the price label
+  // Clamp ly to within the visible chart area so label never renders off-screen
+  const lyRaw    = yOf(last.close);
+  const ly       = Math.max(pad.t + 9, Math.min(pad.t + ch - 9, lyRaw));
+  const priceUp  = last.close >= last.open;
+  const lineCol  = '#2962ff';  // always blue — matches candle color
+  const fillCol  = priceUp ? '#2962ff' : '#ef5350';
+
+  // Dashed horizontal line across chart
+  svg.appendChild(svgLine(pad.l, ly, W - pad.r, ly, lineCol, '0.8', '4,3', '0.7'));
+
+  // Label pill on right edge
+  const labelW = 72, labelH = 18;
   const lbg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-  lbg.setAttribute('x', W - pad.r + 2); lbg.setAttribute('y', ly - 9);
-  lbg.setAttribute('width', 68); lbg.setAttribute('height', 18); lbg.setAttribute('rx', '3');
-  lbg.setAttribute('fill', last.close >= last.open ? 'var(--buy)' : 'var(--sell)');
+  lbg.setAttribute('x', W - pad.r + 1);
+  lbg.setAttribute('y', ly - labelH / 2);
+  lbg.setAttribute('width', labelW);
+  lbg.setAttribute('height', labelH);
+  lbg.setAttribute('rx', '4');
+  lbg.setAttribute('fill', fillCol);
   svg.appendChild(lbg);
-  const lt = svgText(W - pad.r + 36, ly + 3.5,
-    '$' + last.close.toLocaleString([],{minimumFractionDigits:2,maximumFractionDigits:2}),
-    '9.5', 'rgba(0,0,0,0)', 'middle');
+
+  const lt = svgText(W - pad.r + labelW / 2 + 1, ly + 4,
+    last.close.toLocaleString([], {minimumFractionDigits: 2, maximumFractionDigits: 2}),
+    '9.5', '#ffffff', 'middle');
   lt.setAttribute('font-weight', '700');
   lt.setAttribute('font-family', 'var(--font-mono)');
   svg.appendChild(lt);
