@@ -6244,16 +6244,36 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
 }
 
 // Cover a short position (buy back the borrowed shares)
+const _coverInFlight = new Set();
+
 async function coverShort(sym, price, reason) {
   const pos = shortPositions[sym];
   if (!pos) return;
+  if (_coverInFlight.has(sym)) {
+    log('warn', `⚠️ ${sym} cover already in-flight — skipping duplicate`);
+    return;
+  }
+  _coverInFlight.add(sym);
   const qty = pos.qtyRemaining || pos.qty;
   const forceClose = reason === 'MANUAL_DISCORD';
 
   if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
-    try { await placeOrder(sym, qty, 'buy'); }
+    try {
+      const fill = await placeOrder(sym, qty, 'buy');
+      const filledQty = fill?.filled_qty ? +fill.filled_qty : qty;
+      if (filledQty < qty) {
+        const remaining = qty - filledQty;
+        if (remaining > 0 && shortPositions[sym]) {
+          shortPositions[sym].qtyRemaining = remaining;
+          shortPositions[sym].qty = remaining;
+          _coverInFlight.delete(sym);
+          return;
+        }
+      }
+    }
     catch (e) {
       log('error', `Cover failed ${sym}: ${e.message}`);
+      _coverInFlight.delete(sym);
       if (!forceClose) return;
       log('warn', `Force-closing short ${sym} in memory despite order failure`);
     }
@@ -6287,6 +6307,7 @@ async function coverShort(sym, price, reason) {
   await sendDiscordAlert('cover', sym, qty, price, pnl, reason);
   await syncTrade({ sym, side: 'COVER', qty, price, pnl, reason });
   await syncAll();
+  _coverInFlight.delete(sym);
   await syncLog('sell', `${icon} COVER ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
 
   // Trigger recovery on short losses too
@@ -6480,16 +6501,46 @@ async function partialExit(sym, price, qtyToSell, reason) {
   await syncPortfolio();
 }
 
+const _exitInFlight = new Set(); // per-symbol exit lock — prevents looping on partial fills
+
 async function exitPosition(sym, price, reason) {
   const pos = positions[sym];
   if (!pos) return;
+
+  // ── Exit in-flight guard ─────────────────────────────────────
+  // Without this: sell order fires, takes 200ms to settle, next scan
+  // still sees the position open (Alpaca hasn't confirmed yet), fires
+  // another sell. With partial fills this loops indefinitely.
+  if (_exitInFlight.has(sym)) {
+    log('warn', `⚠️ ${sym} exit already in-flight — skipping duplicate`);
+    return;
+  }
+  _exitInFlight.add(sym);
+
   const qtyToSell = pos.qtyRemaining || pos.qty;
   const forceClose = reason === 'MANUAL_DISCORD';
 
   if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
-    try { await placeOrder(sym, qtyToSell, 'sell'); }
+    try {
+      const fill = await placeOrder(sym, qtyToSell, 'sell');
+      // Use actual filled qty from Alpaca if available — prevents qty mismatch loops
+      const filledQty = fill?.filled_qty ? +fill.filled_qty : qtyToSell;
+      if (filledQty < qtyToSell) {
+        log('warn', `${sym} partial fill: sold ${filledQty}/${qtyToSell} shares — updating position`);
+        if (positions[sym]) {
+          const remaining = qtyToSell - filledQty;
+          if (remaining > 0) {
+            positions[sym].qtyRemaining = remaining;
+            positions[sym].qty = remaining;
+            _exitInFlight.delete(sym);
+            return; // still have shares — let next scan handle remainder
+          }
+        }
+      }
+    }
     catch (e) {
       log('error', `Sell order failed ${sym}: ${e.message}`);
+      _exitInFlight.delete(sym);
       if (!forceClose) return;
       log('warn', `Force-closing ${sym} in memory despite order failure`);
     }
@@ -6525,6 +6576,7 @@ async function exitPosition(sym, price, reason) {
   await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
   await syncAll();
   await syncLog('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
+  _exitInFlight.delete(sym); // release lock after full exit
 
   // ── RECOVERY MODE ─────────────────────────────────────────────
   if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
@@ -7619,17 +7671,17 @@ let alpacaShorts    = new Set();
 // Shorting controlled via CONFIG.shortsEnabled (dashboard toggle)
 
 async function syncAlpacaPositions() {
-  if (isSimMode()) return; // sim tracks positions in memory — no Alpaca sync needed
+  if (isSimMode()) return;
   if (!CONFIG.alpacaKey) return;
   try {
     const data = await alpacaFetch(`${ALPACA_BASE()}/v2/positions`);
     if (!Array.isArray(data)) return;
-
+    const reconcileNow = Date.now();
     const liveSymbols = new Set(data.map(p => p.symbol));
 
     // ── Detect manual closes ──
-    // If we have a position in memory but it's gone from Alpaca → manually closed.
-    //
+    // Grace period: skip positions < 45s old — Alpaca may not have settled
+    // the fill yet, causing instant phantom MANUAL_CLOSE (the ARM loop bug).
     // CRITICAL DEDUP: previously this loop fired MANUAL_CLOSE trades on every
     // reconcile when a symbol was in memory but not at Alpaca. A rare race or
     // state-restoration path caused the SAME TQQQ position to record 30+
@@ -7640,6 +7692,11 @@ async function syncAlpacaPositions() {
     //   2. Keep a short-lived "recently closed" guard so a racing restore
     //      can't re-add the same symbol within 60s of a close.
     for (const sym of Object.keys(positions)) {
+      // Grace period — skip positions < 45s old to avoid phantom MANUAL_CLOSE
+      // from partial fills that haven't settled in Alpaca yet (ARM loop bug)
+      const posAge = positions[sym]?.entryTime
+        ? (reconcileNow - new Date(positions[sym].entryTime).getTime()) / 1000 : 999;
+      if (posAge < 45) continue;
       if (liveSymbols.has(sym)) continue;
 
       // Snapshot the position object, then remove from memory SYNCHRONOUSLY
@@ -7672,6 +7729,9 @@ async function syncAlpacaPositions() {
 
     // Same logic for shorts
     for (const sym of Object.keys(shortPositions)) {
+      const shortAge = shortPositions[sym]?.entryTime
+        ? (reconcileNow - new Date(shortPositions[sym].entryTime).getTime()) / 1000 : 999;
+      if (shortAge < 45) continue;
       if (liveSymbols.has(sym)) continue;
       const pos = shortPositions[sym];
       delete shortPositions[sym];
@@ -9299,6 +9359,9 @@ setInterval(async () => {
     } catch(e) { log('error', `Overnight close failed ${sym}: ${e.message}`); }
   }
   for (const sym of [...Object.keys(shortPositions)]) {
+    const spos = shortPositions[sym];
+    const sAgeSec = spos?.entryTime ? (now - new Date(spos.entryTime).getTime()) / 1000 : 999;
+    if (sAgeSec < 45) continue;
     try {
       const cur = priceHistory5m[sym]?.[priceHistory5m[sym].length-1] || shortPositions[sym].entryPrice;
       await coverShort(sym, cur, 'INTRADAY_CLOSE');
