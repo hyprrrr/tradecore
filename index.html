@@ -616,183 +616,185 @@
      MOBILE RESPONSIVE — screens < 768px (phones)
      Strategy: single column, bottom tab bar, swipeable panels
   ═══════════════════════════════════════════════════════════ */
+  /* ═══════════════════════════════════════════════════════
+     MOBILE — clean rewrite, no layout conflicts
+     Uses display:none/block toggling, not flex tricks
+  ═══════════════════════════════════════════════════════ */
   @media (max-width: 768px) {
+    html, body { font-size: 13px; overflow: hidden; }
 
-    /* ── Root tweaks ── */
-    html, body { font-size: 13px; }
-
-    /* ── App shell: header + tab bar + content ── */
+    /* App: fixed header + scrollable main + fixed tab bar */
     .app {
-      grid-template-rows: 48px 1fr 56px;
-      height: 100dvh; /* dynamic viewport height — handles mobile browser chrome */
+      display: grid;
+      grid-template-rows: 48px 1fr;
+      height: 100dvh;
+      overflow: hidden;
     }
 
-    /* ── Header: shrink to logo + clock + mode pill only ── */
-    .header { padding: 0 12px; }
+    /* ── Header ── */
+    .header { padding: 0 10px; }
     .brand-sub { display: none; }
-    .brand { font-size: 15px; gap: 7px; }
-    .brand-icon { width: 26px; height: 26px; font-size: 13px; }
-
-    /* Hide desktop nav tabs — replaced by bottom tab bar */
+    .brand { font-size: 14px; gap: 6px; }
+    .brand-icon { width: 24px; height: 24px; font-size: 12px; }
     .nav-tabs { display: none; }
-
-    /* Collapse header-right to just mode + clock */
-    .header-right { gap: 6px; }
-    .header-pill { padding: 4px 8px; font-size: 10px; }
-    /* Hide config/exit sim buttons in header on mobile */
+    .header-right { gap: 5px; }
+    .header-pill { padding: 3px 7px; font-size: 9.5px; }
     .header-right .btn:not(#modeIndicator):not(#exitSimBtn) { display: none; }
+
+    /* ── Main grid → single full-height container ── */
+    .main {
+      display: block !important;
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      padding: 0;
+      gap: 0;
+      background: transparent;
+    }
+
+    /* All panels hidden by default — JS shows the active one */
+    .leftbar, .rightbar, .chart-area, .bottom-panels { display: none !important; }
+
+    /* Active panel fills the whole space above tab bar */
+    .leftbar.m-active,
+    .rightbar.m-active,
+    .chart-area.m-active,
+    .bottom-panels.m-active {
+      display: flex !important;
+      flex-direction: column;
+      position: absolute;
+      inset: 0 0 56px 0; /* leave room for tab bar */
+      width: 100%;
+      border-radius: 0 !important;
+      overflow-y: auto;
+      overflow-x: hidden;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* chart-area needs special treatment — it has its own sub-panels */
+    .chart-area.m-active {
+      overflow: hidden; /* chart svg handles its own scroll */
+    }
+
+    /* Bottom panels stack vertically when shown */
+    .bottom-panels.m-active {
+      flex-direction: column;
+      gap: 8px;
+      padding: 8px;
+      background: transparent;
+    }
+    .bottom-panels.m-active .panel {
+      min-height: 280px;
+      flex-shrink: 0;
+    }
 
     /* ── Mobile bottom tab bar ── */
     .mobile-tab-bar {
       display: flex !important;
-      position: fixed;
+      position: fixed !important;
       bottom: 0; left: 0; right: 0;
       height: 56px;
-      background: rgba(7,7,11,0.88);
-      backdrop-filter: blur(24px);
-      -webkit-backdrop-filter: blur(24px);
-      border-top: 1px solid rgba(255,255,255,0.08);
-      z-index: 200;
-      padding-bottom: env(safe-area-inset-bottom);
+      background: rgba(7,7,11,0.92);
+      backdrop-filter: blur(24px) saturate(180%);
+      -webkit-backdrop-filter: blur(24px) saturate(180%);
+      border-top: 1px solid rgba(255,255,255,0.09);
+      z-index: 1000;
+      padding-bottom: env(safe-area-inset-bottom, 0px);
     }
     .mobile-tab-btn {
       flex: 1;
       display: flex; flex-direction: column;
       align-items: center; justify-content: center;
       gap: 3px;
-      color: var(--text-dim);
-      font-size: 9.5px; font-weight: 500;
+      color: rgba(255,255,255,0.35);
+      font-size: 9px; font-weight: 600; letter-spacing: 0.04em;
       cursor: pointer;
-      transition: color .15s;
+      transition: color .12s;
       -webkit-tap-highlight-color: transparent;
+      user-select: none;
     }
     .mobile-tab-btn.active { color: var(--accent); }
-    .mobile-tab-btn svg { width: 20px; height: 20px; }
-    .mobile-tab-btn .mtab-dot {
-      width: 4px; height: 4px; border-radius: 50%;
-      background: var(--accent); margin-top: -2px;
-      box-shadow: 0 0 5px var(--accent);
-    }
+    .mobile-tab-btn svg { width: 22px; height: 22px; stroke-width: 1.8; }
 
-    /* ── Main: single column, full height, scrollable ── */
-    .main {
-      display: flex !important;
-      flex-direction: column;
-      gap: 0;
-      overflow-y: auto;
-      overflow-x: hidden;
-      background: rgba(0,0,0,0);
-      padding-bottom: 56px; /* room for tab bar */
-    }
-
-    /* Hide left/right sidebars by default on mobile — shown via tab */
-    .leftbar { display: none; }
-    .rightbar { display: none; }
-
-    /* Chart area takes full width */
-    .chart-area {
-      grid-column: unset !important;
-      grid-row: unset !important;
-      width: 100%;
-      min-height: 280px;
-    }
-
-    /* Bottom section (positions + trades) stacks vertically */
-    .bottom-section {
-      grid-column: unset !important;
-      display: flex !important;
-      flex-direction: column;
-      width: 100%;
-    }
-    .positions-panel, .trades-panel { min-height: 220px; }
-
-    /* ── Mobile view switching ── */
-    .main.mobile-view-chart   .chart-area    { display: flex !important; }
-    .main.mobile-view-chart   .bottom-section { display: none !important; }
-    .main.mobile-view-trades  .chart-area    { display: none !important; }
-    .main.mobile-view-trades  .bottom-section { display: flex !important; }
-    .main.mobile-view-left    .leftbar       { display: flex !important; width: 100%; }
-    .main.mobile-view-left    .chart-area    { display: none !important; }
-    .main.mobile-view-left    .bottom-section { display: none !important; }
-    .main.mobile-view-right   .rightbar      { display: flex !important; width: 100%; flex-direction: column; }
-    .main.mobile-view-right   .chart-area    { display: none !important; }
-    .main.mobile-view-right   .bottom-section { display: none !important; }
-
-    /* ── Equity header bar: wrap onto 2 lines ── */
+    /* ── Equity bar: compact 2-row layout ── */
     .equity-bar {
       flex-wrap: wrap;
-      gap: 6px 10px;
+      gap: 4px 12px;
       padding: 8px 12px;
-      font-size: 11px;
+      font-size: 10.5px;
+      flex-shrink: 0;
     }
     .equity-bar > * { white-space: nowrap; }
-    .tf-group { gap: 3px; }
-    .tf-btn { padding: 4px 8px; font-size: 10px; }
-    .indicator-toggles { gap: 6px; font-size: 10px; }
+    .tf-group { gap: 2px; }
+    .tf-btn { padding: 3px 7px; font-size: 9.5px; border-radius: 99px; }
+    .indicator-toggles { font-size: 9.5px; gap: 8px; }
+    .pair-stat-value { font-size: 13px !important; }
+    #mainEquity { font-size: 17px !important; }
 
-    /* ── Chart itself ── */
-    .chart-wrap { min-height: 250px; }
+    /* ── Chart fills remaining height ── */
+    .chart-area.m-active .chart-wrap,
+    .chart-area.m-active #chartWrap {
+      flex: 1;
+      min-height: 0;
+    }
 
-    /* ── Stats cards in right panel: 2-col grid ── */
-    .perf-grid { grid-template-columns: 1fr 1fr !important; gap: 10px; }
+    /* ── Right panel (Stats) — scrollable single column ── */
+    .rightbar.m-active { padding: 8px; gap: 8px; }
+    .rightbar.m-active .stat-grid {
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+    }
 
-    /* ── Bot controls: full width buttons ── */
-    .controls-grid { grid-template-columns: 1fr 1fr !important; }
+    /* ── Left panel (Bot) — scrollable ── */
+    .leftbar.m-active .panel-body { flex: 1; overflow-y: auto; }
 
-    /* ── Analytics overlay: single column ── */
-    .analytics-grid { grid-template-columns: 1fr 1fr !important; }
-    .analytics-row  { grid-template-columns: 1fr !important; }
-    .session-perf-grid { grid-template-columns: 1fr !important; }
+    /* ── Tables ── */
+    .data-table { font-size: 11px; }
+    .data-table th, .data-table td { padding: 8px 10px !important; }
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
-    /* ── Settings overlay: single column ── */
-    .settings-grid { grid-template-columns: 1fr !important; }
-
-    /* ── Tables: make scrollable, pin key columns ── */
-    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-    table { min-width: 480px; font-size: 11.5px; }
-    th, td { padding: 7px 8px !important; }
-
-    /* ── Overlay panels: full screen on mobile ── */
+    /* ── Overlays: full screen ── */
+    .tab-overlay {
+      padding: 0 !important;
+    }
     .overlay-panel {
       position: fixed !important;
       inset: 0 !important;
-      width: 100% !important;
-      max-width: 100% !important;
       border-radius: 0 !important;
-      z-index: 300;
+      max-width: 100% !important;
+      max-height: 100% !important;
+      overflow-y: auto;
     }
 
-    /* ── Log entries: smaller text ── */
-    .log-entry { font-size: 10.5px; padding: 4px 10px; }
-    .log-time  { min-width: 52px; font-size: 9.5px; }
+    /* ── Buttons: comfortable touch targets ── */
+    .btn { min-height: 40px; font-size: 12px; }
+    .controls-grid { grid-template-columns: 1fr 1fr !important; gap: 8px; }
 
-    /* ── Positions list ── */
-    .pos-row { padding: 8px 12px; font-size: 11.5px; }
-    .pos-sym { font-size: 14px; }
+    /* ── Analytics ── */
+    .analytics-grid { grid-template-columns: 1fr 1fr !important; gap: 8px; }
+    .analytics-row  { grid-template-columns: 1fr !important; }
 
-    /* ── Touch targets: minimum 44px ── */
-    .btn, .nav-tab, .mobile-tab-btn, .tf-btn { min-height: 36px; }
+    /* ── Settings ── */
+    .settings-grid { grid-template-columns: 1fr !important; }
+    .settings-row { flex-direction: column; align-items: flex-start; gap: 6px; }
 
-    /* ── Watchlist: bigger touch targets ── */
-    .watch-item { padding: 8px 12px; min-height: 44px; }
+    /* ── Log entries ── */
+    .log-entry { font-size: 10px; padding: 5px 10px; }
+
+    /* ── Watch rows ── */
+    .watch-row { padding: 11px 12px; }
   }
 
-  /* Tablet: 768–1024px — 2 column layout */
+  /* Tablet */
   @media (min-width: 769px) and (max-width: 1024px) {
     .main {
       grid-template-columns: 220px 1fr !important;
       grid-template-rows: 1fr 220px !important;
     }
-    .rightbar {
-      grid-column: 1 / -1;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-    }
-    .chart-area { grid-column: 2; }
-    .bottom-section { grid-column: 2; }
   }
 
-  /* Hide mobile tab bar on desktop */
+  /* Hide tab bar on desktop */
   @media (min-width: 769px) {
     .mobile-tab-bar { display: none !important; }
   }
@@ -2730,20 +2732,32 @@ function updateConnStatus() {
 function renderEquityChart(snapshots) {
   if (!snapshots || !snapshots.length) return;
 
-  // Skip redundant rebuilds: if nothing material changed, bail early.
-  // Hash includes last value + length + tail timestamp. Because we append
-  // a live tail every poll, the hash changes whenever portfolio value does,
-  // which is exactly when we want the chart to repaint.
   const last = snapshots[snapshots.length - 1];
   const hash = `${snapshots.length}|${last.created_at}|${(+last.value).toFixed(2)}`;
   if (hash === state._lastEquityHash && chart.allCandles.length) return;
   state._lastEquityHash = hash;
-
   state.equitySnapshots = snapshots;
 
-  // Rebuild candles at current TF but preserve user's pan/zoom (handled by
-  // drawCandlestickChart). This path runs every poll — do NOT reset view.
+  // Rebuild from snapshots
   const rebuilt = buildCandlesForTF(snapshots, chart.tf);
+
+  // Preserve any live candles (built by tickLiveCandle) that are newer
+  // than the last snapshot — these are the sub-poll real-time updates
+  // that would get wiped if we blindly replaced allCandles
+  if (chart.allCandles?.length && rebuilt.length) {
+    const lastRebuiltTime = rebuilt[rebuilt.length - 1].time instanceof Date
+      ? rebuilt[rebuilt.length - 1].time.getTime()
+      : +rebuilt[rebuilt.length - 1].time;
+
+    const liveCandles = chart.allCandles.filter(c => {
+      const ct = c.time instanceof Date ? c.time.getTime() : +c.time;
+      return c.live && ct > lastRebuiltTime;
+    });
+    if (liveCandles.length) {
+      rebuilt.push(...liveCandles);
+    }
+  }
+
   drawCandlestickChart(rebuilt);
 }
 
@@ -2786,65 +2800,56 @@ function tickLiveCandle() {
   if (!chart.allCandles?.length) return;
 
   const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
-  const bucketMs = msMap[chart.tf] || 3600e3;
-  const now      = Date.now();
-  const key      = Math.floor(now / bucketMs) * bucketMs;
+  const bucketMs  = msMap[chart.tf] || 3600e3;
+  const nowMs     = Date.now();
+  // Current bucket key — floor to bucket boundary
+  const key       = Math.floor(nowMs / bucketMs) * bucketMs;
 
-  const last    = chart.allCandles[chart.allCandles.length - 1];
-  const lastKey = last.time instanceof Date ? last.time.getTime() : +last.time;
+  const last      = chart.allCandles[chart.allCandles.length - 1];
+  // Normalize lastKey: always compare bucket-floored timestamps
+  const lastRawMs = last.time instanceof Date ? last.time.getTime() : +last.time;
+  const lastKey   = Math.floor(lastRawMs / bucketMs) * bucketMs;
   const wasAtEdge = (chart.viewStart + chart.viewCount >= chart.allCandles.length - 1);
 
   if (key > lastKey) {
-    // ── Crossed one or more bucket boundaries ─────────────────────
-    // Fill any skipped intermediate buckets as flat doji candles
-    // (equity was unchanged — no trades fired — so H/L/O/C = last close)
-    // Cap at 12 buckets to avoid flooding (overnight gap etc.)
+    // ── New bucket — fill gaps then start fresh candle ────────────
     const gapCount = Math.min(12, Math.floor((key - lastKey) / bucketMs) - 1);
     for (let g = 1; g <= gapCount; g++) {
-      const gapKey = lastKey + g * bucketMs;
       chart.allCandles.push({
-        time:   new Date(gapKey),
-        open:   last.close, high: last.close, low: last.close, close: last.close,
+        time: new Date(lastKey + g * bucketMs),
+        open: last.close, high: last.close, low: last.close, close: last.close,
         volume: 0, live: true,
       });
     }
-    // Push the current live bucket
     chart.allCandles.push({
       time:   new Date(key),
       open:   last.close,
       high:   Math.max(last.close, v),
       low:    Math.min(last.close, v),
       close:  v,
-      volume: 1,
-      live:   true,
+      volume: 1, live: true,
     });
     _liveCandleLastBucketKey = key;
-    if (wasAtEdge) {
-      chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
-    }
+    if (wasAtEdge) chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
     redrawChart();
     return;
   }
 
-  // ── Same bucket ───────────────────────────────────────────────────
-  // Always update OHLC so wicks/body are accurate, but only redraw if
-  // something actually changed (avoids ~120 redraws/min when idle)
-  const changed = (v !== last.close) || (v > last.high) || (v < last.low);
+  // ── Same bucket — update OHLC in place ───────────────────────────
+  // Always update — even flat equity needs high/low tracking
+  const prevClose = last.close;
   last.close = v;
   if (v > last.high) last.high = v;
   if (v < last.low)  last.low  = v;
 
-  // Even if value is flat: check if we need to redraw because it's been
-  // a while (keeps the chart "alive" visually — e.g. price label refreshes)
-  const now2 = Date.now();
-  if (!changed) {
-    if (!tickLiveCandle._lastForceRedraw || now2 - tickLiveCandle._lastForceRedraw > 10000) {
-      tickLiveCandle._lastForceRedraw = now2;
-      redrawChart(); // heartbeat redraw every 10s even when flat
-    }
-    return;
+  // Redraw on any value change, or heartbeat every 3s to keep price label fresh
+  const changed = v !== prevClose || v > last.high || v < last.low;
+  const now2    = Date.now();
+  const heartbeat = !tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 3000;
+  if (changed || heartbeat) {
+    tickLiveCandle._lastRedraw = now2;
+    redrawChart();
   }
-  redrawChart();
 }
 
 function buildCandlesForTF(snapshots, tf) {
@@ -3639,41 +3644,63 @@ function updateClock() {
 }
 
 // ═══════════════════════════════════════ MOBILE VIEW ═══════════════════════════════════════
+// Uses m-active class toggling — much simpler and glitch-free vs CSS class combos
 let _mobileView = 'chart';
+
+// Map tab names to panel selectors
+const MOBILE_PANELS = {
+  chart:  '.chart-area',
+  trades: '.bottom-panels',
+  left:   '.leftbar',
+  right:  '.rightbar',
+};
+
 function setMobileView(view) {
   if (window.innerWidth > 768) return;
   _mobileView = view;
-  const main = $('mainGrid');
-  if (!main) return;
-  // Remove all mobile-view-* classes
-  main.className = main.className.replace(/mobile-view-\S+/g, '').trim();
-  main.classList.add('mobile-view-' + view);
-  // Update tab bar active state
+
+  // Hide all panels
+  Object.values(MOBILE_PANELS).forEach(sel => {
+    const el = document.querySelector(sel);
+    if (el) el.classList.remove('m-active');
+  });
+
+  // Show the selected panel
+  const target = document.querySelector(MOBILE_PANELS[view]);
+  if (target) target.classList.add('m-active');
+
+  // Update tab bar
   ['chart','trades','left','right'].forEach(v => {
     const btn = $('mtab-' + v);
     if (btn) btn.classList.toggle('active', v === view);
   });
-  // Trigger chart redraw when switching to chart tab (canvas needs resize)
-  if (view === 'chart') setTimeout(() => { try { redrawChart(); } catch(e){} }, 50);
-}
 
-// Auto-init mobile view on load + resize
-function initMobileLayout() {
-  if (window.innerWidth <= 768) {
-    const main = $('mainGrid');
-    if (main && !main.classList.contains('mobile-view-chart') &&
-        !main.classList.contains('mobile-view-trades') &&
-        !main.classList.contains('mobile-view-left') &&
-        !main.classList.contains('mobile-view-right')) {
-      main.classList.add('mobile-view-chart');
-    }
-  } else {
-    // Desktop: remove all mobile classes
-    const main = $('mainGrid');
-    if (main) main.className = main.className.replace(/mobile-view-\S+/g, '').trim();
+  // Chart redraw after layout settles
+  if (view === 'chart') {
+    setTimeout(() => { try { redrawChart(); } catch(e){} }, 80);
   }
 }
-window.addEventListener('resize', initMobileLayout);
+
+function initMobileLayout() {
+  if (window.innerWidth <= 768) {
+    // Ensure only one panel is active
+    const hasActive = Object.values(MOBILE_PANELS).some(sel => {
+      const el = document.querySelector(sel);
+      return el && el.classList.contains('m-active');
+    });
+    if (!hasActive) setMobileView('chart');
+  } else {
+    // Desktop — remove all m-active classes
+    Object.values(MOBILE_PANELS).forEach(sel => {
+      const el = document.querySelector(sel);
+      if (el) el.classList.remove('m-active');
+    });
+  }
+}
+window.addEventListener('resize', () => {
+  initMobileLayout();
+  if (window.innerWidth > 768) try { redrawChart(); } catch(e){}
+});
 
 // ═══════════════════════════════════════ TABS ═══════════════════════════════════════
 function switchTab(name) {
