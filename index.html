@@ -2802,32 +2802,52 @@ function tickLiveCandle() {
   const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
   const bucketMs  = msMap[chart.tf] || 3600e3;
   const nowMs     = Date.now();
-  // Current bucket key — floor to bucket boundary
   const key       = Math.floor(nowMs / bucketMs) * bucketMs;
 
   const last      = chart.allCandles[chart.allCandles.length - 1];
-  // Normalize lastKey: always compare bucket-floored timestamps
   const lastRawMs = last.time instanceof Date ? last.time.getTime() : +last.time;
   const lastKey   = Math.floor(lastRawMs / bucketMs) * bucketMs;
   const wasAtEdge = (chart.viewStart + chart.viewCount >= chart.allCandles.length - 1);
 
+  // Is equity meaningfully changing? (more than $0.50 from last close)
+  // When flat (no open trades), we do NOT create new candles — the current
+  // candle just stays open and extends in time. New candles only form when
+  // equity actually moves, which happens during/after trades.
+  const FLAT_THRESHOLD = 0.50; // $0.50 — noise below this is ignored
+  const equityChanged = Math.abs(v - last.close) > FLAT_THRESHOLD;
+  const hasOpenTrades = (state.positions?.length > 0) ||
+                        (state.botStatus?.open_positions > 0);
+
   if (key > lastKey) {
-    // ── New bucket — fill gaps then start fresh candle ────────────
-    const gapCount = Math.min(12, Math.floor((key - lastKey) / bucketMs) - 1);
-    for (let g = 1; g <= gapCount; g++) {
-      chart.allCandles.push({
-        time: new Date(lastKey + g * bucketMs),
-        open: last.close, high: last.close, low: last.close, close: last.close,
-        volume: 0, live: true,
-      });
+    // ── Bucket boundary crossed ───────────────────────────────────
+    // Only push new candles if equity moved OR we have open trades.
+    // If flat with no trades, just slide the current candle's timestamp
+    // forward so it doesn't look like a spike when movement resumes.
+    if (!equityChanged && !hasOpenTrades) {
+      // Silently extend — move the last candle to the current bucket
+      // so the chart shows a flat line instead of creating doji spam
+      last.time = new Date(key);
+      last.open = last.close = last.high = last.low = v;
+      _liveCandleLastBucketKey = key;
+      // Redraw price label every 10s so it stays fresh
+      const now2 = Date.now();
+      if (!tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 10000) {
+        tickLiveCandle._lastRedraw = now2;
+        redrawChart();
+      }
+      return;
     }
+
+    // Equity moved or trades are open — create real new candle(s)
+    // Skip gap-fill dojis; they make the chart look like a flat spike farm
     chart.allCandles.push({
       time:   new Date(key),
       open:   last.close,
       high:   Math.max(last.close, v),
       low:    Math.min(last.close, v),
       close:  v,
-      volume: 1, live: true,
+      volume: equityChanged ? 1 : 0,
+      live:   true,
     });
     _liveCandleLastBucketKey = key;
     if (wasAtEdge) chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
@@ -2836,16 +2856,14 @@ function tickLiveCandle() {
   }
 
   // ── Same bucket — update OHLC in place ───────────────────────────
-  // Always update — even flat equity needs high/low tracking
   const prevClose = last.close;
   last.close = v;
   if (v > last.high) last.high = v;
   if (v < last.low)  last.low  = v;
 
-  // Redraw on any value change, or heartbeat every 3s to keep price label fresh
-  const changed = v !== prevClose || v > last.high || v < last.low;
-  const now2    = Date.now();
-  const heartbeat = !tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 3000;
+  const changed   = v !== prevClose;
+  const now2      = Date.now();
+  const heartbeat = !tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 5000;
   if (changed || heartbeat) {
     tickLiveCandle._lastRedraw = now2;
     redrawChart();
@@ -2870,44 +2888,45 @@ function buildCandlesForTF(snapshots, tf) {
   const keys = Object.keys(buckets).map(Number).sort((a, b) => a - b);
   if (keys.length < 1) return [];
 
-  // Forward-fill empty buckets between the first and last snapshot so the
-  // chart is continuous. Without fill, a 3-hour gap with no trades meant
-  // the next bucket opened at the old value → phantom gap candle.
+  // Build candles from real snapshot buckets only — NO forward-fill of flat gaps.
+  // Flat periods (no trades, equity unchanged) should appear as a flat line,
+  // not hundreds of identical doji candles that make the chart look broken.
   //
-  // CAP: don't forward-fill across gaps larger than 24 buckets (e.g. 2h on
-  // 5M tf). Long pauses (overnight, weekends, sim rebooting) otherwise
-  // create hundreds of identical doji candles that compress the active
-  // trading periods into invisible slivers. Instead we leave the gap and
-  // continue from the next real snapshot — the chart shows two clusters
-  // of activity with a visual break between them.
-  const MAX_FILL_BUCKETS = 24;
+  // Strategy: only emit a candle if equity actually moved from the previous close.
+  // Consecutive flat buckets get merged into one extended candle (its time just
+  // slides forward). This matches TradingView's behaviour on low-activity charts.
+  const FLAT_THRESHOLD = 0.50; // $0.50 — below this, treat as flat
   const filled = [];
   let lastClose = null;
+  let flatCandle = null; // accumulates flat periods into one visual candle
+
   for (let i = 0; i < keys.length; i++) {
     const key = keys[i];
-    if (i > 0) {
-      const prevKey = keys[i - 1];
-      const gapBuckets = Math.floor((key - prevKey) / bucketMs) - 1;
-      if (gapBuckets > 0 && gapBuckets <= MAX_FILL_BUCKETS) {
-        for (let t = prevKey + bucketMs; t < key; t += bucketMs) {
-          filled.push({
-            time: new Date(t),
-            open: lastClose, high: lastClose, low: lastClose, close: lastClose,
-            volume: 0,
-          });
-        }
-      }
-      // For larger gaps, just skip — chart will show a horizontal time
-      // jump between the two activity clusters. This is the right visual
-      // signal: "nothing happened here, fast-forward".
-    }
-    const b = buckets[key];
-    const v = b.values;
+    const b   = buckets[key];
+    const v   = b.values;
     const open  = lastClose != null ? lastClose : v[0];
     const close = v[v.length - 1];
     const high  = Math.max(open, close, ...v);
     const low   = Math.min(open, close, ...v);
-    filled.push({ time: b.time, open, high, low, close, volume: v.length });
+    const moved = lastClose == null || Math.abs(close - lastClose) > FLAT_THRESHOLD;
+
+    if (!moved) {
+      // Equity flat — extend the flat candle's timestamp but don't emit a new one
+      if (flatCandle) {
+        flatCandle.time  = b.time; // slide time forward
+        flatCandle.close = close;
+        flatCandle.high  = Math.max(flatCandle.high, high);
+        flatCandle.low   = Math.min(flatCandle.low,  low);
+      } else {
+        // Start a flat candle
+        flatCandle = { time: b.time, open, high, low, close, volume: v.length };
+        filled.push(flatCandle);
+      }
+    } else {
+      // Equity moved — flush flat candle if pending, then emit real candle
+      flatCandle = null;
+      filled.push({ time: b.time, open, high, low, close, volume: v.length });
+    }
     lastClose = close;
   }
 
