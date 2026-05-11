@@ -2064,12 +2064,22 @@ async function connectPolygon() {
           if (msg.ev==='status' && msg.status==='auth_success') {
             polygonConnected = true;
             log('stream', '✅ Polygon.io real-time feed live');
-            subscribePolygon([...Object.keys(positions),...Object.keys(shortPositions)]);
+            // Subscribe to full watchlist for instant price ticks — not just open positions
+            const watchAll = [...new Set([
+              ...CONFIG.symbols.slice(0, 80), // top 80 from watchlist
+              ...Object.keys(positions),
+              ...Object.keys(shortPositions),
+              ...Object.keys(scalpPositions),
+            ])];
+            subscribePolygon(watchAll);
+            log('stream', `📡 Polygon subscribed to ${watchAll.length} symbols`);
           }
           // Real-time quote (bid/ask mid)
           if (msg.ev==='Q') {
             const sym=msg.sym, mid=((msg.bp||0)+(msg.ap||0))/2;
             if (!sym||!mid) continue;
+            // Update live price — managePosition reads this every 5s
+            alpacaLivePrice[sym] = mid;
             if (!priceHistory5m[sym]) priceHistory5m[sym]=[];
             const last=priceHistory5m[sym][priceHistory5m[sym].length-1];
             if (!last||Math.abs(mid-last)/last>0.00005) {
@@ -2078,6 +2088,14 @@ async function connectPolygon() {
             }
             if (liveBar[sym]) { liveBar[sym].c=mid; liveBar[sym].h=Math.max(liveBar[sym].h,mid); liveBar[sym].l=Math.min(liveBar[sym].l,mid); }
             if (positions[sym]) { if (mid>positions[sym].highWater) positions[sym].highWater=mid; if (mid<(positions[sym].lowWater||mid)) positions[sym].lowWater=mid; }
+            // Fast-signal: if we have bars cached and no position, check for entry on big moves
+            // Throttle per symbol: max 1 signal check per 10s to avoid spam
+            const _now = Date.now();
+            if (!positions[sym] && !shortPositions[sym] && !scalpPositions[sym] &&
+                barCache.has(`${sym}_5Min`) && (!_tickSignalThrottle[sym] || _now - _tickSignalThrottle[sym] > 10000)) {
+              _tickSignalThrottle[sym] = _now;
+              _tickSignalQueue.add(sym); // process in next tick loop
+            }
           }
           // Real-time trade print
           if (msg.ev==='T') {
@@ -2106,6 +2124,8 @@ function subscribePolygon(syms) {
 // Gets injected into the bars array on every managePosition call
 // This is what makes indicators (ATR, RSI) update at tick speed not bar-close speed
 let liveBar = {}; // sym → { time, t, o, h, l, c, v }
+const _tickSignalThrottle = {}; // sym → lastCheckMs — prevents signal spam on every tick
+const _tickSignalQueue    = new Set(); // symbols queued for fast signal check
 
 // Inject the live (incomplete) current bar into a bars array
 // Replaces the last bar if it's in the same 5-min window, otherwise appends
@@ -6244,13 +6264,19 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
 }
 
 // Cover a short position (buy back the borrowed shares)
-const _coverInFlight = new Set();
+const _coverInFlight  = new Set();
+const _recentlyCovered = {}; // sym → timestamp, blocks re-cover within 60s
 
 async function coverShort(sym, price, reason) {
   const pos = shortPositions[sym];
   if (!pos) return;
   if (_coverInFlight.has(sym)) {
     log('warn', `⚠️ ${sym} cover already in-flight — skipping duplicate`);
+    return;
+  }
+  // Block re-cover within 60s of last successful cover (catches race with reconcile)
+  if (_recentlyCovered[sym] && Date.now() - _recentlyCovered[sym] < 60000) {
+    log('warn', `⚠️ ${sym} covered ${Math.round((Date.now()-_recentlyCovered[sym])/1000)}s ago — skipping duplicate`);
     return;
   }
   _coverInFlight.add(sym);
@@ -6306,8 +6332,9 @@ async function coverShort(sym, price, reason) {
   trades.push({ time: new Date(), sym, side: 'COVER', qty, price, pnl, reason });
   await sendDiscordAlert('cover', sym, qty, price, pnl, reason);
   await syncTrade({ sym, side: 'COVER', qty, price, pnl, reason });
-  await syncAll();
+  _recentlyCovered[sym] = Date.now(); // block re-cover for 60s
   _coverInFlight.delete(sym);
+  await syncPortfolio(); // only update portfolio — don't trigger full position reconcile
   await syncLog('sell', `${icon} COVER ${qty}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
 
   // Trigger recovery on short losses too
@@ -6501,7 +6528,8 @@ async function partialExit(sym, price, qtyToSell, reason) {
   await syncPortfolio();
 }
 
-const _exitInFlight = new Set(); // per-symbol exit lock — prevents looping on partial fills
+const _exitInFlight   = new Set();
+const _recentlyExited = {}; // sym → timestamp, blocks re-exit within 60s
 
 async function exitPosition(sym, price, reason) {
   const pos = positions[sym];
@@ -6513,6 +6541,10 @@ async function exitPosition(sym, price, reason) {
   // another sell. With partial fills this loops indefinitely.
   if (_exitInFlight.has(sym)) {
     log('warn', `⚠️ ${sym} exit already in-flight — skipping duplicate`);
+    return;
+  }
+  if (_recentlyExited[sym] && Date.now() - _recentlyExited[sym] < 60000) {
+    log('warn', `⚠️ ${sym} exited ${Math.round((Date.now()-_recentlyExited[sym])/1000)}s ago — skipping duplicate`);
     return;
   }
   _exitInFlight.add(sym);
@@ -6574,9 +6606,10 @@ async function exitPosition(sym, price, reason) {
   log('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
   await sendDiscordAlert('sell', sym, qtyToSell, price, pnl, reason);
   await syncTrade({ sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
-  await syncAll();
-  await syncLog('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`);
-  _exitInFlight.delete(sym); // release lock after full exit
+  _recentlyExited[sym] = Date.now();
+  _exitInFlight.delete(sym);
+  await syncPortfolio();
+  await syncLog('sell', `${icon} SELL ${qtyToSell}x ${sym} @ $${price.toFixed(2)} P&L=${pnl>=0?'+':''}$${pnl.toFixed(2)} (${reason})`)
 
   // ── RECOVERY MODE ─────────────────────────────────────────────
   if (pnl < 0 && CONFIG.recoveryMode && !isSimMode()) {
@@ -7697,6 +7730,8 @@ async function syncAlpacaPositions() {
       const posAge = positions[sym]?.entryTime
         ? (reconcileNow - new Date(positions[sym].entryTime).getTime()) / 1000 : 999;
       if (posAge < 45) continue;
+      // Skip if an exit is already in-flight
+      if (_exitInFlight.has(sym)) continue;
       if (liveSymbols.has(sym)) continue;
 
       // Snapshot the position object, then remove from memory SYNCHRONOUSLY
@@ -7732,6 +7767,8 @@ async function syncAlpacaPositions() {
       const shortAge = shortPositions[sym]?.entryTime
         ? (reconcileNow - new Date(shortPositions[sym].entryTime).getTime()) / 1000 : 999;
       if (shortAge < 45) continue;
+      if (_coverInFlight.has(sym)) continue; // cover already in progress
+      if (_recentlyCovered[sym] && Date.now() - _recentlyCovered[sym] < 60000) continue; // covered recently
       if (liveSymbols.has(sym)) continue;
       const pos = shortPositions[sym];
       delete shortPositions[sym];
@@ -9141,8 +9178,8 @@ async function prewarmData() {
 let scanInProgress = false;
 let lastFullScan = 0;
 const FULL_SCAN_INTERVAL_MS = Math.max(
-  +(process.env.SCAN_INTERVAL_SEC || 15) * 1000,
-  10000 // never faster than 10s
+  +(process.env.SCAN_INTERVAL_SEC || 10) * 1000, // reduced 15s→10s (bar cache makes this cheap)
+  8000  // never faster than 8s
 );
 const PRICE_SYNC_INTERVAL_MS      = 8000;          // price updates every 8s
 const EQUITY_SNAPSHOT_INTERVAL_MS = 5 * 1000;      // equity curve point every 5s — TradingView-like update density
@@ -9203,6 +9240,31 @@ async function tick() {
     }
 
     // Full swing scan
+    // ── Tick-signal fast path ──────────────────────────────────────
+    // Process symbols queued by Polygon price ticks — these get signal checks
+    // immediately using cached bars, without waiting for the next full scan.
+    // This cuts signal latency from ~15s down to ~1-2s on price movement.
+    if (_tickSignalQueue.size > 0 && !scanInProgress) {
+      const toCheck = [..._tickSignalQueue].slice(0, 10); // max 10 per tick
+      _tickSignalQueue.clear();
+      for (const sym of toCheck) {
+        try {
+          const bars5m  = barCache.get(`${sym}_5Min`)?.bars;
+          const bars15m = barCache.get(`${sym}_15Min`)?.bars;
+          if (!bars5m || bars5m.length < 15) continue;
+          if (positions[sym] || shortPositions[sym] || scalpPositions[sym]) continue;
+          const sig = generateSignalByStrategy(sym, bars5m, bars15m) || generateSignal(sym, bars5m, bars15m);
+          if (!sig || sig.signal === 'HOLD' || (sig.confidence || 0) < CONFIG.minConfidence) continue;
+          const price = alpacaLivePrice[sym] || bars5m[bars5m.length-1]?.c;
+          if (!price) continue;
+          const edge = await edgeGate(sym, sig.signal === 'BUY' ? 'long' : 'short', sig, bars5m);
+          if (!edge.pass) continue;
+          log('scan', `⚡ Tick-signal ${sym} ${sig.signal} conf:${sig.confidence}% — fast entry`);
+          await enterPosition(sym, price, sig, bars5m, sig.signal === 'BUY' ? 'long' : 'short');
+        } catch(e) { /* non-critical */ }
+      }
+    }
+
     if (now - lastFullScan >= FULL_SCAN_INTERVAL_MS) {
       lastFullScan = now;
       await runScan();
@@ -9288,6 +9350,7 @@ cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' 
 
 // Startup — prewarm data then scan immediately
 ensureColumns().catch(() => {});
+prewarmBarCache().catch(() => {});
 // Reset adaptive RSI thresholds to defaults on startup
 // Prevents the adaptive engine from persisting paralytic values across restarts
 if (CONFIG.rsiOversold > 40) {
@@ -9301,6 +9364,23 @@ if (CONFIG.rsiOverbought < 62) {
 if (CONFIG.maxPositionPct > 0.12) {
   log('sys', `⚙️ Resetting maxPositionPct: ${(CONFIG.maxPositionPct*100).toFixed(0)}% → 10% (was too large)`);
   CONFIG.maxPositionPct = 0.10;
+}
+
+// Pre-warm bar cache on startup so first scan is instant
+async function prewarmBarCache() {
+  const topSyms = (CONFIG.symbols || []).slice(0, 40);
+  if (!topSyms.length) return;
+  log('sys', `🔥 Pre-warming bar cache for ${topSyms.length} symbols...`);
+  const BATCH = 5;
+  for (let i = 0; i < topSyms.length; i += BATCH) {
+    const batch = topSyms.slice(i, i + BATCH);
+    await Promise.allSettled(batch.map(sym => Promise.all([
+      fetchBarsCached(sym, '5Min', 100).catch(() => null),
+      fetchBarsCached(sym, '15Min', 40).catch(() => null),
+    ])));
+    await new Promise(r => setTimeout(r, 400)); // rate limit friendly
+  }
+  log('sys', `✅ Bar cache pre-warmed — first scan will be instant`);
 }
 
 loadRemoteConfig().then(async () => {
