@@ -2758,41 +2758,21 @@ async function alpacaFetch(url, opts = {}, retries = 2) {
 }
 
 async function fetchBars(symbol, timeframe, limit) {
-  // Try Alpaca first — extend to 10 days to ensure enough bars for RSI(14)
+  // ── PRIMARY: Yahoo Finance — no rate limit, no API key needed ──
+  // Alpaca is reserved for order execution only. Yahoo handles all bar data.
+  try {
+    const interval = timeframe === '5Min' ? '5m' : timeframe === '15Min' ? '15m' : timeframe === '1Hour' ? '1h' : '1d';
+    const range    = timeframe === '1Day' ? '3mo' : '7d';
+    const bars = await yahooFetchBars(symbol, interval, range);
+    if (bars?.length >= 15) return bars;
+  } catch(e) {}
+
+  // ── FALLBACK: Alpaca (only if Yahoo fails) ──
   try {
     const start = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
     const url = `${ALPACA_DATA_BASE}/v2/stocks/${symbol}/bars?timeframe=${timeframe}&start=${start}&limit=${Math.max(limit, 100)}&feed=${getDataFeed()}`;
     const data = await alpacaFetch(url);
-    // Need at least 30 bars for RSI+MACD+ADX to be meaningful
-    // If Alpaca returns too few, fall through to Yahoo
-    if (data.bars && data.bars.length >= 30) return data.bars;
-    if (data.bars && data.bars.length > 0) {
-      log('data', `${symbol} Alpaca only returned ${data.bars.length} bars — trying Yahoo`);
-    }
-  } catch (e) {}
-
-  // Fallback: Yahoo Finance (free, no key)
-  // Uses 7d range to guarantee 30+ 5-min bars even during pre-market
-  try {
-    const fetch = await getFetch();
-    const interval = timeframe === '5Min' ? '5m' : timeframe === '15Min' ? '15m' : '1d';
-    const range    = timeframe === '1Day' ? '3mo' : '7d';
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${interval}&range=${range}`;
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    const data = await res.json();
-    const result = data?.chart?.result?.[0];
-    if (!result) return null;
-    const timestamps = result.timestamp || [];
-    const q = result.indicators?.quote?.[0] || {};
-    const bars = timestamps.map((t, i) => ({
-      t: new Date(t * 1000).toISOString(),
-      o: q.open?.[i], h: q.high?.[i], l: q.low?.[i],
-      c: q.close?.[i], v: q.volume?.[i] || 0,
-    })).filter(b => b.c != null);
-    if (bars.length >= 10) {
-      log('data', `${symbol} using Yahoo Finance fallback (${bars.length} bars)`);
-      return bars;
-    }
+    if (data?.bars?.length >= 15) return data.bars;
   } catch (e) {}
 
   log('warn', `No data for ${symbol}`);
@@ -8850,6 +8830,100 @@ log('sys', `Current session: ${getCurrentSession()}`);
 // ── 1. Bar cache ──
 // Avoid re-fetching the same bars multiple times per scan cycle.
 // Bars change at most every minute, so an 8-second cache is safe.
+// ═══════════════════════════════════════════════════════════════════
+// YAHOO FINANCE BATCH SCANNER
+// ═══════════════════════════════════════════════════════════════════
+// Fetches bars for ALL symbols simultaneously using Yahoo Finance.
+// No API key, no rate limits, ~100 symbols in parallel in <3 seconds.
+// Used for signal scanning — Alpaca is reserved for order execution.
+//
+// Two endpoints:
+//   /v8/finance/chart/{sym}   — historical bars (5m, 15m, 1h, 1d)
+//   /v7/finance/quote          — real-time price quotes (batch, up to 50)
+// ═══════════════════════════════════════════════════════════════════
+
+// Fetch 5m bars for one symbol from Yahoo (no key, no rate limit)
+async function yahooFetchBars(symbol, interval = '5m', range = '5d') {
+  const fetch = await getFetch();
+  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${interval}&range=${range}`;
+  try {
+    const res  = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data   = await res.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) return null;
+    const timestamps = result.timestamp || [];
+    const q = result.indicators?.quote?.[0] || {};
+    const bars = timestamps.map((t, i) => ({
+      t: new Date(t * 1000).toISOString(),
+      o: q.open?.[i], h: q.high?.[i], l: q.low?.[i],
+      c: q.close?.[i], v: q.volume?.[i] || 0,
+    })).filter(b => b.c != null && b.h != null && b.l != null);
+    return bars.length >= 10 ? bars : null;
+  } catch(e) { return null; }
+}
+
+// Batch fetch real-time quotes for up to 50 symbols at once
+// Returns { SYM: price } map — instant, no rate limit
+async function yahooBatchQuotes(symbols) {
+  if (!symbols?.length) return {};
+  const fetch = await getFetch();
+  const result = {};
+  // Yahoo /quote accepts comma-separated symbols, max 50
+  for (let i = 0; i < symbols.length; i += 50) {
+    const batch = symbols.slice(i, i + 50);
+    try {
+      const url = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${batch.join(',')}&fields=regularMarketPrice,bid,ask`;
+      const res  = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const quotes = data?.quoteResponse?.result || [];
+      for (const q of quotes) {
+        if (q.regularMarketPrice) result[q.symbol] = q.regularMarketPrice;
+      }
+    } catch(e) {}
+  }
+  return result;
+}
+
+// Batch scan ALL symbols using Yahoo Finance in parallel
+// Splits into groups of 20 concurrent fetches, returns barData map
+async function yahooBatchScanBars(symbols, timeframe = '5m', range = '5d') {
+  if (!symbols?.length) return {};
+  const CONCURRENCY = 20; // Yahoo handles 20 concurrent requests fine
+  const result = {};
+  const t0 = Date.now();
+
+  for (let i = 0; i < symbols.length; i += CONCURRENCY) {
+    const batch = symbols.slice(i, i + CONCURRENCY);
+    const settled = await Promise.allSettled(
+      batch.map(async sym => {
+        const bars = await yahooFetchBars(sym, timeframe, range);
+        return { sym, bars };
+      })
+    );
+    for (const r of settled) {
+      if (r.status === 'fulfilled' && r.value?.bars?.length >= 15) {
+        result[r.value.sym] = r.value.bars;
+      }
+    }
+    // Small courtesy delay between groups — Yahoo is lenient but not infinite
+    if (i + CONCURRENCY < symbols.length) {
+      await new Promise(r => setTimeout(r, 120));
+    }
+  }
+
+  const count = Object.keys(result).length;
+  log('scan', `📊 Yahoo batch: ${count}/${symbols.length} symbols in ${((Date.now()-t0)/1000).toFixed(1)}s`);
+  return result;
+}
+
 const barCache = new Map(); // `SYM_TF` → { bars, ts }
 // TTL by timeframe — no point re-fetching a 5m bar before the next 5m closes.
 // This is the single biggest API call reducer: cache hit = zero network req.
@@ -8876,51 +8950,78 @@ async function fetchBarsCached(symbol, timeframe, limit) {
 // Old: fetched symbols one-by-one (symbol 15 waited for symbols 1-14)
 // New: fetch all symbols simultaneously → scan time drops ~10x
 async function fetchAllBarsParallel(symbols) {
-  // Stagger requests in batches of 3 to avoid rate limiting
-  // Alpaca free tier: 200 req/min. Each symbol needs 2 calls (5m + 15m).
-  // 102 symbols = 204 calls. At 200/min limit we need ≥ 61s — we achieve
-  // this by batching 5 symbols (10 calls) with 350ms gap = ~7s/batch × 21 batches = 147s total.
-  // BUT: in-memory cache (fetchBarsCached) skips re-fetching bars < 90s old,
-  // so subsequent scans within the same minute are nearly free.
+  // ── PRIMARY: Yahoo Finance batch — all symbols at once, no rate limit ──
+  // Yahoo Finance has no API key requirement and handles 100+ concurrent
+  // requests. This replaces the old Alpaca-per-symbol batching which took
+  // 30-147 seconds and constantly hit the 200 req/min limit.
   //
-  // Target: stay under 180 req/min (10% safety margin).
-  // Formula: delay = Math.ceil((BATCH_SIZE * 2) / (180/60) * 1000) = 333ms per batch of 5
-  const BATCH_SIZE = 5;
-  const BATCH_DELAY = 350; // ms between batches — keeps us at ~171 req/min max
+  // Strategy: fetch 5m bars from Yahoo for all symbols in parallel groups
+  // of 20. For 15m bars, check bar cache first (TTL=4min) — only refetch
+  // if stale. Alpaca is only used as fallback if Yahoo returns no data.
+  const t0 = Date.now();
   const results = [];
-  let rateLimitBackoff = 0; // increases if we still hit limits
+  const CONCURRENCY = 20;
 
-  for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
-    const batch = symbols.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.allSettled(
-      batch.map(async sym => {
-        const [bars5m, bars15m] = await Promise.all([
-          fetchBarsCached(sym, '5Min',  100),
-          fetchBarsCached(sym, '15Min', 40),
-        ]);
-        return { sym, bars5m, bars15m };
-      })
-    );
+  // Check which symbols need fresh 5m bars (cache miss)
+  const needFresh5m  = symbols.filter(s => {
+    const hit = barCache.get(`${s}_5Min`);
+    return !hit || Date.now() - hit.ts > BAR_CACHE_TTL_MAP['5Min'];
+  });
+  const needFresh15m = symbols.filter(s => {
+    const hit = barCache.get(`${s}_15Min`);
+    return !hit || Date.now() - hit.ts > BAR_CACHE_TTL_MAP['15Min'];
+  });
 
-    // Check if this batch hit rate limits — increase backoff if so
-    const hadRateLimit = batchResults.some(r =>
-      r.status === 'rejected' && r.reason?.message?.includes('rate limit')
-    );
-    if (hadRateLimit) {
-      rateLimitBackoff = Math.min(rateLimitBackoff + 200, 1000);
-    } else if (rateLimitBackoff > 0) {
-      rateLimitBackoff = Math.max(0, rateLimitBackoff - 50); // recover slowly
-    }
+  // Fetch 5m bars for cache-miss symbols in parallel via Yahoo
+  const yahoo5m  = {};
+  const yahoo15m = {};
 
-    results.push(...batchResults);
-
-    if (i + BATCH_SIZE < symbols.length) {
-      await new Promise(r => setTimeout(r, BATCH_DELAY + rateLimitBackoff));
+  if (needFresh5m.length > 0) {
+    for (let i = 0; i < needFresh5m.length; i += CONCURRENCY) {
+      const batch = needFresh5m.slice(i, i + CONCURRENCY);
+      const settled = await Promise.allSettled(
+        batch.map(async sym => ({ sym, bars: await yahooFetchBars(sym, '5m', '5d') }))
+      );
+      for (const r of settled) {
+        if (r.status === 'fulfilled' && r.value?.bars?.length >= 15) {
+          yahoo5m[r.value.sym] = r.value.bars;
+          barCache.set(`${r.value.sym}_5Min`, { bars: r.value.bars, ts: Date.now() });
+        }
+      }
+      if (i + CONCURRENCY < needFresh5m.length) await new Promise(r => setTimeout(r, 100));
     }
   }
-  return results
-    .filter(r => r.status === 'fulfilled' && r.value.bars5m)
-    .map(r => r.value);
+
+  // Fetch 15m bars for cache-miss symbols
+  if (needFresh15m.length > 0) {
+    for (let i = 0; i < needFresh15m.length; i += CONCURRENCY) {
+      const batch = needFresh15m.slice(i, i + CONCURRENCY);
+      const settled = await Promise.allSettled(
+        batch.map(async sym => ({ sym, bars: await yahooFetchBars(sym, '15m', '7d') }))
+      );
+      for (const r of settled) {
+        if (r.status === 'fulfilled' && r.value?.bars?.length >= 10) {
+          yahoo15m[r.value.sym] = r.value.bars;
+          barCache.set(`${r.value.sym}_15Min`, { bars: r.value.bars, ts: Date.now() });
+        }
+      }
+      if (i + CONCURRENCY < needFresh15m.length) await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  // Assemble results — use Yahoo data, fall back to cache, then Alpaca
+  for (const sym of symbols) {
+    const cached5m  = barCache.get(`${sym}_5Min`);
+    const cached15m = barCache.get(`${sym}_15Min`);
+    const bars5m    = yahoo5m[sym]  || cached5m?.bars  || await fetchBarsCached(sym, '5Min',  60).catch(() => null);
+    const bars15m   = yahoo15m[sym] || cached15m?.bars || await fetchBarsCached(sym, '15Min', 40).catch(() => null);
+    if (bars5m?.length >= 15) results.push({ sym, bars5m, bars15m: bars15m || [] });
+  }
+
+  const fresh = needFresh5m.length;
+  const cached = symbols.length - fresh;
+  log('scan', `📊 Bars: ${results.length}/${symbols.length} symbols | ${fresh} fresh (Yahoo) ${cached} cached | ${Date.now()-t0}ms`);
+  return results;
 }
 
 // ── 3. Latest trade price (real-time, not bar close) ──
