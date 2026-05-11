@@ -2799,9 +2799,10 @@ async function fetchBars(symbol, timeframe, limit) {
   // Auto-bench after repeated failures to stop wasting scan slots
   if (!fetchBars._failCount) fetchBars._failCount = {};
   fetchBars._failCount[symbol] = (fetchBars._failCount[symbol] || 0) + 1;
-  if (fetchBars._failCount[symbol] >= 5) {
-    log('sys', `🚫 Auto-benching ${symbol} — no data after 5 attempts`);
-    if (typeof benchSym === 'function') benchSym(symbol, 'no_data');
+  if (fetchBars._failCount[symbol] >= 3) { // was 5 — bench faster
+    log('sys', `🚫 Auto-benching ${symbol} — no data after ${fetchBars._failCount[symbol]} attempts`);
+    // Remove from CONFIG.symbols so it stops getting scanned
+    CONFIG.symbols = CONFIG.symbols.filter(s => s !== symbol);
     fetchBars._failCount[symbol] = 0;
   }
   return null;
@@ -6025,10 +6026,15 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   // This is the most important risk rule. One bad trade (RBLX -$7k) erases
   // weeks of small wins. 10% cap = max possible loss on one trade is 1% of
   // account (10% position × 10% adverse move before stop fires).
-  const maxPositionDollars = (realEquity > 0 ? realEquity : CONFIG.startingCapital) * 0.10; // 10% of account
+  const accountBase = realEquity > 0 ? realEquity : CONFIG.startingCapital;
+  // High-volatility stocks (ATR > 1.5% of price) get tighter cap — TSLA at $395 with 2% ATR
+  // means $7.90/share daily move. Need smaller positions or stops blow through immediately.
+  const atrPctNow = sigInfo?.atr ? sigInfo.atr / price : 0.01;
+  const capPct = atrPctNow > 0.015 ? 0.06 : 0.10; // 6% for high-vol, 10% normal
+  const maxPositionDollars = accountBase * capPct;
   const maxQtyByCap = Math.floor(maxPositionDollars / price);
   if (finalQty > maxQtyByCap && maxQtyByCap >= 1) {
-    log('risk', `📏 ${sym} qty capped: ${finalQty} → ${maxQtyByCap} (10% account cap, $${maxPositionDollars.toFixed(0)} max)`);
+    log('risk', `📏 ${sym} qty capped: ${finalQty} → ${maxQtyByCap} (${(capPct*100).toFixed(0)}% cap, ATR=${(atrPctNow*100).toFixed(2)}%)`);
     finalQty = maxQtyByCap;
   }
 
@@ -7729,9 +7735,10 @@ async function syncAlpacaPositions() {
       // from partial fills that haven't settled in Alpaca yet (ARM loop bug)
       const posAge = positions[sym]?.entryTime
         ? (reconcileNow - new Date(positions[sym].entryTime).getTime()) / 1000 : 999;
-      if (posAge < 45) continue;
+      if (posAge < 90) continue; // was 45s — Alpaca fill settlement can take 60s+ AH
       // Skip if an exit is already in-flight
       if (_exitInFlight.has(sym)) continue;
+      if (_recentlyExited[sym] && Date.now() - _recentlyExited[sym] < 90000) continue;
       if (liveSymbols.has(sym)) continue;
 
       // Snapshot the position object, then remove from memory SYNCHRONOUSLY
@@ -7766,9 +7773,9 @@ async function syncAlpacaPositions() {
     for (const sym of Object.keys(shortPositions)) {
       const shortAge = shortPositions[sym]?.entryTime
         ? (reconcileNow - new Date(shortPositions[sym].entryTime).getTime()) / 1000 : 999;
-      if (shortAge < 45) continue;
-      if (_coverInFlight.has(sym)) continue; // cover already in progress
-      if (_recentlyCovered[sym] && Date.now() - _recentlyCovered[sym] < 60000) continue; // covered recently
+      if (shortAge < 90) continue;
+      if (_coverInFlight.has(sym)) continue;
+      if (_recentlyCovered[sym] && Date.now() - _recentlyCovered[sym] < 90000) continue; // covered recently
       if (liveSymbols.has(sym)) continue;
       const pos = shortPositions[sym];
       delete shortPositions[sym];
@@ -8944,7 +8951,11 @@ async function spreadIsAcceptable(symbol, price) {
     const quote = data?.quote;
     if (!quote?.ap || !quote?.bp) return true; // can't check — allow
     const spreadPct = (quote.ap - quote.bp) / price;
-    const maxSpread = 0.005; // 0.5% max spread — was 0.15% which blocked PANW/SNOW on normal volatile days
+    // After-hours spreads are naturally wide (8-15%) — don't filter them
+    // Only enforce spread during regular market hours
+    const etHr = getETTime().getHours();
+    const isRegularHours = etHr >= 9 && etHr < 16;
+    const maxSpread = isRegularHours ? 0.005 : 0.15; // 0.5% regular, 15% extended
     if (spreadPct > maxSpread) {
       log('filter', `${symbol} spread too wide: ${(spreadPct*100).toFixed(3)}% — skipping`);
       return false;
@@ -9351,20 +9362,16 @@ cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' 
 // Startup — prewarm data then scan immediately
 ensureColumns().catch(() => {});
 prewarmBarCache().catch(() => {});
-// Reset adaptive RSI thresholds to defaults on startup
-// Prevents the adaptive engine from persisting paralytic values across restarts
-if (CONFIG.rsiOversold > 40) {
-  log('sys', `⚙️ Resetting rsiOversold: ${CONFIG.rsiOversold} → 35 (was too tight)`);
-  CONFIG.rsiOversold = 35;
-}
-if (CONFIG.rsiOverbought < 62) {
-  log('sys', `⚙️ Resetting rsiOverbought: ${CONFIG.rsiOverbought} → 65 (was too tight)`);
-  CONFIG.rsiOverbought = 65;
-}
-if (CONFIG.maxPositionPct > 0.12) {
-  log('sys', `⚙️ Resetting maxPositionPct: ${(CONFIG.maxPositionPct*100).toFixed(0)}% → 10% (was too large)`);
-  CONFIG.maxPositionPct = 0.10;
-}
+// Hard reset adaptive params on every startup — prevents paralytic drift across restarts
+// These values are relearned from scratch each session
+CONFIG.rsiOversold   = 35;
+CONFIG.rsiOverbought = 65;
+CONFIG.minConfidence = 62;
+CONFIG.maxPositionPct = 0.10;
+CONFIG.adaptTargetWR  = 0.65;
+CONFIG.strategy       = CONFIG.strategy || 'rsi_macd';
+CONFIG._activeStrategy = CONFIG.strategy;
+log('sys', `⚙️ Adaptive params reset: RSI ${CONFIG.rsiOversold}/${CONFIG.rsiOverbought} conf:${CONFIG.minConfidence} pos:${(CONFIG.maxPositionPct*100).toFixed(0)}% strategy:${CONFIG.strategy}`);
 
 // Pre-warm bar cache on startup so first scan is instant
 async function prewarmBarCache() {
