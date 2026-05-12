@@ -96,7 +96,7 @@ const CONFIG = {
   tp3Pct:            +(process.env.TP3_PCT           || 5.0) / 100, // sell rest at +5%
   timeStopHours:     +(process.env.TIME_STOP_HOURS   || 6),        // exit flat trade after N hours
   timeStopMinPct:    +(process.env.TIME_STOP_MIN_PCT || 0.5) / 100,// only exit if gain < X%
-  atrStopMult:       +(process.env.ATR_STOP_MULT     || 2.0),      // SL = entry - (ATR * mult)
+  atrStopMult:       +(process.env.ATR_STOP_MULT     || 1.5),      // SL = entry ± (ATR × mult) — reduced 2.0→1.5
   volSqueezePct:     +(process.env.VOL_SQUEEZE_PCT   || 50) / 100, // exit if ATR drops X% vs entry ATR
 
   trendFilter:       process.env.TREND_FILTER  !== 'false',
@@ -439,7 +439,7 @@ const ADAPT_DEFAULTS = {
   rsiOversold:    35,   // reset on every restart if adaptive drifted too tight
   rsiOverbought:  65,
   minConfidence:  62,
-  atrStopMult:    2.0,
+  atrStopMult:    1.5, // was 2.0 — tighter stops, less risk per trade
   maxPositionPct: 0.10, // hard cap 10% — RBLX trade was 30%, wiped weeks of gains
   tp1Pct:         0.015,
   tp2Pct:         0.030,
@@ -451,7 +451,7 @@ const ADAPT_BOUNDS = {
   rsiOversold:    { min: 25, max: 40 }, // was 18-45 — cap at 40 so never blocks liquid stocks
   rsiOverbought:  { min: 60, max: 75 }, // was 55-82 — floor at 60
   minConfidence:  { min: 55, max: 75 }, // was 60-80, cap at 75 so bot doesn't freeze   // was 60-92 — 92 was so high almost nothing qualified, paralyzed the bot
-  atrStopMult:    { min: 1.5, max: 2.5 }, // hard cap — 3.5x caused $2900 loss
+  atrStopMult:    { min: 1.2, max: 2.0 }, // hard cap 2.0 — above that stops are too wide
   maxPositionPct: { min: 0.03, max: 0.12 }, // hard cap 12% — RBLX -$7k was 30%
   tp1Pct:         { min: 0.010, max: 0.030 },
   tp2Pct:         { min: 0.025, max: 0.060 },
@@ -5514,21 +5514,18 @@ function generateSignal(sym, bars5m, bars15m) {
     atrPct: atrVal / (price || 1),
   });
 
-  // Apply key-level scoring
-  const keySig = applyKeyLevelScoring(apexSig, sym, bars5m);
-
   // Momentum overlay: big moves confirm technical signals → boost confidence
   const momSig = signalMomentumBreakout(sym, bars5m);
-  if (momSig && keySig?.signal !== 'HOLD' && momSig.signal === keySig?.signal) {
+  if (momSig && apexSig?.signal !== 'HOLD' && momSig.signal === apexSig?.signal) {
     return {
-      ...keySig,
-      score:      (keySig.score || 0) + momSig.score,
-      confidence: Math.min(97, (keySig.confidence || 0) + 15),
-      reasons:    [...(keySig.reasons || []), `⚡ Momentum: ${(momSig.movePct*100).toFixed(2)}% move ${momSig.volRatio.toFixed(1)}x vol`],
+      ...apexSig,
+      score:      (apexSig.score || 0) + momSig.score,
+      confidence: Math.min(97, (apexSig.confidence || 0) + 15),
+      reasons:    [...(apexSig.reasons || []), `⚡ Momentum: ${(momSig.movePct*100).toFixed(2)}% move ${momSig.volRatio.toFixed(1)}x vol`],
       isMomentumConfirmed: true,
     };
   }
-  return keySig;
+  return apexSig;
 }
 
 // ─────────────────────────────────────────────
@@ -6201,14 +6198,21 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     // With immediate trailing stops, we use a tighter initial stop
     // The trade only needs to go +0.3% before break-even locks in
     // So initial stop should be just wide enough to avoid normal noise
-    const atrVal14  = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
-    // Stop = 2× ATR below entry — wide enough to avoid noise, tight enough to limit loss
-    // Stop = min(2×ATR, hardMaxLoss%) — whichever is TIGHTER (higher price)
-    // This enforces R:R: if ATR is wide, stop still respects hardMaxLoss
-    const hardMaxPct = CONFIG.hardMaxLoss || 0.015;
+    // ATR for stop calculation — use 5-min bars only, never daily
+    // TSLA daily ATR=~$26 → 2x = $52 stop. That wiped $995 yesterday.
+    // 5-min ATR for TSLA = ~$1-2 → 2x = $2-4 stop. Much better.
+    const rawAtr    = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
+    // Hard cap: ATR used for stops can never exceed 0.8% of price
+    // This prevents daily/weekly bar ATR from creating massive stops
+    const maxAtrForStop = price * 0.008; // 0.8% max ATR
+    const atrVal14  = Math.min(rawAtr, maxAtrForStop);
+
+    // Stop distance: 2×ATR but NEVER more than 2% from entry
+    const hardMaxPct = Math.min(CONFIG.hardMaxLoss || 0.015, 0.020); // hard cap 2%
     const atrStop   = price - (atrVal14 * CONFIG.atrStopMult);
     const capStop   = price * (1 - hardMaxPct);
     const stopPrice = Math.max(atrStop, capStop); // higher = tighter for longs
+    log('risk', `${sym} stop: $${stopPrice.toFixed(2)} (ATR=$${atrVal14.toFixed(2)} cap=$${capStop.toFixed(2)} dist=${((price-stopPrice)/price*100).toFixed(2)}%)`);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       // For live mode — verify Alpaca doesn't already have this position
@@ -6348,11 +6352,14 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   } else {
     // SHORT — borrow shares to sell, profit if price falls
     // Stop loss ABOVE entry for shorts — 2× ATR, capped at 1.5%
-    const atrVal14s = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
-    const hardMaxPctS = CONFIG.hardMaxLoss || 0.015;
-    const atrStopS  = price + (atrVal14s * CONFIG.atrStopMult);
-    const capStopS  = price * (1 + hardMaxPctS);
-    const stopPrice = Math.min(atrStopS, capStopS);
+    const rawAtrS    = bars && bars.length >= 14 ? atr(bars, 14) : price * 0.005;
+    const maxAtrS    = price * 0.008; // cap at 0.8% — prevents daily bar ATR blowing stops
+    const atrVal14s  = Math.min(rawAtrS, maxAtrS);
+    const hardMaxPctS = Math.min(CONFIG.hardMaxLoss || 0.015, 0.020); // never more than 2%
+    const atrStopS   = price + (atrVal14s * CONFIG.atrStopMult);
+    const capStopS   = price * (1 + hardMaxPctS);
+    const stopPrice  = Math.min(atrStopS, capStopS);
+    log('risk', `${sym} short stop: $${stopPrice.toFixed(2)} (dist=${((stopPrice-price)/price*100).toFixed(2)}%)`);
 
     if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
       // Pre-entry stale-price guard (same rationale as long branch)
