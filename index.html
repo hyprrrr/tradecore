@@ -1248,6 +1248,13 @@
             <span class="toggle-slider"></span>
           </label>
         </div>
+        <div class="control-row">
+          <span class="control-label" title="AI reads news headlines to catch catalyst moves like TSLA +8%. Uses ~$0.01/day. Disabled in sim mode automatically.">AI News 📰</span>
+          <label class="toggle">
+            <input type="checkbox" id="aiNewsToggle" onchange="toggleSetting('ai_news_enabled', this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
       </div>
       <div style="padding: 8px 14px; border-top: 1px solid var(--border); display: flex; gap: 8px;">
         <button class="btn btn-outline btn-sm" style="flex:1;" onclick="resetCircuit()">Reset CB</button>
@@ -1793,7 +1800,18 @@ async function fetchEquity() {
   // bucket while Alpaca reported a $96k account. Now the chart can never
   // disagree with Alpaca.
   const tbl = state.mode === 'sim' ? 'sim_tc_equity' : 'tc_equity';
-  const since = new Date(Date.now() - 30*24*60*60*1000).toISOString();
+  // Range based on selected timeframe — don't pull 30 days when viewing 5M chart
+  // That causes Y-axis to span full account history ($83k-$118k) and squishes today's candles
+  const tfRangeMs = {
+    '5M':  1  * 24*60*60*1000,  // 5m chart  = today only
+    '15M': 2  * 24*60*60*1000,  // 15m chart = 2 days
+    '30M': 3  * 24*60*60*1000,  // 30m chart = 3 days
+    '1H':  7  * 24*60*60*1000,  // 1h chart  = 1 week
+    '4H':  14 * 24*60*60*1000,  // 4h chart  = 2 weeks
+    '1D':  90 * 24*60*60*1000,  // 1d chart  = 3 months
+  };
+  const rangeMs = tfRangeMs[chart?.tf || '5M'] || 1 * 24*60*60*1000;
+  const since = new Date(Date.now() - rangeMs).toISOString();
   const data = await sbFetch(
     `${tbl}?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=500`,
     'GET'
@@ -2467,6 +2485,7 @@ function updateSettingsUI(s) {
   $('shortsToggle').checked = !!s.shorts_enabled;
   $('swingToggle').checked = s.swing_enabled !== false;
   $('recoveryToggle').checked = !!s.recovery_mode;
+  if ($('aiNewsToggle')) $('aiNewsToggle').checked = s.ai_news_enabled !== false;
 }
 
 function renderPositions(positions) {
@@ -2888,18 +2907,10 @@ function buildCandlesForTF(snapshots, tf) {
   const keys = Object.keys(buckets).map(Number).sort((a, b) => a - b);
   if (keys.length < 1) return [];
 
-  // Build candles from real snapshot buckets only — NO forward-fill of flat gaps.
-  // Flat periods (no trades, equity unchanged) should appear as a flat line,
-  // not hundreds of identical doji candles that make the chart look broken.
-  //
-  // Strategy: only emit a candle if equity actually moved from the previous close.
-  // Consecutive flat buckets get merged into one extended candle (its time just
-  // slides forward). This matches TradingView's behaviour on low-activity charts.
-  const FLAT_THRESHOLD = 0.50; // $0.50 — below this, treat as flat
+  // Build one candle per bucket — clean, no merging, no gaps
+  // The Y-axis range is set per TF so flat periods don't look squished
   const filled = [];
   let lastClose = null;
-  let flatCandle = null; // accumulates flat periods into one visual candle
-
   for (let i = 0; i < keys.length; i++) {
     const key = keys[i];
     const b   = buckets[key];
@@ -2908,41 +2919,32 @@ function buildCandlesForTF(snapshots, tf) {
     const close = v[v.length - 1];
     const high  = Math.max(open, close, ...v);
     const low   = Math.min(open, close, ...v);
-    const moved = lastClose == null || Math.abs(close - lastClose) > FLAT_THRESHOLD;
-
-    if (!moved) {
-      // Equity flat — extend the flat candle's timestamp but don't emit a new one
-      if (flatCandle) {
-        flatCandle.time  = b.time; // slide time forward
-        flatCandle.close = close;
-        flatCandle.high  = Math.max(flatCandle.high, high);
-        flatCandle.low   = Math.min(flatCandle.low,  low);
-      } else {
-        // Start a flat candle
-        flatCandle = { time: b.time, open, high, low, close, volume: v.length };
-        filled.push(flatCandle);
-      }
-    } else {
-      // Equity moved — flush flat candle if pending, then emit real candle
-      flatCandle = null;
-      filled.push({ time: b.time, open, high, low, close, volume: v.length });
-    }
+    filled.push({ time: b.time, open, high, low, close, volume: v.length });
     lastClose = close;
   }
-
   return filled;
 }
 
 function setTF(tf) {
-  // User-initiated timeframe change — safe to reset view.
   chart.tf = tf;
-  _liveCandleLastBucketKey = 0; // reset so tickLiveCandle re-syncs to current bucket
-  chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
-  if (!chart.allCandles.length) return;
-  // Default view: show last 60 candles (or all if fewer)
-  chart.viewCount = Math.min(100, chart.allCandles.length);
-  chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
-  if (!chart.isDragging) redrawChart();
+  chart.yScale  = 1.0;
+  chart.yOffset = 0;
+  _liveCandleLastBucketKey = 0;
+  // Re-fetch equity snapshots with the range appropriate for this TF
+  // so 5M chart only shows today and 1D shows full history
+  fetchEquity().then(() => {
+    chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
+    if (!chart.allCandles.length) return;
+    chart.viewCount = Math.min(100, chart.allCandles.length);
+    chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
+    redrawChart();
+  }).catch(() => {
+    // Fallback: rebuild from existing snapshots
+    chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
+    chart.viewCount = Math.min(100, chart.allCandles.length);
+    chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
+    redrawChart();
+  });
 }
 
 // rAF-batched redraw — coalesces multiple calls per frame into one render
@@ -4083,6 +4085,7 @@ async function saveSetting(field, value) {
   if ($('shortsToggle')   && field === 'shorts_enabled') $('shortsToggle').checked   = value;
   if ($('swingToggle')    && field === 'swing_enabled')  $('swingToggle').checked    = value;
   if ($('recoveryToggle') && field === 'recovery_mode')  $('recoveryToggle').checked = value;
+  if ($('aiNewsToggle')   && field === 'ai_news_enabled') $('aiNewsToggle').checked   = value;
 }
 
 async function saveAllSettings() {
@@ -4097,6 +4100,7 @@ async function saveAllSettings() {
     scalp_mode:        gb('setScalp'),
     shorts_enabled:    gb('setShorts'),
     recovery_mode:     gb('setRecovery'),
+    ai_news_enabled:   $('aiNewsToggle')?.checked ?? true,
     sim_mode:          gb('setSim'),
     strategy:          g('setStrategy'),
     market_sentiment:  g('setMarketSentiment') || undefined,  // snake_case matches Supabase column
