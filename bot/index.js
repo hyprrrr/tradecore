@@ -7388,11 +7388,12 @@ async function runNewsScanner() {
 
 async function runAIAdvisor(sym, price, bars, pos) {
   if (!AI_ADVISOR_KEY) return null;
-  if (isSimMode()) return null; // sim runs too fast, would burn tokens
+  if (isSimMode()) return null;
+  if (CONFIG.aiNewsEnabled === false) return null; // same toggle controls all AI usage
 
-  // Only run every 2 minutes per position
+  // Only run every 5 minutes per position (was 2 min — too frequent, burns tokens)
   const now = Date.now();
-  if (aiAdvisorLastRun[sym] && now - aiAdvisorLastRun[sym] < 120000) return null;
+  if (aiAdvisorLastRun[sym] && now - aiAdvisorLastRun[sym] < 300000) return null;
   aiAdvisorLastRun[sym] = now;
 
   try {
@@ -7412,52 +7413,11 @@ async function runAIAdvisor(sym, price, bars, pos) {
     const chg       = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(3);
     const mfe       = ((pos.highWater - pos.entryPrice) / pos.entryPrice * 100).toFixed(3);
     const mae       = ((pos.entryPrice - pos.lowWater)  / pos.entryPrice * 100).toFixed(3);
-    const last5bars = bars.slice(-5).map(b =>
-      `  ${new Date(b.t||Date.now()).toISOString().slice(11,16)} O:${b.o?.toFixed(2)} H:${b.h?.toFixed(2)} L:${b.l?.toFixed(2)} C:${b.c?.toFixed(2)} V:${b.v||0}`
-    ).join('\n');
-
-    const prompt = `You are an expert intraday trader analyzing an open position. Make a fast, decisive call.
-
-POSITION:
-  Symbol:      ${sym}
-  Direction:   ${pos.direction || 'LONG'}
-  Entry:       $${pos.entryPrice.toFixed(2)}
-  Current:     $${price.toFixed(2)}
-  P&L:         ${chg >= 0 ? '+' : ''}${chg}%
-  Hold time:   ${holdMins} minutes
-  Stop loss:   $${pos.stopPrice.toFixed(2)}
-  TP1 hit:     ${pos.tp1Hit ? 'YES' : 'NO'}
-  TP2 hit:     ${pos.tp2Hit ? 'YES' : 'NO'}
-
-TRADE STATS:
-  MFE (best):  +${mfe}% (highest price reached)
-  MAE (worst): -${mae}% (lowest price reached)
-  ATR (14):    $${atrVal.toFixed(3)} (${(atrVal/price*100).toFixed(3)}%)
-
-INDICATORS:
-  RSI(14):     ${rsiVal.toFixed(1)}
-  MACD:        ${macdData.macd}
-  VWAP:        $${vwapVal.toFixed(2)} (price is ${price > vwapVal ? 'ABOVE' : 'BELOW'} VWAP)
-
-LAST 5 BARS (5-min):
-${last5bars}
-
-Based on this data, what is the single best action right now?
-
-Respond with ONLY a JSON object, nothing else:
-{
-  "action": "HOLD" | "TIGHTEN" | "PARTIAL" | "EXIT",
-  "reason": "one sentence max",
-  "newStopPrice": <number or null>,
-  "confidence": <0-100>
-}
-
-Rules:
-- EXIT if RSI > 75 and price pulling back from MFE, or momentum clearly dead
-- PARTIAL if up significantly and showing signs of topping
-- TIGHTEN if profitable but risky, move stop to lock more profit
-- HOLD if trade is developing normally
-- newStopPrice only needed for TIGHTEN action`;
+    // Ultra-compact prompt — all context in one dense line, JSON only out
+    // ~120 tokens vs old 450 token prompt = 73% token reduction
+    const aboveVwap = price > vwapVal ? 'above' : 'below';
+    const prompt = `Trade: ${sym} ${pos.direction||'LONG'} entry$${pos.entryPrice.toFixed(2)} now$${price.toFixed(2)} pnl${chg}% held${holdMins}m stop$${pos.stopPrice?.toFixed(2)} RSI${rsiVal.toFixed(0)} ${aboveVwap}VWAP MFE${mfe}% MAE${mae}% TP1:${pos.tp1Hit?'y':'n'} TP2:${pos.tp2Hit?'y':'n'}
+Reply ONLY JSON: {"action":"HOLD|TIGHTEN|PARTIAL|EXIT","reason":"<10 words","newStopPrice":null,"confidence":0-100}`;
 
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -7468,7 +7428,7 @@ Rules:
       },
       body: JSON.stringify({
         model:      'claude-haiku-4-5-20251001',
-        max_tokens: 150,
+        max_tokens: 60, // JSON response only needs ~40 tokens
         messages: [{ role: 'user', content: prompt }],
       }),
     });
