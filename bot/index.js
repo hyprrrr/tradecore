@@ -110,6 +110,7 @@ const CONFIG = {
   // ── Mode controls (overridden by dashboard via Supabase) ──
   positionTradingEnabled: process.env.POSITION_TRADING === 'true',
   scalpMode:           process.env.SCALP_MODE === 'true',
+  aiNewsEnabled:       process.env.AI_NEWS !== 'false', // default ON, toggleable via dashboard
   shortsEnabled:       process.env.ENABLE_SHORTS === 'true',
   recoveryMode:        process.env.RECOVERY_MODE === 'true',
   minConfidence:       +(process.env.MIN_CONFIDENCE || 62),
@@ -229,6 +230,7 @@ async function loadRemoteConfig() {
     if (s.shorts_enabled !== undefined) CONFIG.shortsEnabled         = !!s.shorts_enabled;
     if (s.position_trading !== undefined) CONFIG.positionTradingEnabled = !!s.position_trading;
     if (s.recovery_mode !== undefined) CONFIG.recoveryMode          = !!s.recovery_mode;
+    if (s.ai_news_enabled !== undefined) CONFIG.aiNewsEnabled        = !!s.ai_news_enabled;
     if (s.sim_mode !== undefined) {
       const newMode = s.sim_mode ? 'sim' : (process.env.MODE || 'alpaca');
       if (newMode !== CONFIG.mode) {
@@ -5003,6 +5005,153 @@ function generateSignalByStrategy(sym, bars5m, bars15m) {
 // ═══════════════════════════════════════════════════════════════════
 
 
+// ═══════════════════════════════════════════════════════════════════
+// MOMENTUM BREAKOUT SCANNER
+// ═══════════════════════════════════════════════════════════════════
+// Catches stocks already moving hard — news catalysts, gap-ups, 
+// unusual volume spikes. TSLA's 8% Piper Sandler move would have
+// triggered this within the first 5 minutes.
+//
+// Entry criteria (ALL required):
+//   1. Price moved > 2% in last 3 bars (strong momentum)
+//   2. Volume > 2.5x average (institutional/news-driven)
+//   3. Price above 20-bar EMA (trend confirmation)
+//   4. ATR expanding (volatility increasing = move has legs)
+//   5. RSI 50-75 for longs (not overbought, momentum building)
+//
+// This runs as an OVERLAY on every strategy — even if the main
+// strategy is rsi_macd or pmrb, the momentum scanner checks every
+// symbol independently and can trigger entries on big moves.
+// ═══════════════════════════════════════════════════════════════════
+
+function signalMomentumBreakout(sym, bars5m) {
+  if (!bars5m || bars5m.length < 25) return null;
+
+  const closes  = bars5m.map(b => b.c);
+  const highs   = bars5m.map(b => b.h);
+  const vols    = bars5m.map(b => +b.v || 0);
+  const price   = closes[closes.length - 1];
+  const reasons = [];
+
+  // ── 1. Price momentum: >2% move in last 3 bars ──────────────────
+  const price3ago = closes[closes.length - 4];
+  const movePct   = (price - price3ago) / price3ago;
+  const moveDir   = movePct > 0 ? 'long' : 'short';
+
+  if (Math.abs(movePct) < 0.02) return null; // < 2% move, skip
+  reasons.push(`🚀 ${(movePct*100).toFixed(2)}% move in 3 bars`);
+
+  // ── 2. Volume spike: >2.5x average ──────────────────────────────
+  const avgVol = vols.slice(-15, -1).reduce((a,b) => a+b, 0) / 14;
+  const curVol = vols[vols.length - 1];
+  const volRatio = avgVol > 0 ? curVol / avgVol : 1;
+  if (volRatio < 2.0) return null; // not enough volume conviction
+  reasons.push(`📊 Volume ${volRatio.toFixed(1)}x average`);
+
+  // ── 3. EMA trend confirmation ────────────────────────────────────
+  const ema20 = closes.slice(-20).reduce((a,b,i,arr) => {
+    if (i === 0) return b;
+    const k = 2/21;
+    return b * k + a * (1-k);
+  }, closes[closes.length-20]);
+  if (moveDir === 'long'  && price < ema20 * 0.99) return null; // below EMA, no long
+  if (moveDir === 'short' && price > ema20 * 1.01) return null; // above EMA, no short
+  reasons.push(`📈 Above EMA20 ($${ema20.toFixed(2)})`);
+
+  // ── 4. ATR expanding (move has energy) ──────────────────────────
+  const atrNow  = atr(bars5m.slice(-8), 7);
+  const atrPrev = atr(bars5m.slice(-16, -8), 7);
+  const atrExpanding = atrNow > atrPrev * 1.1;
+  if (!atrExpanding && volRatio < 3.0) return null;
+  if (atrExpanding) reasons.push(`⚡ ATR expanding (${(atrNow/price*100).toFixed(2)}%)`);
+
+  // ── 5. RSI zone ──────────────────────────────────────────────────
+  const r = rsi(closes, 14);
+  if (moveDir === 'long'  && (r < 45 || r > 80)) return null; // too weak or overbought
+  if (moveDir === 'short' && (r > 55 || r < 20)) return null;
+  reasons.push(`RSI ${r.toFixed(0)}`);
+
+  // ── Score based on strength ──────────────────────────────────────
+  let score = 10;
+  score += Math.min(15, Math.floor(Math.abs(movePct) * 300)); // bigger move = higher score
+  score += Math.min(10, Math.floor((volRatio - 2) * 3));       // more volume = higher score
+  if (Math.abs(movePct) > 0.05) { score += 5; reasons.push('🔥 5%+ move — strong catalyst'); }
+  if (Math.abs(movePct) > 0.08) { score += 8; reasons.push('🔥🔥 8%+ move — major catalyst'); }
+  if (volRatio > 5) { score += 5; reasons.push('🔥 5x+ volume — institutional buying'); }
+
+  const conf = Math.min(96, 55 + score * 1.5);
+  return {
+    signal:     moveDir === 'long' ? 'BUY' : 'SELL',
+    confidence: conf,
+    score,
+    reasons,
+    rsi:        r,
+    atr:        atrNow,
+    isMomentum: true,
+    movePct,
+    volRatio,
+  };
+}
+
+// Momentum scanner runs every full scan cycle independently of main strategy
+// Stores recent momentum signals to avoid re-entering too fast
+const _momentumCooldown = {}; // sym → exitTime
+
+async function runMomentumScanner(symbols, barData5m) {
+  if (isSimMode()) return; // sim uses historical bars, momentum needs live
+  const now = Date.now();
+  const hits = [];
+
+  for (const sym of symbols) {
+    // Skip if already in a position or on cooldown
+    if (positions[sym] || shortPositions[sym] || scalpPositions[sym]) continue;
+    if (_momentumCooldown[sym] && now - _momentumCooldown[sym] < 5 * 60000) continue;
+    if (isSymbolBenched(sym)) continue;
+    if (stopLossCooldown[sym] && now < stopLossCooldown[sym]) continue;
+
+    const bars5m = barData5m[sym];
+    if (!bars5m || bars5m.length < 25) continue;
+
+    const sig = signalMomentumBreakout(sym, bars5m);
+    if (!sig) continue;
+
+    // Edge gate check
+    const direction = sig.signal === 'BUY' ? 'long' : 'short';
+    const edge = await edgeGate(sym, direction, sig, bars5m).catch(() => ({ pass: false }));
+    if (!edge.pass) continue;
+
+    hits.push({ sym, sig, direction });
+    log('scan', `⚡ MOMENTUM ${sym} ${sig.signal} ${(sig.movePct*100).toFixed(2)}% move ${sig.volRatio.toFixed(1)}x vol conf:${sig.confidence}%`);
+  }
+
+  // Sort by move size descending — take strongest first
+  hits.sort((a, b) => Math.abs(b.sig.movePct) - Math.abs(a.sig.movePct));
+
+  // Enter top 2 momentum plays (don't flood with positions)
+  const maxMomentum = 2;
+  let entered = 0;
+  for (const { sym, sig, direction } of hits) {
+    if (entered >= maxMomentum) break;
+    const totalOpen = Object.keys(positions).length + Object.keys(shortPositions).length;
+    if (totalOpen >= CONFIG.maxOpenPositions) break;
+
+    const price = alpacaLivePrice[sym] || sig.price;
+    if (!price || price <= 0) continue;
+
+    try {
+      await enterPosition(sym, price, sig, null, direction);
+      _momentumCooldown[sym] = now;
+      entered++;
+    } catch(e) {
+      log('error', `Momentum entry ${sym}: ${e.message}`);
+    }
+  }
+
+  if (hits.length > 0) {
+    log('scan', `⚡ Momentum scanner: ${hits.length} hits, ${entered} entered`);
+  }
+}
+
 function generateSignal(sym, bars5m, bars15m) {
   if (!bars5m || bars5m.length < 30) return { signal: 'HOLD', confidence: 0, reasons: ['Need 30+ bars'] };
 
@@ -5358,12 +5507,28 @@ function generateSignal(sym, bars5m, bars15m) {
     rsi: r,
     atr: atrVal,
   };
-  // Apply APEX learned rules — may boost confidence or block bad setups
-  return apexFilter(_baseSig, {
+  // Apply APEX learned rules
+  const apexSig = apexFilter(_baseSig, {
     sym: sym || '',
     session: getCurrentSession(),
     atrPct: atrVal / (price || 1),
   });
+
+  // Apply key-level scoring
+  const keySig = applyKeyLevelScoring(apexSig, sym, bars5m);
+
+  // Momentum overlay: big moves confirm technical signals → boost confidence
+  const momSig = signalMomentumBreakout(sym, bars5m);
+  if (momSig && keySig?.signal !== 'HOLD' && momSig.signal === keySig?.signal) {
+    return {
+      ...keySig,
+      score:      (keySig.score || 0) + momSig.score,
+      confidence: Math.min(97, (keySig.confidence || 0) + 15),
+      reasons:    [...(keySig.reasons || []), `⚡ Momentum: ${(momSig.movePct*100).toFixed(2)}% move ${momSig.volRatio.toFixed(1)}x vol`],
+      isMomentumConfirmed: true,
+    };
+  }
+  return keySig;
 }
 
 // ─────────────────────────────────────────────
@@ -7027,6 +7192,200 @@ function minsToClose() {
 const AI_ADVISOR_KEY   = process.env.ANTHROPIC_API_KEY || '';
 const aiAdvisorLastRun = {}; // sym → timestamp
 
+// ═══════════════════════════════════════════════════════════════════
+// AI NEWS SCANNER — Token-Efficient Design
+// ═══════════════════════════════════════════════════════════════════
+// Cost: ~150 tokens/call × max 20 calls/day = ~$0.01/day using Haiku
+//
+// How it works:
+//   1. Fetch headlines from Yahoo Finance RSS (free, no key)
+//   2. Match headlines against watchlist symbols (local, no AI needed)
+//   3. Only send MATCHED headlines to Claude — not everything
+//   4. Ask for pure JSON only — zero explanation tokens wasted
+//   5. Cache seen headlines — same news never sent twice
+//   6. Only fires when market is open and new headlines exist
+// ═══════════════════════════════════════════════════════════════════
+
+const _newsCache      = new Set();   // headline hashes we've already processed
+const _newsSignals    = {};          // sym → { direction, conf, reason, ts }
+const _newsLastFetch  = { ts: 0 };  // last time we fetched news
+const NEWS_FETCH_INTERVAL = 90000;  // fetch every 90s (free tier friendly)
+
+// Fetch Yahoo Finance RSS — free, no key, no rate limit
+async function fetchNewsHeadlines() {
+  try {
+    const fetch  = await getFetch();
+    const res    = await fetch(
+      'https://feeds.finance.yahoo.com/rss/2.0/headline?s=' +
+      CONFIG.symbols.slice(0, 30).join(',') + '&region=US&lang=en-US',
+      { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) }
+    );
+    const xml    = await res.text();
+    // Parse RSS — extract title + link items
+    const items  = [...xml.matchAll(/<item>[\s\S]*?<title><!\[CDATA\[(.*?)\]\]><\/title>[\s\S]*?<\/item>/g)];
+    return items.map(m => m[1].trim()).filter(Boolean);
+  } catch(e) {
+    // Fallback: Finviz news scrape
+    try {
+      const fetch = await getFetch();
+      const res   = await fetch('https://finviz.com/news.ashx', {
+        headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000)
+      });
+      const html  = await res.text();
+      const titles = [...html.matchAll(/class="news-link-[^"]*"[^>]*>([^<]{10,120})</g)];
+      return titles.map(m => m[1].trim()).slice(0, 30);
+    } catch(e2) { return []; }
+  }
+}
+
+// Match headlines to watchlist symbols without AI (fast, free)
+function matchHeadlinesToSymbols(headlines, watchlist) {
+  const matched = [];
+  for (const headline of headlines) {
+    const hash = headline.slice(0, 60);
+    if (_newsCache.has(hash)) continue; // already processed
+    _newsCache.add(hash);
+    if (_newsCache.size > 500) {
+      // Trim cache to prevent memory leak
+      const arr = [..._newsCache];
+      arr.slice(0, 250).forEach(h => _newsCache.delete(h));
+    }
+
+    // Match against symbols and company names
+    const upper = headline.toUpperCase();
+    for (const sym of watchlist) {
+      // Match exact ticker symbol or common company names
+      const companyMap = {
+        'TSLA': ['TESLA'], 'AAPL': ['APPLE'], 'NVDA': ['NVIDIA'],
+        'MSFT': ['MICROSOFT'], 'AMZN': ['AMAZON'], 'GOOGL': ['GOOGLE','ALPHABET'],
+        'META': ['META','FACEBOOK'], 'NFLX': ['NETFLIX'], 'AMD': ['AMD'],
+        'COIN': ['COINBASE'], 'MSTR': ['MICROSTRATEGY'],
+        'MARA': ['MARATHON DIGITAL'], 'PLTR': ['PALANTIR'],
+      };
+      const names = [sym, ...(companyMap[sym] || [])];
+      if (names.some(n => upper.includes(n))) {
+        matched.push({ sym, headline: headline.slice(0, 120) });
+        break;
+      }
+    }
+  }
+  return matched;
+}
+
+// Call Claude Haiku with matched headlines — ultra-compact prompt
+async function analyzeNewsWithAI(matchedItems) {
+  if (!AI_ADVISOR_KEY || !matchedItems.length) return [];
+
+  const headlines = matchedItems.map(m => `${m.sym}: ${m.headline}`).join("\n");
+
+  try {
+    const fetch  = await getFetch();
+    const resp   = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':    'application/json',
+        'x-api-key':       AI_ADVISOR_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-haiku-4-5-20251001', // cheapest + fastest
+        max_tokens: 256, // tiny — JSON only
+        messages: [{
+          role:    'user',
+          // Ultra-compact prompt — every word costs money
+          content: `Stock news. Reply ONLY with JSON array, no text.
+Format: [{"sym":"TSLA","dir":"long","conf":85,"reason":"brief"}]
+dir: long/short/neutral. conf: 0-100. Skip neutral/unclear.
+News:
+${headlines}`,
+        }],
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const data = await resp.json();
+    const raw  = data?.content?.[0]?.text?.trim() || '[]';
+    // Strip any markdown fences just in case
+    const clean = raw.replace(/```json|```/g, '').trim();
+    const results = JSON.parse(clean);
+    const tokens = data?.usage?.input_tokens + data?.usage?.output_tokens;
+    log('news', `📰 AI analyzed ${matchedItems.length} headlines → ${results.length} signals (${tokens} tokens)`);
+    return Array.isArray(results) ? results : [];
+  } catch(e) {
+    log('warn', `News AI failed: ${e.message?.slice(0,60)}`);
+    return [];
+  }
+}
+
+// Main news scanner — runs every 90s during market hours
+async function runNewsScanner() {
+  if (!AI_ADVISOR_KEY) return;           // no key = disabled
+  if (isSimMode()) return;               // never run in sim — saves tokens
+  if (!isMarketOpen()) return;           // only during live trading hours
+  if (CONFIG.aiNewsEnabled === false) return; // user toggled off in dashboard
+
+  const now = Date.now();
+  if (now - _newsLastFetch.ts < NEWS_FETCH_INTERVAL) return;
+  _newsLastFetch.ts = now;
+
+  try {
+    // Step 1: Fetch headlines (free, local)
+    const headlines = await fetchNewsHeadlines();
+    if (!headlines.length) return;
+
+    // Step 2: Match to watchlist (free, local, no AI)
+    const matched = matchHeadlinesToSymbols(headlines, CONFIG.symbols || []);
+    if (!matched.length) return; // no relevant news = no AI call at all
+
+    // Step 3: Only NOW call Claude — only for relevant matched items
+    const signals = await analyzeNewsWithAI(matched);
+
+    // Step 4: Store signals for use by main scan
+    const ts = Date.now();
+    for (const s of signals) {
+      if (!s.sym || !s.dir || s.dir === 'neutral') continue;
+      if ((s.conf || 0) < 70) continue; // only high-confidence news signals
+      _newsSignals[s.sym] = { direction: s.dir, conf: s.conf, reason: s.reason, ts };
+      log('news', `📰 ${s.sym} ${s.dir.toUpperCase()} conf:${s.conf}% — "${s.reason}"`);
+    }
+
+    // Step 5: Immediately act on very high confidence signals (>85%)
+    for (const s of signals) {
+      if ((s.conf || 0) < 85) continue;
+      if (s.dir === 'neutral') continue;
+      const sym = s.sym;
+      if (!CONFIG.symbols.includes(sym)) continue;
+      if (positions[sym] || shortPositions[sym] || scalpPositions[sym]) continue;
+      if (isSymbolBenched(sym)) continue;
+      if (stopLossCooldown[sym] && now < stopLossCooldown[sym]) continue;
+
+      const price = alpacaLivePrice[sym];
+      if (!price || price <= 0) continue;
+
+      const direction = s.dir === 'long' ? 'long' : 'short';
+      const sig = {
+        signal:     s.dir === 'long' ? 'BUY' : 'SELL',
+        confidence: s.conf,
+        score:      s.conf / 5,
+        reasons:    [`📰 News: ${s.reason}`],
+        isNewsTrade: true,
+        rsi:        50,
+        atr:        price * 0.01,
+      };
+
+      const edge = await edgeGate(sym, direction, sig, null).catch(() => ({ pass: false }));
+      if (!edge.pass) continue;
+
+      log('news', `📰 Acting on news signal: ${sym} ${direction} conf:${s.conf}%`);
+      await enterPosition(sym, price, sig, null, direction).catch(e =>
+        log('error', `News entry ${sym}: ${e.message}`)
+      );
+    }
+  } catch(e) {
+    log('error', `News scanner: ${e.message?.slice(0, 80)}`);
+  }
+}
+
 async function runAIAdvisor(sym, price, bars, pos) {
   if (!AI_ADVISOR_KEY) return null;
   if (isSimMode()) return null; // sim runs too fast, would burn tokens
@@ -7531,6 +7890,17 @@ async function runScan() {
     barData15m[sym] = bars15m;
   }
 
+  // ── Momentum scanner — catches big moves like TSLA +8% on news ──
+  if (!isSimMode() && isMarketOpen()) {
+    runMomentumScanner(symbolsToScan, barData5m).catch(e =>
+      log('error', `Momentum scanner: ${e.message}`)
+    );
+  }
+
+  // ── News scanner — AI-powered, ~$0.01/day via Claude Haiku ──────
+  // Only fires when new relevant headlines exist. Requires ANTHROPIC_API_KEY.
+  runNewsScanner().catch(e => log('error', `News scanner: ${e.message}`));
+
   // Market regime only matters during US hours
   const marketOk = isMarketOpen() ? await getMarketRegime() : true;
 
@@ -7544,6 +7914,10 @@ async function runScan() {
     try {
       // Skip benched symbols at source (saves bar fetches + signal CPU)
       if (isSymbolBenched(sym) && !positions[sym] && !shortPositions[sym]) continue;
+
+      // Boost signal if news scanner flagged this symbol
+      const newsHit = _newsSignals[sym];
+      const newsBoost = newsHit && Date.now() - newsHit.ts < 10 * 60000 ? newsHit : null;
 
       const sessionMult = getSessionMultiplier(sym);
       const sessionLabel = ETF_SESSIONS[sym]
@@ -7600,6 +7974,20 @@ async function runScan() {
 
       // Generate signal
       let sig = generateSignalByStrategy(sym, bars5m, bars15m) || generateSignal(sym, bars5m, bars15m);
+
+      // News signal boost — if AI flagged this symbol, boost confidence
+      if (sig && sig.signal !== 'HOLD' && newsBoost) {
+        const newsDir = newsBoost.direction === 'long' ? 'BUY' : 'SELL';
+        if (newsDir === sig.signal) {
+          sig = {
+            ...sig,
+            confidence: Math.min(97, (sig.confidence || 0) + 20),
+            score:      (sig.score || 0) + 10,
+            reasons:    [...(sig.reasons || []), `📰 News catalyst: ${newsBoost.reason || ''}`],
+          };
+          log('news', `📰 ${sym} news boost +20 conf → ${sig.confidence}%`);
+        }
+      }
       const adjustedConfidence = Math.round(sig.confidence * sessionMult);
       sig = { ...sig, confidence: adjustedConfidence };
 
