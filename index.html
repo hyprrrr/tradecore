@@ -2141,7 +2141,7 @@ function startDataSync() {
 
 // ═══════════════════════════════════════ ACTIONS ═══════════════════════════════════════
 async function toggleSetting(field, value) {
-  // Update checkbox visuals immediately — don't wait for network round-trip
+  // Map field names to checkbox IDs
   const fieldToToggle = {
     'scalp_mode':      'scalpToggle',
     'shorts_enabled':  'shortsToggle',
@@ -2149,12 +2149,22 @@ async function toggleSetting(field, value) {
     'recovery_mode':   'recoveryToggle',
     'ai_news_enabled': 'aiNewsToggle',
   };
-  const toggleId = fieldToToggle[field];
-  if (toggleId && $(toggleId)) $(toggleId).checked = value;
 
+  // 1. Update checkbox visual FIRST before any async work
+  const toggleId = fieldToToggle[field];
+  if (toggleId) {
+    const el = $(toggleId);
+    if (el) el.checked = !!value;
+  }
+
+  // 2. Update local state so subsequent reads see the new value
+  if (!state.settings) state.settings = {};
+  state.settings[field] = value;
+
+  // 3. Save to Supabase — do NOT call fetchSettings() after, it would overwrite UI
   const body = { [field]: value, updated_at: new Date().toISOString() };
-  await sbFetch('tc_settings?id=eq.1', 'PATCH', body);
-  await fetchSettings();
+  await sbFetch('tc_settings?id=eq.1', 'PATCH', body).catch(() => {});
+
   addLog('info', `Setting ${field} → ${value}`);
 }
 
