@@ -2759,6 +2759,18 @@ function renderEquityChart(snapshots) {
   }
 
   drawCandlestickChart(rebuilt);
+
+  // Seed the last candle with current portfolio value so chart is live immediately
+  // without waiting for the next tickLiveCandle cycle
+  if (chart.allCandles?.length && state.portfolio?.total_value) {
+    const v    = +state.portfolio.total_value;
+    const last = chart.allCandles[chart.allCandles.length - 1];
+    if (Number.isFinite(v) && v > 0) {
+      last.close = v;
+      if (v > last.high) last.high = v;
+      if (v < last.low)  last.low  = v;
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2800,57 +2812,44 @@ function tickLiveCandle() {
   if (!chart.allCandles?.length) return;
 
   const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
-  const bucketMs  = msMap[chart.tf] || 3600e3;
-  const nowMs     = Date.now();
-  const key       = Math.floor(nowMs / bucketMs) * bucketMs;
+  const bucketMs = msMap[chart.tf] || 3600e3;
+  const nowMs    = Date.now();
+  const key      = Math.floor(nowMs / bucketMs) * bucketMs;
 
   const last      = chart.allCandles[chart.allCandles.length - 1];
   const lastRawMs = last.time instanceof Date ? last.time.getTime() : +last.time;
   const lastKey   = Math.floor(lastRawMs / bucketMs) * bucketMs;
-  const wasAtEdge = (chart.viewStart + chart.viewCount >= chart.allCandles.length - 1);
-
-  // Is equity meaningfully changing? (more than $0.50 from last close)
-  // When flat (no open trades), we do NOT create new candles — the current
-  // candle just stays open and extends in time. New candles only form when
-  // equity actually moves, which happens during/after trades.
-  const FLAT_THRESHOLD = 0.50; // $0.50 — noise below this is ignored
-  const equityChanged = Math.abs(v - last.close) > FLAT_THRESHOLD;
-  const hasOpenTrades = (state.positions?.length > 0) ||
-                        (state.botStatus?.open_positions > 0);
+  const wasAtEdge = chart.viewStart + chart.viewCount >= chart.allCandles.length - 1;
 
   if (key > lastKey) {
-    // ── Bucket boundary crossed ───────────────────────────────────
-    // Only push new candles if equity moved OR we have open trades.
-    // If flat with no trades, just slide the current candle's timestamp
-    // forward so it doesn't look like a spike when movement resumes.
-    if (!equityChanged && !hasOpenTrades) {
-      // Silently extend — move the last candle to the current bucket
-      // so the chart shows a flat line instead of creating doji spam
-      last.time = new Date(key);
-      last.open = last.close = last.high = last.low = v;
-      _liveCandleLastBucketKey = key;
-      // Redraw price label every 10s so it stays fresh
-      const now2 = Date.now();
-      if (!tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 10000) {
-        tickLiveCandle._lastRedraw = now2;
-        redrawChart();
-      }
-      return;
+    // ── New time bucket — ALWAYS create a new candle ─────────────
+    // Previously we skipped flat buckets which caused the chart to
+    // freeze after 7 candles. Now we always advance — flat candles
+    // are fine (they show as a doji/flat line which is accurate).
+    // Gap-fill: if multiple buckets were skipped (bot was down etc),
+    // fill them as flat carries so the timeline is continuous.
+    const gapBuckets = Math.min(8, Math.floor((key - lastKey) / bucketMs) - 1);
+    for (let g = 1; g <= gapBuckets; g++) {
+      chart.allCandles.push({
+        time:   new Date(lastKey + g * bucketMs),
+        open:   last.close, high: last.close,
+        low:    last.close, close: last.close,
+        volume: 0, live: true,
+      });
     }
-
-    // Equity moved or trades are open — create real new candle(s)
-    // Skip gap-fill dojis; they make the chart look like a flat spike farm
+    // Push the current bucket candle
     chart.allCandles.push({
       time:   new Date(key),
       open:   last.close,
       high:   Math.max(last.close, v),
       low:    Math.min(last.close, v),
       close:  v,
-      volume: equityChanged ? 1 : 0,
+      volume: Math.abs(v - last.close) > 0.01 ? 1 : 0,
       live:   true,
     });
     _liveCandleLastBucketKey = key;
     if (wasAtEdge) chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
+    tickLiveCandle._lastRedraw = nowMs;
     redrawChart();
     return;
   }
@@ -2861,9 +2860,10 @@ function tickLiveCandle() {
   if (v > last.high) last.high = v;
   if (v < last.low)  last.low  = v;
 
-  const changed   = v !== prevClose;
+  // Redraw on value change, or heartbeat every 4s to keep label fresh
   const now2      = Date.now();
-  const heartbeat = !tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 5000;
+  const changed   = v !== prevClose;
+  const heartbeat = !tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 4000;
   if (changed || heartbeat) {
     tickLiveCandle._lastRedraw = now2;
     redrawChart();
