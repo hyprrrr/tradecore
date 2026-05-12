@@ -1906,8 +1906,8 @@ async function syncPositions() {
       symbol:        sym,
       side:          'LONG',
       entry_price:   +pos.entryPrice.toFixed(4),
-      qty,
-      cost:          +(pos.entryPrice * qty).toFixed(2),
+      qty:           +Math.abs(qty || 0),
+      cost:          +(pos.entryPrice * (qty||0)).toFixed(2),
       current_price: +cur.toFixed(4),
       pnl:           +pnl.toFixed(2),
       pnl_pct:       +pnlPct.toFixed(2),
@@ -1929,8 +1929,8 @@ async function syncPositions() {
       symbol:        sym + '_SHORT',
       side:          'SHORT',
       entry_price:   +pos.entryPrice.toFixed(4),
-      qty:           -qty,
-      cost:          +(pos.entryPrice * qty).toFixed(2),
+      qty:           -Math.abs(qty || 0),
+      cost:          +(pos.entryPrice * (qty||0)).toFixed(2),
       current_price: +cur.toFixed(4),
       pnl:           +pnl.toFixed(2),
       pnl_pct:       +pnlPct.toFixed(2),
@@ -1997,7 +1997,16 @@ async function syncPositions() {
   }
 }
 
+const _lastTradeTs = {}; // sym+side → timestamp for dedup
 async function syncTrade(trade) {
+  // Hard dedup: don't write same sym+side+reason within 5 seconds
+  const key = `${trade.sym}_${trade.side}_${trade.reason}`;
+  const now = Date.now();
+  if (_lastTradeTs[key] && now - _lastTradeTs[key] < 5000) {
+    log('warn', `⚠️ Duplicate trade suppressed: ${key}`);
+    return;
+  }
+  _lastTradeTs[key] = now;
   await sbFetch(tbl('tc_trades'), 'POST', {
     symbol:     trade.sym,
     side:       trade.side,
@@ -2562,15 +2571,14 @@ let _lastForceEquityMs = 0;
 function pushEquitySnapshot(equity) {
   if (!Number.isFinite(equity) || equity <= 0) return;
   const now = Date.now();
-  // Throttle: max one push per 60s (was 1s — was generating ~1440 rows/day per symbol)
-  // On-trade pushes still fire immediately (called directly from exitPosition)
-  if (now - _lastForceEquityMs < 60000) return;
+  // Throttle: max one push per 30s — was 60s which meant 0 snapshots in short sessions
+  if (now - _lastForceEquityMs < 30000) return;
   _lastForceEquityMs = now;
   lastEquitySnapshot = now;
   sbFetch(tbl('tc_equity'), 'POST', {
-    value: +equity.toFixed(2),
+    value:      +equity.toFixed(2),
     created_at: new Date().toISOString(),
-  }).catch(()=>{});
+  }).catch(e => log('warn', `Equity snapshot failed: ${e.message?.slice(0,60)}`));
 }
 
 function recordSymbolOutcome(sym, pnl, direction = null) {
@@ -9463,6 +9471,17 @@ cron.schedule('31 9 * * 1-5',  updateDayBias,    { timezone: 'America/New_York' 
 // Startup — prewarm data then scan immediately
 ensureColumns().catch(() => {});
 prewarmBarCache().catch(() => {});
+// Push initial equity snapshot so chart has at least one data point on startup
+setTimeout(async () => {
+  try {
+    if (realEquity > 0) pushEquitySnapshot(realEquity);
+    else {
+      const acct = await getAccount().catch(() => null);
+      if (acct?.equity) { realEquity = +acct.equity; pushEquitySnapshot(realEquity); }
+    }
+  } catch(e) {}
+}, 8000);
+
 // Hard reset adaptive params on every startup — prevents paralytic drift across restarts
 // These values are relearned from scratch each session
 CONFIG.rsiOversold   = 35;
