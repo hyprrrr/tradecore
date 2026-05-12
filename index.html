@@ -2141,6 +2141,17 @@ function startDataSync() {
 
 // ═══════════════════════════════════════ ACTIONS ═══════════════════════════════════════
 async function toggleSetting(field, value) {
+  // Update checkbox visuals immediately — don't wait for network round-trip
+  const fieldToToggle = {
+    'scalp_mode':      'scalpToggle',
+    'shorts_enabled':  'shortsToggle',
+    'swing_enabled':   'swingToggle',
+    'recovery_mode':   'recoveryToggle',
+    'ai_news_enabled': 'aiNewsToggle',
+  };
+  const toggleId = fieldToToggle[field];
+  if (toggleId && $(toggleId)) $(toggleId).checked = value;
+
   const body = { [field]: value, updated_at: new Date().toISOString() };
   await sbFetch('tc_settings?id=eq.1', 'PATCH', body);
   await fetchSettings();
