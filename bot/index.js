@@ -5555,72 +5555,141 @@ async function classifyRegime() {
   if (Date.now() - _regimeCache.at < 60000 && _regimeCache.state) return _regimeCache.state;
 
   try {
-    const [dayBars, intraBars, vixProxy] = await Promise.all([
-      fetchBars('SPY', '1Day', 30),
-      fetchBars('SPY', '5Min', 30),
-      // Use UVXY as a VIX proxy — more actionable than VIX (untradeable index)
-      // UVXY up = fear up. Spike = regime stress.
+    // Fetch multiple instruments in parallel — total ~800ms
+    const [spyDay, spy5m, qqq5m, uvxy5m, tlt5m] = await Promise.all([
+      fetchBars('SPY', '1Day', 30).catch(() => null),
+      fetchBars('SPY', '5Min', 40).catch(() => null),
+      fetchBars('QQQ', '5Min', 20).catch(() => null),
       fetchBars('UVXY', '5Min', 20).catch(() => null),
+      fetchBars('TLT', '5Min', 20).catch(() => null),
     ]);
 
-    let state = 'bull';       // default optimistic
+    let state = 'bull';
     let reasons = [];
-    let spyTrendScore = 0;    // -3 to +3
-    let volScore = 0;         // 0 (calm) to 3 (blowoff)
+    let spyTrendScore = 0;  // -4 to +4
+    let volScore = 0;       // 0-3
+    let riskOffScore = 0;   // bonds + dollar pressure
 
-    // ── Daily trend ──
-    if (dayBars && dayBars.length >= 20) {
-      const closes = dayBars.map(b => b.c);
-      const e10 = ema(closes, 10), e20 = ema(closes, 20);
-      const latest = closes[closes.length - 1];
-      if (latest > e10 && e10 > e20) spyTrendScore += 2;      // strong uptrend
-      else if (latest > e10)         spyTrendScore += 1;
-      else if (latest < e10 && e10 < e20) spyTrendScore -= 2; // downtrend
-      else if (latest < e10)         spyTrendScore -= 1;
+    // ── 1. SPY daily trend (weight: 2) ──────────────────────────────
+    if (spyDay?.length >= 20) {
+      const c = spyDay.map(b => b.c);
+      const e10 = ema(c, 10), e20 = ema(c, 20), latest = c[c.length-1];
+      const dailyMom = (latest - c[c.length-5]) / c[c.length-5]; // 5-day momentum
+      if (latest > e10 && e10 > e20) {
+        spyTrendScore += 2;
+        if (dailyMom > 0.01) { spyTrendScore += 1; reasons.push(`SPY strong daily uptrend +${(dailyMom*100).toFixed(1)}%`); }
+        else reasons.push(`SPY daily uptrend`);
+      } else if (latest < e10 && e10 < e20) {
+        spyTrendScore -= 2;
+        if (dailyMom < -0.01) { spyTrendScore -= 1; reasons.push(`SPY strong daily downtrend ${(dailyMom*100).toFixed(1)}%`); }
+        else reasons.push(`SPY daily downtrend`);
+      } else if (latest > e10) { spyTrendScore += 1; }
+      else { spyTrendScore -= 1; }
     }
 
-    // ── Intraday trend (5m) ──
-    if (intraBars && intraBars.length >= 10) {
-      const closes = intraBars.map(b => b.c);
-      const last5 = closes.slice(-5);
-      const up    = last5.filter((c, i) => i > 0 && c > last5[i-1]).length;
-      const down  = last5.filter((c, i) => i > 0 && c < last5[i-1]).length;
-      if (up >= 3) spyTrendScore += 1;
-      if (down >= 3) spyTrendScore -= 1;
-
-      // Volatility score
-      const spyAtr = atr(intraBars, 10);
-      const spyAtrPct = (spyAtr / closes[closes.length - 1]) * 100;
-      if (spyAtrPct > 0.6)      { volScore = 3; reasons.push(`SPY ATR ${spyAtrPct.toFixed(2)}%/bar — blowoff`); }
-      else if (spyAtrPct > 0.4) { volScore = 2; reasons.push(`SPY ATR ${spyAtrPct.toFixed(2)}%/bar — elevated`); }
-      else if (spyAtrPct > 0.25){ volScore = 1; }
-    }
-
-    // ── UVXY fear spike ──
+    // ── 2. SPY intraday 5m momentum ─────────────────────────────────
     let uvxySpike = false;
-    if (vixProxy && vixProxy.length >= 10) {
-      const uv = vixProxy.map(b => b.c);
-      const uvAvg = uv.slice(0, -3).reduce((a,b) => a+b, 0) / Math.max(1, uv.length - 3);
-      const uvLast = uv[uv.length - 1];
-      if (uvLast > uvAvg * 1.08) { // 8%+ spike in UVXY
-        uvxySpike = true;
-        reasons.push(`UVXY spike ${((uvLast/uvAvg - 1)*100).toFixed(1)}%`);
+    if (spy5m?.length >= 15) {
+      const c = spy5m.map(b => b.c);
+      const last6 = c.slice(-6);
+      const up   = last6.filter((v,i) => i>0 && v > last6[i-1]).length;
+      const down = last6.filter((v,i) => i>0 && v < last6[i-1]).length;
+      if (up >= 4)   { spyTrendScore += 1; reasons.push(`SPY 5m uptrend (${up}/5 bars green)`); }
+      if (down >= 4) { spyTrendScore -= 1; reasons.push(`SPY 5m downtrend (${down}/5 bars red)`); }
+
+      // Volatility / ATR
+      const spyAtr    = atr(spy5m, 10);
+      const spyAtrPct = spyAtr / c[c.length-1] * 100;
+      if (spyAtrPct > 0.6)       { volScore = 3; reasons.push(`SPY ATR ${spyAtrPct.toFixed(2)}%/bar BLOWOFF`); }
+      else if (spyAtrPct > 0.4)  { volScore = 2; reasons.push(`SPY ATR ${spyAtrPct.toFixed(2)}%/bar elevated`); }
+      else if (spyAtrPct > 0.25) { volScore = 1; }
+
+      // Key level break — SPY breaking prev session high/low is instant signal
+      const prevHigh = Math.max(...spy5m.slice(-20, -1).map(b => b.h));
+      const prevLow  = Math.min(...spy5m.slice(-20, -1).map(b => b.l));
+      const curClose = c[c.length-1];
+      if (curClose > prevHigh * 1.001) { spyTrendScore += 1; reasons.push(`SPY broke 20-bar high $${prevHigh.toFixed(2)} → ${curClose.toFixed(2)}`); }
+      if (curClose < prevLow  * 0.999) { spyTrendScore -= 1; reasons.push(`SPY broke 20-bar low $${prevLow.toFixed(2)} → ${curClose.toFixed(2)}`); }
+    }
+
+    // ── 3. QQQ vs SPY divergence (tech leadership/rotation) ─────────
+    if (qqq5m?.length >= 10 && spy5m?.length >= 10) {
+      const qClose = qqq5m[qqq5m.length-1]?.c;
+      const qOpen  = qqq5m[qqq5m.length-6]?.c || qClose;
+      const sClose = spy5m[spy5m.length-1]?.c;
+      const sOpen  = spy5m[spy5m.length-6]?.c || sClose;
+      const qMove  = (qClose - qOpen) / qOpen;
+      const sMove  = (sClose - sOpen) / sOpen;
+      const div    = qMove - sMove;
+      if (div > 0.005) {
+        spyTrendScore += 1;
+        reasons.push(`QQQ leading SPY by ${(div*100).toFixed(2)}% — tech bullish`);
+      } else if (div < -0.005) {
+        spyTrendScore -= 1;
+        reasons.push(`QQQ lagging SPY by ${(Math.abs(div)*100).toFixed(2)}% — tech risk-off`);
       }
     }
 
-    // ── Classify ──
-    if (volScore >= 3 || uvxySpike && volScore >= 2) {
-      state = 'blowoff';
-    } else if (spyTrendScore <= -2) {
-      state = 'bear';
-    } else if (spyTrendScore >= 2 && volScore <= 1) {
-      state = 'bull';
-    } else {
-      state = 'chop';
-      reasons.push(`trendScore=${spyTrendScore} volScore=${volScore}`);
+    // ── 4. UVXY fear gauge ───────────────────────────────────────────
+    if (uvxy5m?.length >= 10) {
+      const uv    = uvxy5m.map(b => b.c);
+      const uvAvg = uv.slice(0, -3).reduce((a,b) => a+b, 0) / Math.max(1, uv.length-3);
+      const uvNow = uv[uv.length-1];
+      const uvChg = (uvNow - uvAvg) / uvAvg;
+      if (uvChg > 0.08) {
+        uvxySpike = true;
+        volScore = Math.max(volScore, 2);
+        reasons.push(`UVXY spike +${(uvChg*100).toFixed(1)}% — fear entering`);
+      } else if (uvChg > 0.04) {
+        volScore = Math.max(volScore, 1);
+        reasons.push(`UVXY elevated +${(uvChg*100).toFixed(1)}%`);
+      }
     }
 
-    const result = { state, spyTrendScore, volScore, uvxySpike, reasons: reasons.join(', ') };
+    // ── 5. TLT (bonds) — risk-off indicator ─────────────────────────
+    if (tlt5m?.length >= 10) {
+      const tlt  = tlt5m.map(b => b.c);
+      const tltMom = (tlt[tlt.length-1] - tlt[tlt.length-6]) / tlt[tlt.length-6];
+      if (tltMom > 0.003) {
+        riskOffScore += 1;
+        reasons.push(`TLT rising +${(tltMom*100).toFixed(2)}% — bonds bid, risk-off`);
+      }
+    }
+
+    // Apply risk-off pressure
+    spyTrendScore -= riskOffScore;
+
+    // ── 6. Final classification ──────────────────────────────────────
+    if (volScore >= 3 || (uvxySpike && volScore >= 2)) {
+      state = 'blowoff';
+      reasons.push('→ BLOWOFF: use RSI+MACD both directions, tightest stops');
+    } else if (spyTrendScore <= -2) {
+      state = 'bear';
+      reasons.push('→ BEAR: shorts preferred, SMC/breakdown patterns');
+    } else if (spyTrendScore >= 2 && volScore <= 1) {
+      state = 'bull';
+      reasons.push('→ BULL: longs preferred, trend-following');
+    } else {
+      state = 'chop';
+      reasons.push(`→ CHOP: mean-reversion, reduce size | score=${spyTrendScore} vol=${volScore}`);
+    }
+
+    const result = { state, spyTrendScore, volScore, uvxySpike, riskOffScore, reasons: reasons.join(' | ') };
+
+    // ── 7. Instant strategy switch on regime change ──────────────────
+    if (_lastRegimeState && _lastRegimeState !== state) {
+      log('sys', `🔄 REGIME CHANGED: ${_lastRegimeState.toUpperCase()} → ${state.toUpperCase()} | ${reasons.slice(-1)[0]}`);
+      // Force immediate auto-strategy resolution
+      if (CONFIG.strategy === 'auto' || !CONFIG.strategy) {
+        const newStrat = await resolveAutoStrategy(result).catch(() => null);
+        if (newStrat && newStrat !== CONFIG._activeStrategy) {
+          CONFIG._activeStrategy = newStrat;
+          log('sys', `⚡ Instant strategy switch → ${newStrat.toUpperCase()} (regime changed)`);
+        }
+      }
+    }
+    _lastRegimeState = state;
+
     _regimeCache.at = Date.now();
     _regimeCache.state = result;
     return result;
@@ -5812,69 +5881,95 @@ function resolveMarketSentiment(regimeState) {
 let _autoStrategyLast = { strategy: null, reason: '', changedAt: 0 };
 
 async function resolveAutoStrategy(regime) {
-  if (!regime) return CONFIG.strategy || 'rsi_macd';
+  if (!regime) return CONFIG._activeStrategy || CONFIG.strategy || 'rsi_macd';
 
   const etNow  = getETTime();
   const etMins = etNow.getHours() * 60 + etNow.getMinutes();
-  const { state, spyTrendScore, volScore, uvxySpike } = regime;
+  const { state, spyTrendScore, volScore, uvxySpike, riskOffScore } = regime;
 
   let chosen = 'rsi_macd';
   let reason = '';
 
-  // ── BLOWOFF: high volatility, news-driven panic ───────────────────
+  // ── BLOWOFF: panic, wide ATR, fear spiking ──────────────────────
   if (state === 'blowoff' || uvxySpike) {
     chosen = 'rsi_macd';
-    reason = `Blowoff/UVXY spike — RSI+MACD fastest to react`;
+    reason = `Blowoff/UVXY spike — RSI+MACD only, tight stops`;
 
-  // ── BULL market ────────────────────────────────────────────────────
-  } else if (state === 'bull' || spyTrendScore >= 1) {
-
-    // 8:00–10:30 AM ET = PMRB prime window
-    if (etMins >= 8*60 && etMins <= 10*60+30) {
-      chosen = 'pmrb';
-      reason = `Bull + ${Math.floor(etMins/60)}:${String(etMins%60).padStart(2,'0')} ET = PMRB prime window`;
-
-    // 10:30 AM–2 PM ET = 4H range formed, fade breakouts  
-    } else if (etMins > 10*60+30 && etMins <= 14*60) {
-      chosen = '4hrs';
-      reason = `Bull + midday = 4H range fade (institutions defending levels)`;
-
-    // 2–4 PM ET or pre-market = trend pullback
-    } else {
-      chosen = 'trend_pullback';
-      reason = `Bull outside prime windows = ride trend on pullbacks`;
-    }
-
-  // ── BEAR market ────────────────────────────────────────────────────
-  } else if (state === 'bear' || spyTrendScore <= -2) {
-    // During prime hours, SMC catches distribution/breakdown best
-    if (etMins >= 9*60 && etMins <= 15*60) {
-      chosen = 'smc';
-      reason = `Bear regime — SMC catches distribution/breakdown patterns`;
+  // ── PRE-MARKET (4–9:30 AM ET) ───────────────────────────────────
+  } else if (etMins < 9*60+30) {
+    if (state === 'bull') {
+      // 8:00–9:30 AM = PMRB prime capture window
+      chosen = etMins >= 8*60 ? 'pmrb' : 'rsi_macd';
+      reason = etMins >= 8*60
+        ? `Pre-market bull — PMRB capturing 8AM range`
+        : `Pre-market bull — RSI+MACD until 8AM`;
     } else {
       chosen = 'rsi_macd';
-      reason = `Bear + off-hours — RSI+MACD with short bias`;
+      reason = `Pre-market ${state} — RSI+MACD conservative`;
     }
 
-  // ── CHOP: mean reversion ───────────────────────────────────────────
-  } else {
-    // VWAP reversion is the cleanest chop strategy
-    if (etMins >= 9*60 && etMins <= 15*60) {
-      chosen = 'vwap_reversion';
-      reason = `Chop regime — VWAP reversion works best in ranging market`;
+  // ── MARKET OPEN (9:30–10:30 AM ET) — highest volatility window ──
+  } else if (etMins >= 9*60+30 && etMins <= 10*60+30) {
+    if (state === 'bull' && spyTrendScore >= 2) {
+      chosen = 'pmrb';           // strong bull: ride the open momentum
+      reason = `Open bull (score:${spyTrendScore}) — PMRB range break`;
+    } else if (state === 'bear' && spyTrendScore <= -2) {
+      chosen = 'smc';            // strong bear: distribution/breakdown
+      reason = `Open bear (score:${spyTrendScore}) — SMC breakdown`;
+    } else if (volScore >= 2) {
+      chosen = 'rsi_macd';       // volatile: fast reactive strategy
+      reason = `Open volatile (vol:${volScore}) — RSI+MACD`;
     } else {
-      chosen = 'bb_divergence';
-      reason = `Chop + off-hours — BB divergence for slow mean reversion`;
+      chosen = 'vwap_reversion'; // choppy open: fade VWAP deviations
+      reason = `Open chop — VWAP reversion`;
+    }
+
+  // ── MIDDAY (10:30 AM–2 PM ET) — institutional flow ──────────────
+  } else if (etMins > 10*60+30 && etMins <= 14*60) {
+    if (state === 'bull' && spyTrendScore >= 2) {
+      chosen = '4hrs';           // 4H range established, fade breaks
+      reason = `Midday bull — 4H range fade`;
+    } else if (state === 'bull') {
+      chosen = 'trend_pullback'; // mild bull: pullback entries
+      reason = `Midday mild bull — trend pullback`;
+    } else if (state === 'bear') {
+      chosen = 'smc';
+      reason = `Midday bear — SMC distribution`;
+    } else {
+      chosen = 'vwap_reversion';
+      reason = `Midday chop — VWAP reversion`;
+    }
+
+  // ── AFTERNOON (2–4 PM ET) — late session flow ───────────────────
+  } else if (etMins > 14*60 && etMins <= 16*60) {
+    if (state === 'bull' && riskOffScore === 0) {
+      chosen = 'trend_pullback'; // bull + bonds calm = safe to hold
+      reason = `Afternoon bull — trend continuation`;
+    } else if (state === 'bear') {
+      chosen = 'smc';
+      reason = `Afternoon bear — SMC`;
+    } else {
+      chosen = 'bb_divergence';  // late session chop: BB fade
+      reason = `Afternoon chop — BB divergence`;
+    }
+
+  // ── AFTER HOURS / ASIA (outside market hours) ───────────────────
+  } else {
+    if (state === 'bear') {
+      chosen = 'rsi_macd';       // AH bear: careful RSI only
+      reason = `AH bear — RSI+MACD short bias`;
+    } else {
+      chosen = 'rsi_macd';
+      reason = `After-hours — RSI+MACD conservative`;
     }
   }
 
-  // Only log when strategy actually changes
+  // ── Log and notify on change ────────────────────────────────────
   if (chosen !== _autoStrategyLast.strategy) {
     const prev = _autoStrategyLast.strategy;
     _autoStrategyLast = { strategy: chosen, reason, changedAt: Date.now() };
-    log('sys', `🔀 Auto-strategy: ${prev || 'none'} → ${chosen.toUpperCase()} | ${reason}`);
+    log('sys', `🔀 Strategy: ${(prev||'none').toUpperCase()} → ${chosen.toUpperCase()} | ${reason}`);
 
-    // Notify Discord on strategy switch
     if (CONFIG.discordWebhook && prev) {
       const fetch = await getFetch();
       fetch(CONFIG.discordWebhook, {
@@ -5882,9 +5977,9 @@ async function resolveAutoStrategy(regime) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           embeds: [{
-            title: `🔀 Strategy Auto-Switched`,
+            title: `🔀 Strategy Switched`,
             description: `**${(prev||'').toUpperCase()}** → **${chosen.toUpperCase()}**`,
-            fields: [{ name: 'Reason', value: reason }],
+            fields: [{ name: 'Reason', value: reason }, { name: 'Regime', value: `${regime.state} | SPY score:${regime.spyTrendScore}` }],
             color: 0x00e5c7,
           }]
         }),
@@ -9902,7 +9997,34 @@ setInterval(async () => {
   if (!isSimMode() && CONFIG.alpacaKey && Object.keys(positions).length + Object.keys(shortPositions).length > 0) {
     await syncPricesOnly();
   }
-}, 15000); // was 5000 — reduced to cut egress
+}, 15000);
+
+// ── Real-time regime watcher — every 20s ──────────────────────────
+// Runs independently of the scan loop so strategy switches happen
+// immediately when market conditions change, not just on the next scan.
+// This is what makes strategy selection truly real-time.
+setInterval(async () => {
+  if (isSimMode()) return;
+  if (!isMarketOpen() && !(getETTime().getHours() >= 4)) return; // skip overnight
+  try {
+    const regime = await classifyRegime();
+    // Auto-strategy: resolve and apply immediately
+    if (CONFIG.strategy === 'auto' || !CONFIG.strategy) {
+      const strat = await resolveAutoStrategy(regime);
+      if (strat !== CONFIG._activeStrategy) {
+        CONFIG._activeStrategy = strat;
+        // Push to Supabase so dashboard shows live strategy
+        sbFetch('tc_settings?id=eq.1', 'PATCH', {
+          active_strategy: strat,
+          regime_state:    regime.state,
+          updated_at:      new Date().toISOString(),
+        }).catch(() => {});
+      }
+    }
+    // Update live regime display even when not auto
+    alpacaLivePrice['_regime'] = regime.state; // hacky but shows in diag
+  } catch(e) { /* non-critical */ }
+}, 20000);
 
 // ── OVERNIGHT GUARDIAN — runs every 60 seconds, completely independent of scan loop ──
 // If market is closed and we still have open positions, close them immediately.
