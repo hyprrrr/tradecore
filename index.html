@@ -1144,6 +1144,10 @@
               <span class="pair-stat-label">Win/Loss</span>
               <span class="pair-stat-value" id="mainWL">--</span>
             </div>
+            <div class="pair-stat" title="Live market regime and active strategy">
+              <span class="pair-stat-label">Regime</span>
+              <span class="pair-stat-value" id="mainRegime" style="font-size:11px;letter-spacing:0.03em;">--</span>
+            </div>
             <div class="pair-stat">
               <span class="pair-stat-label">Cash</span>
               <span class="pair-stat-value" id="mainCash">--</span>
@@ -2488,6 +2492,15 @@ function updateBotStatus(s) {
   $('simBtn').textContent = s.mode==='sim' ? 'Exit Sim' : 'Enter Sim';
   $('sessionPill').textContent = s.session || '--';
   $('mainWL').textContent = (s.wins||0) + 'W / ' + (s.losses||0) + 'L';
+  // Live regime + strategy
+  const regimeEl = $('mainRegime');
+  if (regimeEl) {
+    const regime = s.regime || state.settings?.regime_state || '';
+    const strat  = s._activeStrategy || state.settings?.active_strategy || s.strategy || '';
+    const colors = { bull:'#05d890', bear:'#ff4060', chop:'#ffb020', blowoff:'#ff6b00' };
+    regimeEl.style.color = colors[regime] || 'var(--text-muted)';
+    regimeEl.textContent = [regime?.toUpperCase(), strat?.toUpperCase()].filter(Boolean).join(' › ') || '--';
+  }
   $('statWinLoss').textContent = (s.wins||0) + 'W / ' + (s.losses||0) + 'L';
   const total = (s.wins||0)+(s.losses||0);
   const wr = total>0 ? ((s.wins||0)/total*100).toFixed(1) : '0.0';
@@ -2516,24 +2529,46 @@ function renderPositions(positions) {
     return;
   }
 
-  // If we're transitioning from empty to populated, clear the placeholder.
-  if (body.querySelector('.watch-row') === null) body.innerHTML = '';
-
-  // Build a map of currently-live symbols so we can diff.
-  const wanted = new Set(positions.map(p => p.symbol));
-  const existing = {};
-  body.querySelectorAll('.watch-row').forEach(row => {
-    existing[row.dataset.symbol] = row;
-  });
-
-  // Remove rows for symbols that are no longer open (position closed).
-  for (const sym in existing) {
-    if (!wanted.has(sym)) existing[sym].remove();
+  // Deduplicate by base symbol — NVDA, NVDA_SHORT, NVDA_SCALP_SHORT
+  // all collapse into one row showing the most prominent position.
+  // Priority: SHORT > LONG > SCALP (swing positions matter most for display)
+  const deduped = [];
+  const seen = new Map(); // baseSym → index in deduped
+  for (const p of positions) {
+    const baseSym = cleanSym(p.symbol); // strips _SHORT, _SCALP etc
+    const side    = (p.side || '').toUpperCase();
+    const isScalp = p.symbol.includes('_SCALP') || side.includes('SCALP');
+    if (seen.has(baseSym)) {
+      // Merge: prefer swing over scalp, combine qty/pnl
+      const existing_p = deduped[seen.get(baseSym)];
+      if (!isScalp) {
+        // Non-scalp wins — replace scalp row with swing row
+        deduped[seen.get(baseSym)] = {
+          ...p,
+          symbol:  baseSym + (side.includes('SHORT') ? '_SHORT' : ''),
+          _merged: true,
+        };
+      }
+      // Either way, add PnL together
+      deduped[seen.get(baseSym)].pnl = ((deduped[seen.get(baseSym)].pnl || 0) + (p.pnl || 0));
+    } else {
+      seen.set(baseSym, deduped.length);
+      deduped.push({ ...p, _baseSym: baseSym });
+    }
   }
 
-  // Update-in-place or append — never rebuild the container innerHTML, so
-  // the DOM node persists from position open → close without flicker.
-  positions.forEach((p, i) => {
+  if (body.querySelector('.watch-row') === null) body.innerHTML = '';
+
+  const wanted = new Set(deduped.map(p => p.symbol));
+  const existingRows = {};
+  body.querySelectorAll('.watch-row').forEach(row => {
+    existingRows[row.dataset.symbol] = row;
+  });
+  for (const sym in existingRows) {
+    if (!wanted.has(sym)) existingRows[sym].remove();
+  }
+
+  deduped.forEach((p, i) => {
     const side      = p.side || 'LONG';
     const up        = (p.pnl_pct || 0) >= 0;
     const priceStr  = fmt(p.current_price);
@@ -2595,6 +2630,23 @@ function filterPositions(query) {
 
 function renderPositionsTable(positions) {
   const tbody = $('positionsTableBody');
+
+  // Deduplicate by base symbol — collapse NVDA + NVDA_SHORT + NVDA_SCALP into one row
+  const seen = new Map();
+  const deduped = [];
+  for (const p of positions) {
+    const base = cleanSym(p.symbol);
+    const isScalp = p.symbol.includes('_SCALP') || (p.side||'').toUpperCase().includes('SCALP');
+    if (seen.has(base)) {
+      if (!isScalp) deduped[seen.get(base)] = p; // swap scalp for swing
+      deduped[seen.get(base)].pnl = ((deduped[seen.get(base)].pnl||0) + (p.pnl||0));
+    } else {
+      seen.set(base, deduped.length);
+      deduped.push({...p});
+    }
+  }
+  positions = deduped;
+
   $('openCount').textContent = '(' + positions.length + ')';
 
   // Compute open P&L from position fields
