@@ -6582,13 +6582,13 @@ async function coverShort(sym, price, reason) {
   // Immediately delete from Supabase so dashboard reflects closure instantly.
   sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}_SHORT`, 'DELETE').catch(() => {});
 
-  // Stamp cooldown on stop-loss short exits
-  if (reason === 'STOP_LOSS') {
+  // Cooldown on any losing exit — prevents SCHW-style double-loss
+  if (pnl < 0 && ['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) {
     const lossAbs = Math.abs(pnl);
-    const cooldownMins = lossAbs > 100 ? 15 : lossAbs > 30 ? 10 : 5;
+    const cooldownMins = lossAbs > 100 ? 20 : lossAbs > 30 ? 12 : 8;
     stopLossCooldown[sym] = Date.now() + cooldownMins * 60 * 1000;
-    log('risk', `⏳ ${sym} re-entry cooldown: ${cooldownMins}min after SHORT ${reason} ($${pnl.toFixed(2)})`);
-    markPMRBFailed(sym); // PMRB: one attempt per symbol per day
+    log('risk', `⏳ ${sym} cooldown: ${cooldownMins}min after ${reason} ($${pnl.toFixed(2)})`);
+    markPMRBFailed(sym);
   }
 
   const icon = { STOP_LOSS:'🛑', TAKE_PROFIT:'🎯', TRAILING_STOP:'📉', SIGNAL:'📤', TIME_STOP:'⏰' }[reason] || '📤';
@@ -6857,12 +6857,13 @@ async function exitPosition(sym, price, reason) {
 
   // Stamp cooldown on stop-loss exits — prevents immediate re-entry into same failing trade
   // Cooldown scales with loss: small loss = 5min, large loss = 15min
-  if (['STOP_LOSS','BREAK_EVEN_STOP'].includes(reason)) {
+  // Cooldown on any losing long exit — MANUAL_CLOSE included (SCHW double-loss fix)
+  if (pnl < 0 && ['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) {
     const lossAbs = Math.abs(pnl);
-    const cooldownMins = lossAbs > 100 ? 15 : lossAbs > 30 ? 10 : 5;
+    const cooldownMins = lossAbs > 100 ? 20 : lossAbs > 30 ? 12 : 8;
     stopLossCooldown[sym] = Date.now() + cooldownMins * 60 * 1000;
-    log('risk', `⏳ ${sym} re-entry cooldown: ${cooldownMins}min after ${reason} ($${pnl.toFixed(2)})`);
-    markPMRBFailed(sym); // PMRB: one attempt per symbol per day
+    log('risk', `⏳ ${sym} cooldown: ${cooldownMins}min after ${reason} ($${pnl.toFixed(2)})`);
+    markPMRBFailed(sym);
   }
 
   trades.push({ time: new Date(), sym, side: 'SELL', qty: qtyToSell, price, pnl, reason });
@@ -7496,9 +7497,11 @@ async function runAIAdvisor(sym, price, bars, pos) {
   if (isSimMode()) return null;
   if (CONFIG.aiNewsEnabled === false) return null; // same toggle controls all AI usage
 
-  // Only run every 5 minutes per position (was 2 min — too frequent, burns tokens)
   const now = Date.now();
   if (aiAdvisorLastRun[sym] && now - aiAdvisorLastRun[sym] < 300000) return null;
+  // Don't fire AI advisor within 3 minutes of entry — gives trade time to develop
+  const posAge = pos?.entryTime ? (now - new Date(pos.entryTime).getTime()) / 1000 : 999;
+  if (posAge < 180) return null; // 3 min minimum hold before AI can advise
   aiAdvisorLastRun[sym] = now;
 
   try {
@@ -9527,8 +9530,13 @@ async function spreadIsAcceptable(symbol, price) {
     // After-hours spreads are naturally wide (8-15%) — don't filter them
     // Only enforce spread during regular market hours
     const etHr = getETTime().getHours();
-    const isRegularHours = etHr >= 9 && etHr < 16;
-    const maxSpread = isRegularHours ? 0.005 : 0.15; // 0.5% regular, 15% extended
+    const etMin = getETTime().getMinutes();
+    // Market hours 9:30-16:00 ET = tightest spreads
+    // Pre/post market 4-9:30 and 16-20 = wider but still liquid
+    // Deep overnight = very wide, skip most
+    const isMarketHours = (etHr === 9 && etMin >= 30) || (etHr >= 10 && etHr < 16);
+    const isExtendedHours = (etHr >= 4 && etHr < 9) || (etHr === 9 && etMin < 30) || (etHr >= 16 && etHr < 20);
+    const maxSpread = isMarketHours ? 0.007 : isExtendedHours ? 0.02 : 0.15; // 0.7% market, 2% extended
     if (spreadPct > maxSpread) {
       log('filter', `${symbol} spread too wide: ${(spreadPct*100).toFixed(3)}% — skipping`);
       return false;
