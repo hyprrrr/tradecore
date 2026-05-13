@@ -43,6 +43,9 @@ async function getFetch() {
 // ─────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────
+// Permanently excluded symbols — delisted or no data sources
+const SCAN_EXCLUSIONS = new Set(['SQ', 'FB', 'TWTR']); // SQ→XYZ, FB→META, TWTR→delisted
+
 const CONFIG = {
   alpacaKey:    process.env.ALPACA_KEY    || '',
   alpacaSecret: process.env.ALPACA_SECRET || '',
@@ -1749,7 +1752,7 @@ async function syncPortfolio() {
       return a + (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty);
     }, 0);
     const equity = portfolio + openVal + shortPnl;
-    const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
+    const dayPnl = realDailyStartEquity > 80000 ? equity - realDailyStartEquity : (equity - (lastEquity || equity));
     if (equity > 0) {
       realEquity = equity;
       // Set daily baseline from Alpaca's last_equity (previous day close)
@@ -3335,7 +3338,7 @@ async function runSimScan() {
     return acc + (pos.entryPrice - cur) * (pos.qtyRemaining || pos.qty);
   }, 0);
   const equity = portfolio + positionMarketValue + shortPnl;
-  const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
+  const dayPnl = realDailyStartEquity > 80000 ? equity - realDailyStartEquity : (equity - (lastEquity || equity));
   realEquity   = equity;
 
   // Write positions + portfolio in parallel — atomic so dashboard never sees mismatched state
@@ -8756,8 +8759,19 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
     return;
   }
 
+  // ── VOLATILITY GUARD for scalps ─────────────────────────────────
+  // High-ATR stocks (TSLA, MSTR) move too fast for scalp stops — skip them
+  const scalpBars = barCache.get(`${sym}_5Min`)?.bars;
+  if (scalpBars && scalpBars.length >= 14) {
+    const scalpAtr    = atr(scalpBars, 14);
+    const scalpAtrPct = scalpAtr / bars1m[bars1m.length-1]?.c || 0;
+    if (scalpAtrPct > 0.015) { // 1.5% ATR per 5m bar = too volatile for scalp
+      log('scalp', `⚠️ ${sym} skipping scalp — ATR too high (${(scalpAtrPct*100).toFixed(2)}% > 1.5%)`);
+      return;
+    }
+  }
+
   // ── EDGE GATE ── (scalps get same regime + volume + time-of-day filters)
-  // Mark as scalp so edge gate exempts it from sentiment/swing direction blocks
   const scalpSigInfo = { ...sigInfo, isScalp: true, scalp: true };
   const edge = await edgeGate(sym, direction, scalpSigInfo, null);
   if (!edge.pass) {
@@ -10134,7 +10148,7 @@ async function handleSlashCommand(commandName, options) {
       return a + (cur - p.entryPrice) * (p.qtyRemaining || p.qty);
     }, 0);
     const equity = realEquity || portfolio + openPnl;
-    const dayPnl = equity - (realDailyStartEquity || CONFIG.startingCapital);
+    const dayPnl = realDailyStartEquity > 80000 ? equity - realDailyStartEquity : (equity - (lastEquity || equity));
     const allPos = [
       ...Object.entries(positions).map(([s,p])      => `• **${s}** ${formatPosition(s,p,false)}`),
       ...Object.entries(shortPositions).map(([s,p]) => `• **${s}** ${formatPosition(s,p,true)}`),
