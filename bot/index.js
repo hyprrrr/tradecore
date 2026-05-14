@@ -10512,6 +10512,55 @@ http.createServer(async (req, res) => {
   }
 
   // ── GET /diagnostic — full state dump for debugging equity spikes ──
+  // ── GET /prices — ultra-lightweight live price feed ──────────────
+  // Returns alpacaLivePrice for all open positions + watchlist top 20
+  // Dashboard polls this every 1 second for real-time position P&L
+  // No DB calls, no Alpaca calls — just returns in-memory data instantly
+  if (req.method === 'GET' && url === '/prices') {
+    const openSyms = [
+      ...Object.keys(positions),
+      ...Object.keys(shortPositions),
+      ...Object.keys(scalpPositions),
+    ];
+    // Build price map — open positions first, then top watchlist
+    const prices = {};
+    for (const sym of openSyms) {
+      if (alpacaLivePrice[sym] > 0) prices[sym] = alpacaLivePrice[sym];
+    }
+    // Include all available live prices for active symbols
+    for (const [sym, price] of Object.entries(alpacaLivePrice)) {
+      if (price > 0 && sym !== '_regime') prices[sym] = price;
+    }
+    // Include open position details for P&L calc
+    const posDetails = {};
+    for (const [sym, pos] of Object.entries(positions)) {
+      posDetails[sym] = {
+        side: 'long',
+        entry: pos.entryPrice,
+        qty:   pos.qtyRemaining || pos.qty,
+        price: alpacaLivePrice[sym] || pos.entryPrice,
+        pnl:   ((alpacaLivePrice[sym] || pos.entryPrice) - pos.entryPrice) * (pos.qtyRemaining || pos.qty),
+      };
+    }
+    for (const [sym, pos] of Object.entries(shortPositions)) {
+      posDetails[sym + '_SHORT'] = {
+        side: 'short',
+        entry: pos.entryPrice,
+        qty:   pos.qtyRemaining || pos.qty,
+        price: alpacaLivePrice[sym] || pos.entryPrice,
+        pnl:   (pos.entryPrice - (alpacaLivePrice[sym] || pos.entryPrice)) * (pos.qtyRemaining || pos.qty),
+      };
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      prices,
+      positions: posDetails,
+      equity:    realEquity,
+      ts:        Date.now(),
+    }));
+    return;
+  }
+
   if (req.method === 'GET' && url === '/diagnostic') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
 
