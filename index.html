@@ -1038,6 +1038,112 @@
   .panel:nth-child(2) { animation-delay: 0.05s; }
   .panel:nth-child(3) { animation-delay: 0.10s; }
   .panel:nth-child(4) { animation-delay: 0.15s; }
+
+  /* ═══════════════════════════════════════════════════════
+     CUSTOM GLASS DROPDOWN — replaces native <select>
+     Animated, dark-themed, no OS white popup
+  ═══════════════════════════════════════════════════════ */
+  .c-select {
+    position: relative;
+    display: inline-block;
+    min-width: 200px;
+    user-select: none;
+  }
+  .c-select-trigger {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 12.5px;
+    font-family: var(--font);
+    color: var(--text);
+    transition: all .15s ease;
+    backdrop-filter: blur(12px);
+  }
+  .c-select-trigger:hover {
+    background: rgba(255,255,255,0.09);
+    border-color: rgba(255,255,255,0.18);
+  }
+  .c-select.open .c-select-trigger {
+    background: rgba(255,255,255,0.1);
+    border-color: rgba(0,229,199,0.4);
+    box-shadow: 0 0 0 3px rgba(0,229,199,0.08);
+  }
+  .c-select-arrow {
+    width: 14px; height: 14px;
+    flex-shrink: 0;
+    opacity: 0.5;
+    transition: transform .2s ease, opacity .15s;
+  }
+  .c-select.open .c-select-arrow {
+    transform: rotate(180deg);
+    opacity: 1;
+  }
+  .c-select-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0; right: 0;
+    background: rgba(12,12,20,0.97);
+    backdrop-filter: blur(40px) saturate(180%);
+    -webkit-backdrop-filter: blur(40px) saturate(180%);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 14px;
+    padding: 6px;
+    z-index: 9999;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.7), 0 1px 0 rgba(255,255,255,0.06) inset;
+    /* Animation */
+    transform-origin: top center;
+    transform: scaleY(0.85) translateY(-8px);
+    opacity: 0;
+    pointer-events: none;
+    transition: transform .18s cubic-bezier(0.34,1.56,0.64,1), opacity .15s ease;
+  }
+  .c-select.open .c-select-menu {
+    transform: scaleY(1) translateY(0);
+    opacity: 1;
+    pointer-events: all;
+  }
+  .c-select-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    border-radius: 9px;
+    font-size: 12.5px;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background .1s, color .1s;
+    white-space: nowrap;
+  }
+  .c-select-option:hover {
+    background: rgba(255,255,255,0.08);
+    color: var(--text);
+  }
+  .c-select-option.selected {
+    background: rgba(0,229,199,0.1);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .c-select-option.selected::after {
+    content: '';
+    display: block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    margin-left: auto;
+  }
+  /* Divider between option groups */
+  .c-select-divider {
+    height: 1px;
+    background: rgba(255,255,255,0.07);
+    margin: 4px 6px;
+  }
 </style>
 </head>
 <body>
@@ -1457,29 +1563,43 @@
           <div class="settings-section-title">⚡ Strategy</div>
           <div class="settings-row">
             <span class="settings-label">Strategy</span>
-            <select class="settings-select" id="setStrategy" style="width:auto;" onchange="saveSetting('strategy', this.value).then(() => { const s=$('settingsSaveStatus'); if(s){s.textContent='✓ Strategy saved'; s.style.color='var(--buy)'; setTimeout(()=>s.textContent='',2000);}})">
-              <option value="rsi_macd">RSI + MACD (default)</option>
-              <option value="smc">SMC</option>
-              <option value="ict">ICT</option>
-              <option value="vwap_reversion">VWAP Reversion</option>
-              <option value="order_flow">Order Flow</option>
-              <option value="wyckoff">Wyckoff</option>
-              <option value="auto">🤖 Auto (regime-based)</option>
-              <option value="4hrs">4-Hour Range Scalp</option>
-              <option value="pmrb">Pre-Market Range Break (8AM)</option>
-              <option value="orb">Opening Range Breakout</option>
-              <option value="trend_pullback">Trend Pullback to VWAP</option>
-              <option value="bb_divergence">BB + RSI Divergence</option>
-            </select>
+            <div class="c-select" id="setStrategy" data-field="strategy" data-value="rsi_macd">
+              <div class="c-select-trigger" onclick="cSelectToggle('setStrategy')">
+                <span class="c-select-label">RSI + MACD (default)</span>
+                <svg class="c-select-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+              </div>
+              <div class="c-select-menu">
+                <div class="c-select-option selected" data-value="rsi_macd" onclick="cSelectPick('setStrategy','rsi_macd',this)">RSI + MACD (default)</div>
+                <div class="c-select-option" data-value="auto" onclick="cSelectPick('setStrategy','auto',this)">🤖 Auto (regime-based)</div>
+                <div class="c-select-divider"></div>
+                <div class="c-select-option" data-value="pmrb" onclick="cSelectPick('setStrategy','pmrb',this)">Pre-Market Range Break</div>
+                <div class="c-select-option" data-value="4hrs" onclick="cSelectPick('setStrategy','4hrs',this)">4-Hour Range Scalp</div>
+                <div class="c-select-option" data-value="orb" onclick="cSelectPick('setStrategy','orb',this)">Opening Range Breakout</div>
+                <div class="c-select-option" data-value="trend_pullback" onclick="cSelectPick('setStrategy','trend_pullback',this)">Trend Pullback to VWAP</div>
+                <div class="c-select-divider"></div>
+                <div class="c-select-option" data-value="vwap_reversion" onclick="cSelectPick('setStrategy','vwap_reversion',this)">VWAP Reversion</div>
+                <div class="c-select-option" data-value="bb_divergence" onclick="cSelectPick('setStrategy','bb_divergence',this)">BB + RSI Divergence</div>
+                <div class="c-select-option" data-value="smc" onclick="cSelectPick('setStrategy','smc',this)">SMC</div>
+                <div class="c-select-option" data-value="ict" onclick="cSelectPick('setStrategy','ict',this)">ICT</div>
+                <div class="c-select-option" data-value="order_flow" onclick="cSelectPick('setStrategy','order_flow',this)">Order Flow</div>
+                <div class="c-select-option" data-value="wyckoff" onclick="cSelectPick('setStrategy','wyckoff',this)">Wyckoff</div>
+              </div>
+            </div>
           </div>
           <div class="settings-row">
             <label class="settings-label">Market Sentiment</label>
-            <select class="settings-select" id="setMarketSentiment" style="width:auto;" title="Controls which directions are allowed. Auto = derived from SPY regime each scan." onchange="saveSetting('market_sentiment', this.value).then(() => { const s=$('settingsSaveStatus'); if(s){s.textContent='✓ Sentiment saved'; s.style.color='var(--buy)'; setTimeout(()=>s.textContent='',2000);}})">
-              <option value="auto">🤖 Auto (SPY-driven)</option>
-              <option value="bullish">📈 Bullish — Longs only</option>
-              <option value="bearish">📉 Bearish — Shorts only</option>
-              <option value="neutral">↔️ Neutral — Both directions</option>
-            </select>
+            <div class="c-select" id="setMarketSentiment" data-field="market_sentiment" data-value="auto">
+              <div class="c-select-trigger" onclick="cSelectToggle('setMarketSentiment')">
+                <span class="c-select-label">🤖 Auto (SPY-driven)</span>
+                <svg class="c-select-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+              </div>
+              <div class="c-select-menu">
+                <div class="c-select-option selected" data-value="auto" onclick="cSelectPick('setMarketSentiment','auto',this)">🤖 Auto (SPY-driven)</div>
+                <div class="c-select-option" data-value="bullish" onclick="cSelectPick('setMarketSentiment','bullish',this)">📈 Bullish — Longs only</div>
+                <div class="c-select-option" data-value="neutral" onclick="cSelectPick('setMarketSentiment','neutral',this)">↔️ Neutral — Both directions</div>
+                <div class="c-select-option" data-value="bearish" onclick="cSelectPick('setMarketSentiment','bearish',this)">📉 Bearish — Shorts only</div>
+              </div>
+            </div>
             <span style="font-size:10px;color:var(--text-dim);margin-left:8px;">Blocks counter-trend trades</span>
           </div>
           <div class="settings-row">
@@ -3737,6 +3857,66 @@ function updateClock() {
     : `${local} ${tzLabel}  (${et} ET)`;
 }
 
+// ═══════════════════════════════════════ CUSTOM DROPDOWNS ═══════════════════════════════════════
+// Glass animated dropdowns — replaces native OS <select> elements
+// All state tracked on the DOM element via data-value attribute
+
+function cSelectToggle(id) {
+  const el = $(id);
+  if (!el) return;
+  const isOpen = el.classList.contains('open');
+  // Close all other dropdowns first
+  document.querySelectorAll('.c-select.open').forEach(d => {
+    if (d !== el) d.classList.remove('open');
+  });
+  el.classList.toggle('open', !isOpen);
+}
+
+function cSelectPick(id, value, optionEl) {
+  const el = $(id);
+  if (!el) return;
+  // Update selected state
+  el.querySelectorAll('.c-select-option').forEach(o => o.classList.remove('selected'));
+  optionEl.classList.add('selected');
+  // Update trigger label
+  const label = el.querySelector('.c-select-label');
+  if (label) label.textContent = optionEl.textContent.trim();
+  // Store value
+  el.dataset.value = value;
+  // Close menu
+  el.classList.remove('open');
+  // Save to Supabase — same flow as old <select> onchange
+  const field = el.dataset.field;
+  if (field) {
+    saveSetting(field, value).then(() => {
+      const s = $('settingsSaveStatus');
+      if (s) { s.textContent = '✓ Saved'; s.style.color = 'var(--buy)'; setTimeout(() => s.textContent = '', 2000); }
+    }).catch(() => {});
+    addLog('info', `Setting ${field} → ${value}`);
+  }
+}
+
+// Close dropdown when clicking outside
+document.addEventListener('click', e => {
+  if (!e.target.closest('.c-select')) {
+    document.querySelectorAll('.c-select.open').forEach(d => d.classList.remove('open'));
+  }
+});
+
+// Helper: set a custom dropdown value programmatically (for loading settings)
+function cSelectSet(id, value) {
+  const el = $(id);
+  if (!el) return;
+  el.dataset.value = value;
+  const opt = el.querySelector(`.c-select-option[data-value="${value}"]`);
+  if (opt) {
+    el.querySelectorAll('.c-select-option').forEach(o => o.classList.remove('selected'));
+    opt.classList.add('selected');
+    const label = el.querySelector('.c-select-label');
+    if (label) label.textContent = opt.textContent.trim();
+  }
+}
+
 // ═══════════════════════════════════════ MOBILE VIEW ═══════════════════════════════════════
 // Uses m-active class toggling — much simpler and glitch-free vs CSS class combos
 let _mobileView = 'chart';
@@ -4063,11 +4243,9 @@ function populateSettingsForm() {
   set('setRecovery', s.recovery_mode);
   set('setSim',      s.sim_mode);
 
-  // Strategy dropdown
-  const strat = $('setStrategy');
-  if (strat && s.strategy) strat.value = s.strategy;
-  const sentSel = $('setMarketSentiment');
-  if (sentSel && (s.market_sentiment || s.marketSentiment)) sentSel.value = s.market_sentiment || s.marketSentiment;
+  // Strategy + sentiment — use cSelectSet for custom dropdowns
+  cSelectSet('setStrategy', s.strategy || 'rsi_macd');
+  cSelectSet('setMarketSentiment', s.market_sentiment || s.marketSentiment || 'auto');
 
   // Numbers
   const setN = (id, val) => { const e=$(id); if(e&&val!=null) e.value = val; };
@@ -4175,8 +4353,8 @@ async function saveAllSettings() {
     recovery_mode:     gb('setRecovery'),
     ai_news_enabled:   $('aiNewsToggle')?.checked ?? true,
     sim_mode:          gb('setSim'),
-    strategy:          g('setStrategy'),
-    market_sentiment:  g('setMarketSentiment') || undefined,  // snake_case matches Supabase column
+    strategy:          $('setStrategy')?.dataset?.value || g('setStrategy') || 'rsi_macd',
+    market_sentiment:  $('setMarketSentiment')?.dataset?.value || g('setMarketSentiment') || 'auto',
     starting_capital:  +g('setStartCap') || undefined,
     max_positions:     +g('setMaxPos')   || undefined,
     max_position_pct:  +g('setPosPct')   || undefined,
