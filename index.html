@@ -3019,7 +3019,13 @@ let _liveCandleLastBucketKey = 0;
 
 function tickLiveCandle() {
   if (state._chartPaused) return;
-  const v = state.portfolio ? +state.portfolio.total_value : null;
+  // Use best available equity value from multiple sources
+  const v = +(
+    state.portfolio?.total_value ||
+    state.botStatus?.equity ||
+    state.portfolio?.equity ||
+    0
+  );
   if (!Number.isFinite(v) || v <= 0) return;
   if (!chart.allCandles?.length) return;
 
@@ -3072,11 +3078,9 @@ function tickLiveCandle() {
   if (v > last.high) last.high = v;
   if (v < last.low)  last.low  = v;
 
-  // Redraw on value change, or heartbeat every 4s to keep label fresh
-  const now2      = Date.now();
-  const changed   = v !== prevClose;
-  const heartbeat = !tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 4000;
-  if (changed || heartbeat) {
+  // Always redraw — heartbeat keeps price label and live candle current
+  const now2 = Date.now();
+  if (!tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 2000) {
     tickLiveCandle._lastRedraw = now2;
     redrawChart();
   }
@@ -3088,34 +3092,45 @@ function buildCandlesForTF(snapshots, tf) {
   const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
   const bucketMs = msMap[tf] || 3600e3;
 
-  // Group snapshots into bucket keys.
+  // Step 1: Group snapshots into buckets
   const buckets = {};
+  let firstKey = Infinity, lastKey = -Infinity;
   snapshots.forEach(s => {
+    const val = +s.value;
+    if (!isFinite(val) || val <= 0) return;
     const t   = new Date(s.created_at).getTime();
     const key = Math.floor(t / bucketMs) * bucketMs;
-    if (!buckets[key]) buckets[key] = { time: new Date(key), values: [] };
-    buckets[key].values.push(+s.value);
+    if (!buckets[key]) buckets[key] = { values: [] };
+    buckets[key].values.push(val);
+    if (key < firstKey) firstKey = key;
+    if (key > lastKey)  lastKey  = key;
   });
+  if (firstKey === Infinity) return [];
 
-  const keys = Object.keys(buckets).map(Number).sort((a, b) => a - b);
-  if (keys.length < 1) return [];
+  // Step 2: Fill ALL buckets from first to last (including empty ones)
+  // Empty buckets get forward-filled with previous close — same as TradingView
+  // This eliminates gaps and makes the chart look continuous
+  const nowKey    = Math.floor(Date.now() / bucketMs) * bucketMs;
+  const endKey    = Math.min(lastKey, nowKey); // don't generate future candles
+  const candles   = [];
+  let lastClose   = null;
 
-  // Build one candle per bucket — clean, no merging, no gaps
-  // The Y-axis range is set per TF so flat periods don't look squished
-  const filled = [];
-  let lastClose = null;
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i];
-    const b   = buckets[key];
-    const v   = b.values;
-    const open  = lastClose != null ? lastClose : v[0];
-    const close = v[v.length - 1];
-    const high  = Math.max(open, close, ...v);
-    const low   = Math.min(open, close, ...v);
-    filled.push({ time: b.time, open, high, low, close, volume: v.length });
-    lastClose = close;
+  for (let key = firstKey; key <= endKey; key += bucketMs) {
+    const b = buckets[key];
+    if (b) {
+      const v     = b.values;
+      const open  = lastClose != null ? lastClose : v[0];
+      const close = v[v.length - 1];
+      const high  = Math.max(open, close, ...v);
+      const low   = Math.min(open, close, ...v);
+      candles.push({ time: new Date(key), open, high, low, close, volume: v.length });
+      lastClose = close;
+    } else if (lastClose !== null) {
+      // Empty bucket — flat candle at last known price (forward-fill)
+      candles.push({ time: new Date(key), open: lastClose, high: lastClose, low: lastClose, close: lastClose, volume: 0 });
+    }
   }
-  return filled;
+  return candles;
 }
 
 function setTF(tf) {
@@ -3190,7 +3205,7 @@ function _redrawChartImmediate() {
   const rawRng = maxP - minP || 1;
 
   // Force minimum visual range = 0.25% of price
-  const minVisualRng = maxP * 0.0025;
+  const minVisualRng = maxP * 0.006;
   const rng    = Math.max(rawRng, minVisualRng);
   const midP   = (minP + maxP) / 2;
 
@@ -3198,7 +3213,7 @@ function _redrawChartImmediate() {
   // yScale > 1 = zoomed in (tighter range), < 1 = zoomed out (wider range)
   const yScl   = chart.yScale || 1.0;
   const yOff   = chart.yOffset || 0;
-  const halfRng = (rng * 0.75) / yScl;   // half of visible range
+  const halfRng = (rng * 0.65) / yScl;   // half of visible range
   const yMin   = midP - halfRng + yOff;
   const yMax   = midP + halfRng + yOff;
   const yRng   = yMax - yMin || 1;
@@ -3275,18 +3290,18 @@ function _redrawChartImmediate() {
     svg.appendChild(svgPath(bpL, 'none', 'rgba(0,229,199,0.2)', '1'));
   }
 
-  // ── Candles — TradingView-style tight layout ─────────────────
-  // Key: slot = total space per candle. Body uses 72% of slot.
-  // 1px gap on each side = natural breathing room without looking sparse.
-  // Minimum body height 1px (doji), max candle width 16px.
-  const slotW  = cw / Math.max(visible.length, 1);
-  const candleW = Math.max(2, Math.min(16, slotW * 0.72));
-  const wickW   = Math.max(1, Math.min(1.5, candleW * 0.13));
+  // ── Candles — TradingView-style ─────────────────────────────
+  // TV uses ~60% body width of slot. Wicks are 1px always.
+  // At 100 candles: slotW~6px, candleW~4px — tight and dense like TV.
+  // At 20 candles: slotW~30px, candleW~18px — zoomed in, wider bodies.
+  const slotW   = cw / Math.max(visible.length, 1);
+  const candleW = Math.max(1.5, Math.min(20, slotW * 0.6));
+  const wickW   = 1; // always 1px wicks — exactly like TV
 
-  // TV color scheme: bull = #2962ff solid, bear = dark body + blue border
-  const BULL_FILL   = '#2962ff';
-  const BEAR_FILL   = '#131722';
-  const BEAR_STROKE = '#2962ff';
+  // Colors matching TV dark theme
+  const BULL_FILL   = '#2962ff';   // solid blue bull
+  const BEAR_FILL   = '#131722';   // dark bear body
+  const BEAR_STROKE = '#2962ff';   // blue outline on bear
   const WICK_COL    = '#2962ff';
 
   visible.forEach((d, i) => {
@@ -3589,7 +3604,7 @@ function initChartInteraction() {
 
   // ── DOUBLE-CLICK — reset view to default ─────────────────────
   wrap.addEventListener('dblclick', () => {
-    chart.viewCount = Math.min(100, chart.allCandles?.length || 100);
+    chart.viewCount = Math.min(120, chart.allCandles?.length || 120); // more candles = denser/tighter chart
     chart.viewStart = Math.max(0, (chart.allCandles?.length || 0) - chart.viewCount);
     chart.yScale    = 1.0;
     chart.yOffset   = 0;
