@@ -6582,8 +6582,9 @@ async function coverShort(sym, price, reason) {
   // Immediately delete from Supabase so dashboard reflects closure instantly.
   sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}_SHORT`, 'DELETE').catch(() => {});
 
-  // Cooldown on any losing exit — prevents SCHW-style double-loss
-  if (pnl < 0 && ['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) {
+  // Cooldown on losses + any MANUAL_CLOSE (even breakeven)
+  if ((pnl < 0 && ['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) ||
+      (reason === 'MANUAL_CLOSE' && pnl <= 1)) {
     const lossAbs = Math.abs(pnl);
     const cooldownMins = lossAbs > 100 ? 20 : lossAbs > 30 ? 12 : 8;
     stopLossCooldown[sym] = Date.now() + cooldownMins * 60 * 1000;
@@ -6857,8 +6858,9 @@ async function exitPosition(sym, price, reason) {
 
   // Stamp cooldown on stop-loss exits — prevents immediate re-entry into same failing trade
   // Cooldown scales with loss: small loss = 5min, large loss = 15min
-  // Cooldown on any losing long exit — MANUAL_CLOSE included (SCHW double-loss fix)
-  if (pnl < 0 && ['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) {
+  // Cooldown on losing exits + any MANUAL_CLOSE (even at breakeven — prevents re-entry spam)
+  if ((pnl < 0 && ['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) ||
+      (reason === 'MANUAL_CLOSE' && pnl <= 1)) {
     const lossAbs = Math.abs(pnl);
     const cooldownMins = lossAbs > 100 ? 20 : lossAbs > 30 ? 12 : 8;
     stopLossCooldown[sym] = Date.now() + cooldownMins * 60 * 1000;
@@ -6985,7 +6987,14 @@ async function runRecoveryScan() {
   }
 
   recoveryState.attempts++;
-  log('recovery', `🔄 Recovery scan #${recoveryState.attempts}: scanning ${Math.min(scanList.length, 12)} symbols`);
+  // Cap recovery at 15 attempts (~8 min) — don't chase losses all day
+  if (recoveryState.attempts > 15) {
+    log('recovery', `🔄 Recovery cap hit (${recoveryState.attempts} attempts) — accepting loss, resuming normal scan`);
+    recoveryState.active  = false;
+    recoveryState.attempts = 0;
+    return;
+  }
+  log('recovery', `🔄 Recovery scan #${recoveryState.attempts}/15: scanning ${Math.min(scanList.length, 12)} symbols`);
 
   const MIN_RECOVERY_CONF = 65;
   let bestSig = null, bestSym = null, bestBars = null;
@@ -8862,7 +8871,8 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   const scalpBars = barCache.get(`${sym}_5Min`)?.bars;
   if (scalpBars && scalpBars.length >= 14) {
     const scalpAtr    = atr(scalpBars, 14);
-    const scalpAtrPct = scalpAtr / bars1m[bars1m.length-1]?.c || 0;
+    const scalpPrice  = alpacaLivePrice[sym] || scalpBars[scalpBars.length-1]?.c || 1;
+    const scalpAtrPct = scalpAtr / scalpPrice;
     if (scalpAtrPct > 0.015) { // 1.5% ATR per 5m bar = too volatile for scalp
       log('scalp', `⚠️ ${sym} skipping scalp — ATR too high (${(scalpAtrPct*100).toFixed(2)}% > 1.5%)`);
       return;
