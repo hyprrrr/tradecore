@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/lightweight-charts/4.1.3/lightweight-charts.standalone.production.js"></script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ALPHACORE // Trading Bot Command Center</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2300e5c7'/><text x='16' y='22' font-family='Inter,system-ui,sans-serif' font-size='19' font-weight='800' text-anchor='middle' fill='%23070708'>A</text></svg>" />
@@ -309,7 +310,7 @@
   .ind-btn:hover { color: var(--text); background: rgba(255,255,255,0.09); }
   .ind-dot { width: 5px; height: 5px; border-radius: 50%; }
 
-  .chart-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: rgba(8,8,14,0.3); }
+  .chart-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: transparent; }
   #equityChart { width: 100%; height: 100%; }
   .chart-tooltip {
     position: absolute; pointer-events: none;
@@ -1280,8 +1281,8 @@
           <div class="legend-item"><div class="legend-line" style="background:#9b59b6"></div>VWAP</div>
           <div class="legend-item"><div class="legend-line" style="background:#3498db"></div>BB Upper</div>
         </div>
-        <svg id="equityChart" preserveAspectRatio="none"></svg>
-        <div class="chart-tooltip" id="chartTooltip"></div>
+        <div id="lwChart" style="position:absolute;inset:0;"></div>
+        <div class="chart-tooltip" id="chartTooltip" style="display:none;"></div>
       </div>
     </section>
 
@@ -2942,47 +2943,14 @@ function updateConnStatus() {
 
 // ═══════════════════════════════════════ EQUITY CHART (CANDLESTICKS FROM SNAPSHOTS) ═══════════════════════════════════════
 function renderEquityChart(snapshots) {
-  if (!snapshots || !snapshots.length) return;
-
+  if (!snapshots?.length) return;
   const last = snapshots[snapshots.length - 1];
   const hash = `${snapshots.length}|${last.created_at}|${(+last.value).toFixed(2)}`;
   if (hash === state._lastEquityHash && chart.allCandles.length) return;
-  state._lastEquityHash = hash;
-  state.equitySnapshots = snapshots;
-
-  // Rebuild from snapshots
-  const rebuilt = buildCandlesForTF(snapshots, chart.tf);
-
-  // Preserve any live candles (built by tickLiveCandle) that are newer
-  // than the last snapshot — these are the sub-poll real-time updates
-  // that would get wiped if we blindly replaced allCandles
-  if (chart.allCandles?.length && rebuilt.length) {
-    const lastRebuiltTime = rebuilt[rebuilt.length - 1].time instanceof Date
-      ? rebuilt[rebuilt.length - 1].time.getTime()
-      : +rebuilt[rebuilt.length - 1].time;
-
-    const liveCandles = chart.allCandles.filter(c => {
-      const ct = c.time instanceof Date ? c.time.getTime() : +c.time;
-      return c.live && ct > lastRebuiltTime;
-    });
-    if (liveCandles.length) {
-      rebuilt.push(...liveCandles);
-    }
-  }
-
-  drawCandlestickChart(rebuilt);
-
-  // Seed the last candle with current portfolio value so chart is live immediately
-  // without waiting for the next tickLiveCandle cycle
-  if (chart.allCandles?.length && state.portfolio?.total_value) {
-    const v    = +state.portfolio.total_value;
-    const last = chart.allCandles[chart.allCandles.length - 1];
-    if (Number.isFinite(v) && v > 0) {
-      last.close = v;
-      if (v > last.high) last.high = v;
-      if (v < last.low)  last.low  = v;
-    }
-  }
+  state._lastEquityHash  = hash;
+  state.equitySnapshots  = snapshots;
+  chart.allCandles = buildCandlesForTF(snapshots, chart.tf);
+  redrawChart();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2990,737 +2958,254 @@ function renderEquityChart(snapshots) {
 // ═══════════════════════════════════════════════════════════════
 
 // View state — persisted across redraws
+// ═══════════════════════════════════════════════════════════════════
+// LIGHTWEIGHT CHARTS ENGINE — TradingView's open-source chart library
+// Replaces the hand-rolled SVG engine entirely.
+// ═══════════════════════════════════════════════════════════════════
+
 const chart = {
-  allCandles: [],      // full dataset
-  viewStart:  0,       // index of leftmost visible candle
-  viewCount:  100,     // how many candles visible — tighter candles = more history
-  isDragging: false,
-  dragStartX: 0,
-  dragStartView: 0,
-  tf: '1H',            // current timeframe
+  tf:         '1H',
+  allCandles: [],
+  _lwChart:   null,  // LightweightCharts chart instance
+  _lwSeries:  null,  // candlestick series
+  _lwEma:     null,  // EMA line series
 };
 
-// Rebuild candles at a given timeframe from raw snapshots
-// ── LIVE CANDLE TICK ─────────────────────────────────────────────
-// Updates the current (right-most) candle in place using the latest
-// portfolio.total_value, then repaints. No Supabase round-trip.
-//
-// Logic per tick:
-//   1. Find which bucket "now" falls into at the active timeframe.
-//   2. If the last candle's time matches → extend it (update close, high, low).
-//   3. If we've crossed into a new bucket → start a fresh candle with
-//      open = prior close, then extend. This is exactly how TradingView
-//      rolls forward at bucket boundaries.
-//   4. Keep the user's viewport stable: if they were pinned to the right
-//      edge, slide with the new candle; otherwise don't touch the view.
-// Track which bucket the live candle last rendered so we detect boundary
-// crossings even when equity is flat (v === last.close every tick).
+let _lwReady = false;
 let _liveCandleLastBucketKey = 0;
 
-function tickLiveCandle() {
-  if (state._chartPaused) return;
-  // Use best available equity value from multiple sources
-  const v = +(
-    state.portfolio?.total_value ||
-    state.botStatus?.equity ||
-    state.portfolio?.equity ||
-    0
-  );
-  if (!Number.isFinite(v) || v <= 0) return;
-  if (!chart.allCandles?.length) return;
+// ── Init LW Chart ────────────────────────────────────────────────
+function initLWChart() {
+  const container = document.getElementById('lwChart');
+  if (!container || !window.LightweightCharts) return;
+  if (chart._lwChart) { chart._lwChart.remove(); }
 
-  const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
-  const bucketMs = msMap[chart.tf] || 3600e3;
-  const nowMs    = Date.now();
-  const key      = Math.floor(nowMs / bucketMs) * bucketMs;
+  chart._lwChart = LightweightCharts.createChart(container, {
+    layout: {
+      background:  { type: 'solid', color: 'transparent' },
+      textColor:   'rgba(255,255,255,0.45)',
+      fontSize:    11,
+      fontFamily:  "'DM Sans', system-ui, sans-serif",
+    },
+    grid: {
+      vertLines:   { color: 'rgba(255,255,255,0.04)' },
+      horzLines:   { color: 'rgba(255,255,255,0.04)' },
+    },
+    crosshair: {
+      mode: LightweightCharts.CrosshairMode.Normal,
+      vertLine: { color: 'rgba(255,255,255,0.3)', labelBackgroundColor: '#1a1a2e' },
+      horzLine: { color: 'rgba(255,255,255,0.3)', labelBackgroundColor: '#1a1a2e' },
+    },
+    rightPriceScale: {
+      borderColor:    'rgba(255,255,255,0.08)',
+      textColor:      'rgba(255,255,255,0.45)',
+      scaleMargins:   { top: 0.1, bottom: 0.1 },
+    },
+    timeScale: {
+      borderColor:       'rgba(255,255,255,0.08)',
+      textColor:         'rgba(255,255,255,0.35)',
+      timeVisible:       true,
+      secondsVisible:    false,
+      fixLeftEdge:       true,
+    },
+    handleScroll:   { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true },
+    handleScale:    { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
+    width:  container.clientWidth,
+    height: container.clientHeight,
+  });
 
-  const last      = chart.allCandles[chart.allCandles.length - 1];
-  const lastRawMs = last.time instanceof Date ? last.time.getTime() : +last.time;
-  const lastKey   = Math.floor(lastRawMs / bucketMs) * bucketMs;
-  const wasAtEdge = chart.viewStart + chart.viewCount >= chart.allCandles.length - 1;
+  // Candlestick series — TV color scheme
+  chart._lwSeries = chart._lwChart.addCandlestickSeries({
+    upColor:          '#2962ff',
+    downColor:        '#131722',
+    borderUpColor:    '#2962ff',
+    borderDownColor:  '#2962ff',
+    wickUpColor:      '#2962ff',
+    wickDownColor:    '#2962ff',
+  });
 
-  if (key > lastKey) {
-    // ── New time bucket — ALWAYS create a new candle ─────────────
-    // Previously we skipped flat buckets which caused the chart to
-    // freeze after 7 candles. Now we always advance — flat candles
-    // are fine (they show as a doji/flat line which is accurate).
-    // Gap-fill: if multiple buckets were skipped (bot was down etc),
-    // fill them as flat carries so the timeline is continuous.
-    const gapBuckets = Math.min(8, Math.floor((key - lastKey) / bucketMs) - 1);
-    for (let g = 1; g <= gapBuckets; g++) {
-      chart.allCandles.push({
-        time:   new Date(lastKey + g * bucketMs),
-        open:   last.close, high: last.close,
-        low:    last.close, close: last.close,
-        volume: 0, live: true,
-      });
+  // EMA line
+  chart._lwEma = chart._lwChart.addLineSeries({
+    color:     'rgba(255,185,0,0.8)',
+    lineWidth: 1.5,
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+
+  // Crosshair tooltip
+  chart._lwChart.subscribeCrosshairMove(param => {
+    const tt = document.getElementById('chartTooltip');
+    if (!tt) return;
+    if (!param.time || !param.seriesData?.size) {
+      tt.style.display = 'none'; return;
     }
-    // Push the current bucket candle
-    chart.allCandles.push({
-      time:   new Date(key),
-      open:   last.close,
-      high:   Math.max(last.close, v),
-      low:    Math.min(last.close, v),
-      close:  v,
-      volume: Math.abs(v - last.close) > 0.01 ? 1 : 0,
-      live:   true,
-    });
-    _liveCandleLastBucketKey = key;
-    if (wasAtEdge) chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
-    tickLiveCandle._lastRedraw = nowMs;
-    redrawChart();
-    return;
-  }
+    const d = param.seriesData.get(chart._lwSeries);
+    if (!d) { tt.style.display = 'none'; return; }
+    const date = new Date(param.time * 1000);
+    const fmt  = v => '$' + (+v).toLocaleString([], {minimumFractionDigits:2,maximumFractionDigits:2});
+    const chg  = d.close - d.open;
+    tt.style.display = 'block';
+    tt.style.left    = Math.min(param.point.x + 12, container.clientWidth - 180) + 'px';
+    tt.style.top     = Math.max(param.point.y - 80, 8) + 'px';
+    tt.innerHTML = `
+      <div style="color:rgba(255,255,255,0.5);font-size:10px;margin-bottom:4px">
+        ${date.toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}
+      </div>
+      <div style="display:grid;grid-template-columns:auto auto;gap:2px 12px;font-size:11px">
+        <span style="color:rgba(255,255,255,0.4)">Open</span><span>${fmt(d.open)}</span>
+        <span style="color:rgba(255,255,255,0.4)">High</span><span>${fmt(d.high)}</span>
+        <span style="color:rgba(255,255,255,0.4)">Low</span><span>${fmt(d.low)}</span>
+        <span style="color:rgba(255,255,255,0.4)">Close</span><span style="color:#2962ff;font-weight:700">${fmt(d.close)}</span>
+        <span style="color:rgba(255,255,255,0.4)">Change</span><span style="color:${chg>=0?'#05d890':'#ff4060'}">${chg>=0?'+':''}${fmt(chg)}</span>
+      </div>`;
+  });
 
-  // ── Same bucket — update OHLC in place ───────────────────────────
-  const prevClose = last.close;
-  last.close = v;
-  if (v > last.high) last.high = v;
-  if (v < last.low)  last.low  = v;
+  // Auto-resize
+  const ro = new ResizeObserver(() => {
+    if (chart._lwChart) chart._lwChart.resize(container.clientWidth, container.clientHeight);
+  });
+  ro.observe(container);
 
-  // Always redraw — heartbeat keeps price label and live candle current
-  const now2 = Date.now();
-  if (!tickLiveCandle._lastRedraw || now2 - tickLiveCandle._lastRedraw > 2000) {
-    tickLiveCandle._lastRedraw = now2;
-    redrawChart();
-  }
+  _lwReady = true;
 }
 
+// ── Candle data builder ──────────────────────────────────────────
 function buildCandlesForTF(snapshots, tf) {
-  if (!snapshots || !snapshots.length) return [];
-
-  const msMap = { '5M': 5*60e3, '15M': 15*60e3, '30M': 30*60e3, '1H': 3600e3, '4H': 4*3600e3, '1D': 86400e3 };
+  if (!snapshots?.length) return [];
+  const msMap = { '5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3 };
   const bucketMs = msMap[tf] || 3600e3;
 
-  // Step 1: Group snapshots into buckets
   const buckets = {};
   let firstKey = Infinity, lastKey = -Infinity;
   snapshots.forEach(s => {
     const val = +s.value;
     if (!isFinite(val) || val <= 0) return;
-    const t   = new Date(s.created_at).getTime();
-    const key = Math.floor(t / bucketMs) * bucketMs;
-    if (!buckets[key]) buckets[key] = { values: [] };
-    buckets[key].values.push(val);
+    const key = Math.floor(new Date(s.created_at).getTime() / bucketMs) * bucketMs;
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(val);
     if (key < firstKey) firstKey = key;
     if (key > lastKey)  lastKey  = key;
   });
   if (firstKey === Infinity) return [];
 
-  // Step 2: Fill ALL buckets from first to last (including empty ones)
-  // Empty buckets get forward-filled with previous close — same as TradingView
-  // This eliminates gaps and makes the chart look continuous
-  const nowKey    = Math.floor(Date.now() / bucketMs) * bucketMs;
-  const endKey    = Math.min(lastKey, nowKey); // don't generate future candles
-  const candles   = [];
-  let lastClose   = null;
+  const candles = [];
+  let lastClose = null;
+  const endKey = Math.min(lastKey, Math.floor(Date.now() / bucketMs) * bucketMs);
 
   for (let key = firstKey; key <= endKey; key += bucketMs) {
-    const b = buckets[key];
-    if (b) {
-      const v     = b.values;
-      const open  = lastClose != null ? lastClose : v[0];
+    const v = buckets[key];
+    if (v) {
+      const open  = lastClose ?? v[0];
       const close = v[v.length - 1];
-      const high  = Math.max(open, close, ...v);
-      const low   = Math.min(open, close, ...v);
-      candles.push({ time: new Date(key), open, high, low, close, volume: v.length });
+      candles.push({ time: key/1000, open, high: Math.max(open,close,...v), low: Math.min(open,close,...v), close });
       lastClose = close;
     } else if (lastClose !== null) {
-      // Empty bucket — flat candle at last known price (forward-fill)
-      candles.push({ time: new Date(key), open: lastClose, high: lastClose, low: lastClose, close: lastClose, volume: 0 });
+      candles.push({ time: key/1000, open: lastClose, high: lastClose, low: lastClose, close: lastClose });
     }
   }
   return candles;
 }
 
+// ── Render to LW Chart ───────────────────────────────────────────
+function redrawChart() {
+  if (!_lwReady || !chart._lwSeries) return;
+  if (!chart.allCandles?.length) return;
+
+  // LW Charts needs data sorted by time with no duplicates
+  const seen = new Set();
+  const data = chart.allCandles
+    .filter(c => { const k = Math.floor(c.time); if (seen.has(k)) return false; seen.add(k); return true; })
+    .map(c => ({ time: typeof c.time === 'number' ? c.time : c.time.getTime()/1000,
+                 open: +c.open, high: +c.high, low: +c.low, close: +c.close }))
+    .filter(c => isFinite(c.open) && isFinite(c.close) && c.time > 0)
+    .sort((a,b) => a.time - b.time);
+
+  if (!data.length) return;
+  chart._lwSeries.setData(data);
+
+  // EMA(20)
+  const closes = data.map(d => d.close);
+  const emaData = [];
+  let emaVal = closes[0];
+  const k = 2/21;
+  data.forEach((d, i) => {
+    emaVal = i === 0 ? closes[0] : closes[i] * k + emaVal * (1-k);
+    emaData.push({ time: d.time, value: emaVal });
+  });
+  chart._lwEma.setData(emaData);
+
+  // Scroll to latest
+  chart._lwChart.timeScale().scrollToPosition(0, false);
+}
+
+// ── Live candle tick ────────────────────────────────────────────
+function tickLiveCandle() {
+  if (!_lwReady || !chart._lwSeries) return;
+  const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
+  if (!isFinite(v) || v <= 0) return;
+
+  const msMap = { '5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3 };
+  const bucketMs = msMap[chart.tf] || 3600e3;
+  const nowSec   = Math.floor(Date.now() / bucketMs) * bucketMs / 1000;
+
+  if (!tickLiveCandle._cur || tickLiveCandle._cur.time !== nowSec) {
+    // New bucket
+    const prev = tickLiveCandle._cur;
+    tickLiveCandle._cur = { time: nowSec, open: prev?.close ?? v, high: v, low: v, close: v };
+  } else {
+    // Update current bucket
+    const cur = tickLiveCandle._cur;
+    cur.close = v;
+    if (v > cur.high) cur.high = v;
+    if (v < cur.low)  cur.low  = v;
+  }
+
+  // Push update to chart — this is what makes it real-time
+  try { chart._lwSeries.update(tickLiveCandle._cur); } catch(e) {}
+}
+
+// ── TF switcher ──────────────────────────────────────────────────
 function setTF(tf) {
   chart.tf = tf;
-  chart.yScale  = 1.0;
-  chart.yOffset = 0;
+  document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.querySelector(`.tf-btn[data-tf="${tf}"]`);
+  if (btn) btn.classList.add('active');
+  tickLiveCandle._cur = null;
   _liveCandleLastBucketKey = 0;
-  // Re-fetch equity snapshots with the range appropriate for this TF
-  // so 5M chart only shows today and 1D shows full history
   fetchEquity().then(() => {
     chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
-    if (!chart.allCandles.length) return;
-    chart.viewCount = Math.min(100, chart.allCandles.length);
-    chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
     redrawChart();
   }).catch(() => {
-    // Fallback: rebuild from existing snapshots
     chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
-    chart.viewCount = Math.min(100, chart.allCandles.length);
-    chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
     redrawChart();
   });
 }
 
-// rAF-batched redraw — coalesces multiple calls per frame into one render
-let _redrawScheduled = false;
-function redrawChart() {
-  if (_redrawScheduled) return;
-  _redrawScheduled = true;
-  requestAnimationFrame(() => {
-    _redrawScheduled = false;
-    _redrawChartImmediate();
-  });
-}
-
-function _redrawChartImmediate() {
-  // Subtle chart area gradient tint
-  const chartSvg = document.getElementById('chartSvg');
-  if (chartSvg) chartSvg.style.background = 'linear-gradient(180deg, rgba(6,6,12,0) 0%, rgba(41,98,255,0.015) 100%)';
-  const candles = chart.allCandles;
-  if (!candles.length) return;
-
-  const svg  = $('equityChart');
-  const wrap = $('chartWrap');
-  if (!svg || !wrap) return;
-  const W = wrap.clientWidth  || wrap.offsetWidth  || 800;
-  const H = wrap.clientHeight || wrap.offsetHeight || 400;
-  if (!W || !H) { requestAnimationFrame(redrawChart); return; }
-
-  svg.setAttribute('width',  W);
-  svg.setAttribute('height', H);
-  svg.innerHTML = '';
-
-  // Clamp view
-  // viewStart/viewCount are floats for sub-candle precision — floor for slice
-  chart.viewCount  = Math.max(5, Math.min(chart.allCandles.length, chart.viewCount));
-  chart.viewStart  = Math.max(0, Math.min(chart.allCandles.length - Math.ceil(chart.viewCount), chart.viewStart));
-
-  const vsInt  = Math.floor(chart.viewStart);
-  const vcInt  = Math.ceil(chart.viewCount);
-  const visible = candles.slice(vsInt, vsInt + vcInt);
-  if (!visible.length) return;
-
-  const pad = { t: 20, r: 72, b: 28, l: 8 };
-  const cw  = W - pad.l - pad.r;
-  const ch  = H - pad.t - pad.b;
-
-  // Price range of visible candles
-  const prices = visible.flatMap(d => [d.high, d.low]).filter(isFinite);
-  const minP   = Math.min(...prices);
-  const maxP   = Math.max(...prices);
-  const rawRng = maxP - minP || 1;
-
-  // Force minimum visual range = 0.25% of price
-  const minVisualRng = maxP * 0.006;
-  const rng    = Math.max(rawRng, minVisualRng);
-  const midP   = (minP + maxP) / 2;
-
-  // Apply Y-axis scale (from drag on price axis or ctrl+scroll)
-  // yScale > 1 = zoomed in (tighter range), < 1 = zoomed out (wider range)
-  const yScl   = chart.yScale || 1.0;
-  const yOff   = chart.yOffset || 0;
-  const halfRng = (rng * 0.65) / yScl;   // half of visible range
-  const yMin   = midP - halfRng + yOff;
-  const yMax   = midP + halfRng + yOff;
-  const yRng   = yMax - yMin || 1;
-
-  // Sub-candle pan offset: fractional part of viewStart shifts candles left/right
-  const fracOffset = chart.viewStart - Math.floor(chart.viewStart);
-  const xOf  = i  => pad.l + ((i - fracOffset) / Math.max(vcInt - 1, 1)) * cw;
-  const yOf  = p  => pad.t + ch - ((p - yMin) / yRng) * ch;
-
-  // ── Grid ──────────────────────────────────────────────────────
-  const gridSteps = 5;
-  for (let i = 0; i <= gridSteps; i++) {
-    const y     = pad.t + (i / gridSteps) * ch;
-    const price = yMax  - (i / gridSteps) * yRng;
-    svg.appendChild(svgLine(pad.l, y, W - pad.r, y, 'var(--border)',
-      i === 0 || i === gridSteps ? '1' : '0.5',
-      i === 0 || i === gridSteps ? null : '4,4'));
-    const t = svgText(W - pad.r + 5, y + 3.5,
-      price >= 1000 ? '$' + price.toLocaleString([],{maximumFractionDigits:0}) : '$' + price.toFixed(2),
-      '9.5', 'var(--text-dim)', 'start');
-    t.setAttribute('font-family', 'var(--font-mono)');
-    svg.appendChild(t);
-  }
-
-  // ── Time axis ─────────────────────────────────────────────────
-  // Guard against single-candle case: timeSteps becomes 0, division by
-  // 0 yields NaN, visible[NaN] is undefined → .time crash. Need at least
-  // 2 candles before drawing intermediate time markers.
-  const timeSteps = Math.min(8, visible.length - 1);
-  for (let i = 0; i <= timeSteps; i++) {
-    const ci = timeSteps === 0 ? 0 : Math.round((i / timeSteps) * (visible.length - 1));
-    const candle = visible[ci];
-    if (!candle) continue;
-    const x  = xOf(ci);
-    svg.appendChild(svgLine(x, pad.t, x, H - pad.b, 'var(--border)', '0.5', '3,3'));
-    const d  = candle.time;
-    if (!d) continue;
-    let label;
-    if (chart.tf === '1D') {
-      label = `${d.getMonth()+1}/${d.getDate()}`;
-    } else if (chart.tf === '4H') {
-      label = `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}h`;
-    } else {
-      // 5M/15M/30M/1H all show HH:MM, with date prefix only on day boundaries
-      label = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
-    }
-    svg.appendChild(svgText(x, H - 8, label, '8.5', 'var(--text-dim)', 'middle'));
-  }
-
-  // ── EMA(20) ───────────────────────────────────────────────────
-  const closes = visible.map(c => c.close);
-  const ema20  = calculateEMA(closes, Math.min(20, closes.length));
-  let emaPath  = '';
-  ema20.forEach((v, i) => { if (v != null) emaPath += (emaPath ? ' L' : 'M') + `${xOf(i)},${yOf(v)}`; });
-  if (emaPath) svg.appendChild(svgPath(emaPath, 'none', 'rgba(241,196,15,0.7)', '1.5'));
-
-  // ── Bollinger Bands ───────────────────────────────────────────
-  const bb = closes.map((_, i) => {
-    const n = Math.min(20, i + 1);
-    if (n < 5) return null;
-    const sl   = closes.slice(Math.max(0, i - n + 1), i + 1);
-    const mean = sl.reduce((a, b) => a + b, 0) / sl.length;
-    const std  = Math.sqrt(sl.reduce((a, b) => a + (b - mean) ** 2, 0) / sl.length);
-    return { upper: mean + 2 * std, lower: mean - 2 * std };
-  });
-  let bpU = '', bpL = '';
-  bb.forEach((b, i) => { if (b) { bpU += (bpU ? ' L' : 'M') + `${xOf(i)},${yOf(b.upper)}`; bpL += (bpL ? ' L' : 'M') + `${xOf(i)},${yOf(b.lower)}`; } });
-  if (bpU) {
-    // Band fill
-    let fill = bpU;
-    for (let i = bb.length - 1; i >= 0; i--) { if (bb[i]) fill += ` L${xOf(i)},${yOf(bb[i].lower)}`; }
-    svg.appendChild(svgPath(fill + ' Z', 'rgba(0,229,199,0.03)', null, null));
-    svg.appendChild(svgPath(bpU, 'none', 'rgba(0,229,199,0.2)', '1'));
-    svg.appendChild(svgPath(bpL, 'none', 'rgba(0,229,199,0.2)', '1'));
-  }
-
-  // ── Candles — TradingView-style ─────────────────────────────
-  // TV uses ~60% body width of slot. Wicks are 1px always.
-  // At 100 candles: slotW~6px, candleW~4px — tight and dense like TV.
-  // At 20 candles: slotW~30px, candleW~18px — zoomed in, wider bodies.
-  const slotW   = cw / Math.max(visible.length, 1);
-  const candleW = Math.max(1.5, Math.min(20, slotW * 0.6));
-  const wickW   = 1; // always 1px wicks — exactly like TV
-
-  // Colors matching TV dark theme
-  const BULL_FILL   = '#2962ff';   // solid blue bull
-  const BEAR_FILL   = '#131722';   // dark bear body
-  const BEAR_STROKE = '#2962ff';   // blue outline on bear
-  const WICK_COL    = '#2962ff';
-
-  visible.forEach((d, i) => {
-    const x       = xOf(i);
-    const up      = d.close >= d.open;
-    const yo      = yOf(d.open);
-    const yc      = yOf(d.close);
-    const yh      = yOf(d.high);
-    const yl      = yOf(d.low);
-    const bodyTop = Math.min(yo, yc);
-    const bodyH   = Math.max(Math.abs(yo - yc), 1.5);
-
-    // Upper wick
-    if (yh < bodyTop - 0.3) {
-      const uw = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      uw.setAttribute('x1', x); uw.setAttribute('y1', yh);
-      uw.setAttribute('x2', x); uw.setAttribute('y2', bodyTop);
-      uw.setAttribute('stroke', WICK_COL);
-      uw.setAttribute('stroke-width', wickW);
-      uw.setAttribute('stroke-linecap', 'round');
-      svg.appendChild(uw);
-    }
-
-    // Lower wick
-    if (yl > bodyTop + bodyH + 0.3) {
-      const lw = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      lw.setAttribute('x1', x); lw.setAttribute('y1', bodyTop + bodyH);
-      lw.setAttribute('x2', x); lw.setAttribute('y2', yl);
-      lw.setAttribute('stroke', WICK_COL);
-      lw.setAttribute('stroke-width', wickW);
-      lw.setAttribute('stroke-linecap', 'round');
-      svg.appendChild(lw);
-    }
-
-    // Body
-    const body = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    const rx = candleW > 4 ? Math.min(2, candleW * 0.18) : 0.5;
-    body.setAttribute('x', x - candleW / 2);
-    body.setAttribute('y', bodyTop);
-    body.setAttribute('width', candleW);
-    body.setAttribute('height', bodyH);
-    body.setAttribute('rx', rx);
-    body.setAttribute('ry', rx);
-    if (up) {
-      body.setAttribute('fill', BULL_FILL);
-    } else {
-      body.setAttribute('fill', BEAR_FILL);
-      body.setAttribute('stroke', BEAR_STROKE);
-      body.setAttribute('stroke-width', '1');
-    }
-    svg.appendChild(body);
-
-    // Invisible hit area (full slot width)
-    const hit = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    hit.setAttribute('x', x - slotW / 2);
-    hit.setAttribute('y', pad.t);
-    hit.setAttribute('width', slotW);
-    hit.setAttribute('height', ch);
-    hit.setAttribute('fill', 'transparent');
-    hit.style.cursor = 'crosshair';
-    hit.addEventListener('mouseenter', () => { if (!chart.isDragging) showTooltip(d, x, bodyTop, up, up ? BULL_FILL : BEAR_STROKE); });
-    hit.addEventListener('mouseleave', hideTooltip);
-    svg.appendChild(hit);
-  });
-
-  // ── Current price line + label ───────────────────────────────
-  const last     = visible[visible.length - 1];
-  // Always use the most recent candle's close for the price label
-  // Clamp ly to within the visible chart area so label never renders off-screen
-  const lyRaw    = yOf(last.close);
-  const ly       = Math.max(pad.t + 9, Math.min(pad.t + ch - 9, lyRaw));
-  const priceUp  = last.close >= last.open;
-  const lineCol  = '#2962ff';  // always blue — matches candle color
-  const fillCol  = priceUp ? '#2962ff' : '#ef5350';
-
-  // Dashed horizontal line across chart
-  svg.appendChild(svgLine(pad.l, ly, W - pad.r, ly, lineCol, '0.8', '4,3', '0.7'));
-
-  // Label pill on right edge
-  const labelW = 72, labelH = 18;
-  const lbg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-  lbg.setAttribute('x', W - pad.r + 1);
-  lbg.setAttribute('y', ly - labelH / 2);
-  lbg.setAttribute('width', labelW);
-  lbg.setAttribute('height', labelH);
-  lbg.setAttribute('rx', '4');
-  lbg.setAttribute('fill', fillCol);
-  svg.appendChild(lbg);
-
-  const lt = svgText(W - pad.r + labelW / 2 + 1, ly + 4,
-    last.close.toLocaleString([], {minimumFractionDigits: 2, maximumFractionDigits: 2}),
-    '9.5', '#ffffff', 'middle');
-  lt.setAttribute('font-weight', '700');
-  lt.setAttribute('font-family', 'var(--font-mono)');
-  svg.appendChild(lt);
-
-  // ── Scroll position indicator ─────────────────────────────────
-  if (chart.allCandles.length > chart.viewCount) {
-    const total  = chart.allCandles.length;
-    const barW   = cw * (chart.viewCount / total);
-    const barX   = pad.l + cw * (chart.viewStart / total);
-    const bar    = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    bar.setAttribute('x', barX); bar.setAttribute('y', H - 5);
-    bar.setAttribute('width', barW); bar.setAttribute('height', 3);
-    bar.setAttribute('rx', '1.5');
-    bar.setAttribute('fill', 'rgba(0,229,199,0.3)');
-    svg.appendChild(bar);
-    const track = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    track.setAttribute('x', pad.l); track.setAttribute('y', H - 5);
-    track.setAttribute('width', cw); track.setAttribute('height', 3);
-    track.setAttribute('rx', '1.5');
-    track.setAttribute('fill', 'rgba(255,255,255,0.05)');
-    svg.insertBefore(track, bar);
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════
-// CHART INTERACTION — TradingView-quality 60fps engine
-// ══════════════════════════════════════════════════════════════════
-//
-// Features:
-//  • Wheel zoom: anchors to cursor position (TV behaviour)
-//  • Ctrl+wheel or vertical drag on Y-axis: Y-axis scale zoom
-//  • Left drag: pan X axis with momentum/inertia
-//  • Pinch-to-zoom (touch): X zoom anchored to pinch midpoint
-//  • Double-click: reset to default view
-//  • All rendering queued through rAF — guaranteed 60fps, no jank
-//  • Fractional viewStart for sub-candle pan precision
-//
-// State lives on the `chart` object:
-//   viewStart  — float: leftmost visible candle index (fractional for smooth pan)
-//   viewCount  — float: number of visible candles (fractional for smooth zoom)
-//   yScale     — float: manual Y scale multiplier (1 = auto, >1 = zoomed in)
-//   yOffset    — float: manual Y pan offset in price units
-// ══════════════════════════════════════════════════════════════════
-
-function initChartInteraction() {
-  const wrap = $('chartWrap');
-  if (!wrap || wrap._chartInited) return;
-  wrap._chartInited = true;
-
-  // ── Extra chart state for Y-axis control ──────────────────────
-  if (chart.yScale  === undefined) chart.yScale  = 1.0;
-  if (chart.yOffset === undefined) chart.yOffset = 0;
-
-  // ── RAF-batched render ─────────────────────────────────────────
-  // All interaction handlers write to chart state then call this.
-  // requestAnimationFrame dedupes multiple events in same frame.
-  let _rafPending = false;
-  function scheduleRedraw() {
-    if (_rafPending) return;
-    _rafPending = true;
-    requestAnimationFrame(() => {
-      _rafPending = false;
-      _redrawChartImmediate();
-    });
-  }
-
-  // ── Clamp helpers ─────────────────────────────────────────────
-  function clampView() {
-    const total = chart.allCandles?.length || 1;
-    chart.viewCount = Math.max(5, Math.min(total, chart.viewCount));
-    chart.viewStart = Math.max(0, Math.min(total - chart.viewCount, chart.viewStart));
-  }
-
-  // ── WHEEL — X zoom (default) or Y zoom (ctrl/meta held) ───────
-  // Zoom anchors to cursor: candle under mouse stays in place.
-  // This is the key TV behaviour — deltaY < 0 = scroll up = zoom in.
-  wrap.addEventListener('wheel', e => {
-    e.preventDefault();
-    if (!chart.allCandles?.length) return;
-
-    const rect = wrap.getBoundingClientRect();
-
-    if (e.ctrlKey || e.metaKey) {
-      // ── Y-axis zoom (ctrl+scroll) ──────────────────────────────
-      // Zoom the price range around the price at cursor Y position
-      const yFactor = e.deltaY < 0 ? 0.85 : 1.18; // ctrl+up = zoom in price axis
-      chart.yScale = Math.max(0.2, Math.min(20, chart.yScale * yFactor));
-    } else {
-      // ── X-axis zoom (normal scroll) ───────────────────────────
-      // deltaY < 0 = wheel up = zoom IN (fewer candles)
-      // deltaY > 0 = wheel down = zoom OUT (more candles)
-      const zoomFactor = e.deltaY < 0 ? 0.85 : 1.18;
-      const prevCount  = chart.viewCount;
-      const newCount   = prevCount * zoomFactor;
-      const clamped    = Math.max(5, Math.min(chart.allCandles.length, newCount));
-
-      // Anchor zoom to mouse X — candle under cursor stays fixed
-      const mouseRatio  = (e.clientX - rect.left) / rect.width;
-      // Index of candle under cursor before zoom
-      const anchorIndex = chart.viewStart + mouseRatio * prevCount;
-      chart.viewCount   = clamped;
-      // Recompute viewStart so anchorIndex stays at same screen position
-      chart.viewStart   = anchorIndex - mouseRatio * clamped;
-    }
-
-    clampView();
-    scheduleRedraw();
-  }, { passive: false });
-
-  // ── MOUSEDOWN — start pan or Y-axis drag ──────────────────────
-  let _dragMode       = null; // 'pan' | 'yaxis'
-  let _dragStartX     = 0;
-  let _dragStartY     = 0;
-  let _dragStartView  = 0;
-  let _dragStartYOff  = 0;
-  let _dragStartYScl  = 0;
-  // Momentum
-  let _velX           = 0;
-  let _lastDragX      = 0;
-  let _lastDragTime   = 0;
-  let _momentumRAF    = null;
-
-  const YAXIS_ZONE = 72; // px from right edge = Y axis drag zone
-
-  wrap.addEventListener('mousedown', e => {
-    if (e.button !== 0) return;
-    e.preventDefault();
-    cancelAnimationFrame(_momentumRAF);
-    _velX = 0;
-
-    const rect = wrap.getBoundingClientRect();
-    const fromRight = rect.right - e.clientX;
-
-    if (fromRight < YAXIS_ZONE) {
-      // Drag on Y-axis price labels = scale Y
-      _dragMode      = 'yaxis';
-      _dragStartY    = e.clientY;
-      _dragStartYOff = chart.yOffset;
-      _dragStartYScl = chart.yScale;
-    } else {
-      // Drag on chart body = pan X
-      _dragMode      = 'pan';
-      _dragStartX    = e.clientX;
-      _dragStartView = chart.viewStart;
-      _lastDragX     = e.clientX;
-      _lastDragTime  = performance.now();
-      chart.isDragging = true;
-      wrap.style.cursor = 'grabbing';
-      hideTooltip();
-    }
-  });
-
-  window.addEventListener('mousemove', e => {
-    if (!_dragMode || !chart.allCandles?.length) return;
-
-    const rect = wrap.getBoundingClientRect();
-
-    if (_dragMode === 'pan') {
-      const dx           = e.clientX - _dragStartX;
-      const pxPerCandle  = rect.width / chart.viewCount;
-      chart.viewStart    = _dragStartView - dx / pxPerCandle;
-
-      // Track velocity for momentum
-      const now = performance.now();
-      const dt  = now - _lastDragTime;
-      if (dt > 0) _velX = (e.clientX - _lastDragX) / dt; // px/ms
-      _lastDragX   = e.clientX;
-      _lastDragTime = now;
-
-    } else if (_dragMode === 'yaxis') {
-      // Drag up = zoom in Y (smaller range), drag down = zoom out
-      const dy = _dragStartY - e.clientY;
-      chart.yScale  = Math.max(0.2, Math.min(20, _dragStartYScl * Math.pow(1.004, dy)));
-    }
-
-    clampView();
-    scheduleRedraw();
-  });
-
-  window.addEventListener('mouseup', e => {
-    if (!_dragMode) return;
-
-    if (_dragMode === 'pan' && Math.abs(_velX) > 0.1) {
-      // ── Momentum / inertia ────────────────────────────────────
-      // Decelerates at TV-like rate (~20% per frame)
-      let vel = _velX;
-      const rect = ($('chartWrap') || wrap).getBoundingClientRect();
-      const pxPerCandle = rect.width / chart.viewCount;
-
-      function momentum() {
-        vel *= 0.88; // friction
-        if (Math.abs(vel) < 0.02 || !chart.allCandles?.length) {
-          _momentumRAF = null; return;
-        }
-        chart.viewStart -= vel * 16 / pxPerCandle; // ~16ms/frame
-        clampView();
-        scheduleRedraw();
-        _momentumRAF = requestAnimationFrame(momentum);
-      }
-      _momentumRAF = requestAnimationFrame(momentum);
-    }
-
-    _dragMode = null;
-    chart.isDragging = false;
-    const w = $('chartWrap');
-    if (w) w.style.cursor = 'crosshair';
-  });
-
-  // ── DOUBLE-CLICK — reset view to default ─────────────────────
-  wrap.addEventListener('dblclick', () => {
-    chart.viewCount = Math.min(120, chart.allCandles?.length || 120); // more candles = denser/tighter chart
-    chart.viewStart = Math.max(0, (chart.allCandles?.length || 0) - chart.viewCount);
-    chart.yScale    = 1.0;
-    chart.yOffset   = 0;
-    scheduleRedraw();
-  });
-
-  // ── TOUCH — pinch zoom + single-finger pan ────────────────────
-  let _touch1 = null, _touch2 = null;
-  let _touchStartView = 0, _touchStartCount = 0;
-  let _touchStartDist = 0, _touchMidRatio = 0.5;
-  let _touchLastX = 0;
-
-  wrap.addEventListener('touchstart', e => {
-    e.preventDefault();
-    cancelAnimationFrame(_momentumRAF); _velX = 0;
-    if (e.touches.length === 1) {
-      _touch1 = e.touches[0];
-      _touchStartView  = chart.viewStart;
-      _touchLastX      = _touch1.clientX;
-      _lastDragX       = _touch1.clientX;
-      _lastDragTime    = performance.now();
-    } else if (e.touches.length === 2) {
-      _touch1 = e.touches[0]; _touch2 = e.touches[1];
-      _touchStartView  = chart.viewStart;
-      _touchStartCount = chart.viewCount;
-      _touchStartDist  = Math.hypot(
-        _touch2.clientX - _touch1.clientX,
-        _touch2.clientY - _touch1.clientY
-      );
-      const rect = wrap.getBoundingClientRect();
-      _touchMidRatio = ((_touch1.clientX + _touch2.clientX) / 2 - rect.left) / rect.width;
-    }
-  }, { passive: false });
-
-  wrap.addEventListener('touchmove', e => {
-    e.preventDefault();
-    if (!chart.allCandles?.length) return;
-    const rect = wrap.getBoundingClientRect();
-
-    if (e.touches.length === 1) {
-      const t  = e.touches[0];
-      const dx = t.clientX - _touchLastX;
-      const pxPerCandle = rect.width / chart.viewCount;
-      chart.viewStart = _touchStartView - (t.clientX - _touch1.clientX) / pxPerCandle;
-
-      const now = performance.now(), dt = now - _lastDragTime;
-      if (dt > 0) _velX = (t.clientX - _lastDragX) / dt;
-      _lastDragX = t.clientX; _lastDragTime = now;
-
-    } else if (e.touches.length === 2) {
-      const t1 = e.touches[0], t2 = e.touches[1];
-      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
-      const scaleFactor  = _touchStartDist / dist; // pinch in = fewer candles
-      const newCount     = Math.max(5, Math.min(chart.allCandles.length, _touchStartCount * scaleFactor));
-      // Anchor to pinch midpoint
-      const anchorIndex  = _touchStartView + _touchMidRatio * _touchStartCount;
-      chart.viewCount    = newCount;
-      chart.viewStart    = anchorIndex - _touchMidRatio * newCount;
-    }
-
-    clampView();
-    scheduleRedraw();
-  }, { passive: false });
-
-  wrap.addEventListener('touchend', e => {
-    if (e.touches.length === 0 && Math.abs(_velX) > 0.1) {
-      let vel = _velX;
-      const rect = ($('chartWrap') || wrap).getBoundingClientRect();
-      function momentum() {
-        vel *= 0.88;
-        if (Math.abs(vel) < 0.02 || !chart.allCandles?.length) return;
-        const pxPerCandle = rect.width / chart.viewCount;
-        chart.viewStart -= vel * 16 / pxPerCandle;
-        clampView(); scheduleRedraw();
-        _momentumRAF = requestAnimationFrame(momentum);
-      }
-      _momentumRAF = requestAnimationFrame(momentum);
-    }
-    _touch1 = _touch2 = null;
-  }, { passive: false });
-
-  wrap.style.cursor     = 'crosshair';
-  wrap.style.userSelect = 'none';
-  wrap.style.touchAction = 'none';
-}
+// ── Compat stubs (called by other code) ──────────────────────────
+function initChartInteraction() { initLWChart(); }
+function scheduleRedraw()       { redrawChart(); }
 
 // ── Compatibility wrapper so old code calling drawCandlestickChart still works ──
-function drawCandlestickChart(candles) {
-  if (!candles || !candles.length) return;
-
-  // Detect whether user was pinned to the right edge (viewing latest data)
-  // before we swap in new candles. Tolerance of 1 candle for rounding.
-  const prevLen       = chart.allCandles.length;
-  const wasAtRightEdge = prevLen === 0
-    || (chart.viewStart + chart.viewCount >= prevLen - 1);
-
-  chart.allCandles = candles;
-
-  // First load → default view: last 60 candles (or all if fewer).
-  if (prevLen === 0) {
-    chart.viewCount = Math.min(60, candles.length);
-    chart.viewStart = Math.max(0, candles.length - chart.viewCount);
-  } else if (wasAtRightEdge) {
-    // User hasn't panned away — keep window size, just slide to the new right edge.
-    chart.viewStart = Math.max(0, candles.length - chart.viewCount);
-  }
-  // else: user has panned back to inspect history — leave viewStart/viewCount alone.
-
-  // Clamp in case data shrank (e.g. TF switch, sim reset)
-  chart.viewCount = Math.max(5, Math.min(candles.length, chart.viewCount));
-  chart.viewStart = Math.max(0, Math.min(candles.length - chart.viewCount, chart.viewStart));
-
-  initChartInteraction();
-  // Don't yank the chart out from under an active drag.
-  if (!chart.isDragging) redrawChart();
+function makeLinePath(values, xScale, yScale) {
+  let d = '';
+  values.forEach((v,i) => { if (v!==null && !isNaN(v)) d += (d?' L':'M') + `${xScale(i)},${yScale(v)}`; });
+  return d;
 }
+
+function calculateEMA(prices, period) {
+  const result = [];
+  if (prices.length < period) return prices.map(() => null);
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a,b)=>a+b,0) / period;
+  for (let i=0; i<prices.length; i++) {
+    if (i < period-1) { result.push(null); continue; }
+    if (i === period-1) { result.push(ema); continue; }
+    ema = prices[i] * k + ema * (1 - k);
+    result.push(ema);
+  }
+  return result;
+}
+
 function makeLinePath(values, xScale, yScale) {
   let d = '';
   values.forEach((v,i) => { if (v!==null && !isNaN(v)) d += (d?' L':'M') + `${xScale(i)},${yScale(v)}`; });
@@ -4598,6 +4083,7 @@ function init() {
   setInterval(updateClock, 1000);
   initMobileLayout();
   startLivePriceFeed(); // 1s live price updates from bot
+  setTimeout(initLWChart, 100); // init LW Chart after DOM is ready
 
   // Auto-connect if credentials exist
   if (CONFIG.sbUrl && CONFIG.sbKey) {
