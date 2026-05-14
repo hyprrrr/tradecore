@@ -266,7 +266,7 @@
   .watch-change.down { color: var(--sell); background: rgba(255,64,96,0.12); }
 
   /* ═══════════════════════════════════════ CENTER CHART ═══════════════════════════════════════ */
-  .chart-area { grid-column: 2; grid-row: 1; border-radius: 16px; overflow: hidden; }
+  .chart-area { grid-column: 2; grid-row: 1; border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; }
 
   .chart-topbar {
     display: flex; align-items: center; justify-content: space-between;
@@ -310,7 +310,7 @@
   .ind-btn:hover { color: var(--text); background: rgba(255,255,255,0.09); }
   .ind-dot { width: 5px; height: 5px; border-radius: 50%; }
 
-  .chart-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: transparent; }
+  .chart-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: transparent; min-height: 200px; }
   #equityChart { width: 100%; height: 100%; }
   .chart-tooltip {
     position: absolute; pointer-events: none;
@@ -1281,7 +1281,7 @@
           <div class="legend-item"><div class="legend-line" style="background:#9b59b6"></div>VWAP</div>
           <div class="legend-item"><div class="legend-line" style="background:#3498db"></div>BB Upper</div>
         </div>
-        <div id="lwChart" style="position:absolute;inset:0;"></div>
+        <div id="lwChart" style="position:absolute;inset:0;width:100%;height:100%;"></div>
         <div class="chart-tooltip" id="chartTooltip" style="display:none;"></div>
       </div>
     </section>
@@ -2977,8 +2977,16 @@ let _liveCandleLastBucketKey = 0;
 // ── Init LW Chart ────────────────────────────────────────────────
 function initLWChart() {
   const container = document.getElementById('lwChart');
-  if (!container || !window.LightweightCharts) return;
-  if (chart._lwChart) { chart._lwChart.remove(); }
+  if (!container || !window.LightweightCharts) {
+    // Library not loaded yet — retry in 200ms
+    setTimeout(initLWChart, 200);
+    return;
+  }
+  if (chart._lwChart) { try { chart._lwChart.remove(); } catch(e){} }
+
+  // Ensure container has dimensions before creating chart
+  const w = container.clientWidth  || container.parentElement?.clientWidth  || 800;
+  const h = container.clientHeight || container.parentElement?.clientHeight || 400;
 
   chart._lwChart = LightweightCharts.createChart(container, {
     layout: {
@@ -3010,8 +3018,8 @@ function initLWChart() {
     },
     handleScroll:   { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true },
     handleScale:    { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
-    width:  container.clientWidth,
-    height: container.clientHeight,
+    width:  w,
+    height: h,
   });
 
   // Candlestick series — TV color scheme
@@ -3060,13 +3068,26 @@ function initLWChart() {
       </div>`;
   });
 
-  // Auto-resize
-  const ro = new ResizeObserver(() => {
-    if (chart._lwChart) chart._lwChart.resize(container.clientWidth, container.clientHeight);
+  // Auto-resize — fires immediately and on every container size change
+  const ro = new ResizeObserver(entries => {
+    if (!chart._lwChart) return;
+    for (const entry of entries) {
+      const w2 = entry.contentRect.width;
+      const h2 = entry.contentRect.height;
+      if (w2 > 0 && h2 > 0) chart._lwChart.resize(w2, h2);
+    }
   });
   ro.observe(container);
+  // Also observe parent in case container itself reports 0
+  if (container.parentElement) ro.observe(container.parentElement);
 
   _lwReady = true;
+
+  // Load any existing data immediately after init
+  if (state.equitySnapshots?.length) {
+    chart.allCandles = buildCandlesForTF(state.equitySnapshots, chart.tf);
+    redrawChart();
+  }
 }
 
 // ── Candle data builder ──────────────────────────────────────────
@@ -3531,9 +3552,19 @@ function setMobileView(view) {
     if (btn) btn.classList.toggle('active', v === view);
   });
 
-  // Chart redraw after layout settles
+  // Chart reinit after layout settles (container may have been hidden = 0 dimensions)
   if (view === 'chart') {
-    setTimeout(() => { try { redrawChart(); } catch(e){} }, 80);
+    setTimeout(() => {
+      if (!_lwReady || !chart._lwChart) {
+        initLWChart();
+      } else {
+        const c = document.getElementById('lwChart');
+        if (c && c.clientWidth > 0) {
+          chart._lwChart.resize(c.clientWidth, c.clientHeight || 400);
+          redrawChart();
+        }
+      }
+    }, 100);
   }
 }
 
@@ -4083,7 +4114,7 @@ function init() {
   setInterval(updateClock, 1000);
   initMobileLayout();
   startLivePriceFeed(); // 1s live price updates from bot
-  setTimeout(initLWChart, 100); // init LW Chart after DOM is ready
+  setTimeout(initLWChart, 500); // init LW Chart after DOM + styles are fully rendered
 
   // Auto-connect if credentials exist
   if (CONFIG.sbUrl && CONFIG.sbKey) {
