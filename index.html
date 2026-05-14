@@ -3872,6 +3872,88 @@ function updateClock() {
     : `${local} ${tzLabel}  (${et} ET)`;
 }
 
+// ═══════════════════════════════════════ LIVE PRICE FEED ═══════════════════════════════════════
+// Polls the bot's /prices endpoint every 1 second for real-time position P&L
+// Much faster than Supabase polling (8s) — no DB calls, sub-10ms response
+// Falls back gracefully if bot is offline
+
+let _livePriceFeedActive = false;
+let _livePriceInterval   = null;
+const BOT_URL = (() => {
+  // Auto-detect bot URL from settings or use Railway default
+  return 'https://tradecore.up.railway.app';
+})();
+
+async function startLivePriceFeed() {
+  if (_livePriceFeedActive) return;
+  _livePriceFeedActive = true;
+
+  async function fetchLivePrices() {
+    try {
+      const res = await fetch(`${BOT_URL}/prices`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+
+      // Update position P&L in real time
+      if (data.positions && state.positions?.length) {
+        let updated = false;
+        state.positions = state.positions.map(pos => {
+          const baseSym = cleanSym(pos.symbol);
+          const key = pos.side === 'SHORT' ? baseSym + '_SHORT' : baseSym;
+          const live = data.positions[key] || data.positions[baseSym];
+          if (live && live.price) {
+            updated = true;
+            return { ...pos, current_price: live.price, pnl: live.pnl };
+          }
+          return pos;
+        });
+        if (updated) {
+          renderPositions(state.positions);
+          renderPositionsTable(state.positions);
+        }
+      }
+
+      // Update equity bar open P&L instantly
+      if (data.equity && data.equity > 0 && !state._portfolioOverride) {
+        // Only update if meaningfully different (avoid flicker)
+        const cur = +(state.portfolio?.total_value || 0);
+        if (Math.abs(data.equity - cur) > 0.01) {
+          if (!state.portfolio) state.portfolio = {};
+          state.portfolio.total_value = data.equity;
+          // Update equity display without full render
+          const el = $('mainEquity');
+          if (el) el.textContent = '$' + data.equity.toLocaleString([], {minimumFractionDigits:2, maximumFractionDigits:2});
+          // Feed into live candle
+          tickLiveCandle();
+        }
+      }
+
+      // Update alpaca live prices in state for other components
+      if (data.prices) state._livePrices = data.prices;
+
+    } catch(e) { /* bot offline or network issue — silent fail */ }
+  }
+
+  // Poll every 1 second during market hours, 5s otherwise
+  function scheduleNext() {
+    const etHr = new Date().getUTCHours() - 4; // rough ET
+    const isMarketHours = etHr >= 9 && etHr < 17;
+    const interval = isMarketHours ? 1000 : 5000;
+    _livePriceInterval = setTimeout(async () => {
+      await fetchLivePrices();
+      scheduleNext();
+    }, interval);
+  }
+  scheduleNext();
+}
+
+function stopLivePriceFeed() {
+  _livePriceFeedActive = false;
+  if (_livePriceInterval) { clearTimeout(_livePriceInterval); _livePriceInterval = null; }
+}
+
 // ═══════════════════════════════════════ CUSTOM DROPDOWNS ═══════════════════════════════════════
 // Glass animated dropdowns — replaces native OS <select> elements
 // All state tracked on the DOM element via data-value attribute
@@ -4514,7 +4596,8 @@ document.querySelectorAll('.logs-filter-btn').forEach(btn => {
 function init() {
   updateClock();
   setInterval(updateClock, 1000);
-  initMobileLayout(); // set initial mobile view state
+  initMobileLayout();
+  startLivePriceFeed(); // 1s live price updates from bot
 
   // Auto-connect if credentials exist
   if (CONFIG.sbUrl && CONFIG.sbKey) {
