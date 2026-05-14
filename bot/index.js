@@ -182,7 +182,9 @@ async function loadRemoteConfig() {
 
     // Apply remote settings over CONFIG — secrets never overwritten
     if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 200); // hard cap 200 (was 20)
-    CONFIG.strategy = s.strategy || CONFIG.strategy || 'rsi_macd';
+    CONFIG.strategy = (s.strategy && s.strategy !== 'None' && s.strategy !== 'null')
+      ? s.strategy
+      : (CONFIG.strategy && CONFIG.strategy !== 'None' ? CONFIG.strategy : 'rsi_macd');
     if (s.marketSentiment)  CONFIG.marketSentiment  = s.marketSentiment;
     if (s.market_sentiment) CONFIG.marketSentiment  = s.market_sentiment; // snake_case fallback
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
@@ -3402,13 +3404,18 @@ function ema(prices, period) {
 
 function rsi(prices, period) {
   if (!prices || prices.length < period + 1) return 50;
+  // Filter out NaN/null/undefined values that cause NaN propagation
+  const clean = prices.filter(p => Number.isFinite(p));
+  if (clean.length < period + 1) return 50;
   let gains = 0, losses = 0;
-  for (let i = prices.length - period; i < prices.length; i++) {
-    const d = prices[i] - prices[i - 1];
+  for (let i = clean.length - period; i < clean.length; i++) {
+    const d = clean[i] - clean[i - 1];
+    if (!Number.isFinite(d)) continue;
     d > 0 ? gains += d : losses += Math.abs(d);
   }
   const rs = (gains / period) / ((losses / period) || 0.0001);
-  return 100 - 100 / (1 + rs);
+  const result = 100 - 100 / (1 + rs);
+  return Number.isFinite(result) ? result : 50;
 }
 
 function atr(bars, period = 14) {
@@ -5156,11 +5163,14 @@ async function runMomentumScanner(symbols, barData5m) {
 }
 
 function generateSignal(sym, bars5m, bars15m) {
-  if (!bars5m || bars5m.length < 30) return { signal: 'HOLD', confidence: 0, reasons: ['Need 30+ bars'] };
+  if (!bars5m || bars5m.length < 30) return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Need 30+ bars'], rsi: 50 };
+  // Pre-filter: remove bars with null/NaN close prices (Yahoo sometimes returns these)
+  bars5m = bars5m.filter(b => Number.isFinite(b.c) && Number.isFinite(b.h) && Number.isFinite(b.l));
+  if (bars5m.length < 20) return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Not enough valid bars after NaN filter'], rsi: 50 };
 
-  const c5    = bars5m.map(b => b.c);
+  const c5    = bars5m.map(b => b.c).filter(v => Number.isFinite(v));
   const c15   = bars15m?.length >= 20 ? bars15m.map(b => b.c) : null;
-  const vol   = bars5m.map(b => b.v);
+  const vol   = bars5m.map(b => +b.v || 0);
   const highs = bars5m.map(b => b.h);
   const lows  = bars5m.map(b => b.l);
   const price = c5[c5.length - 1];
@@ -9914,12 +9924,19 @@ setInterval(async () => {
     const prevSentiment = CONFIG.marketSentiment;
     await loadRemoteConfig();
     // Auto-strategy: resolve best strategy from regime if set to 'auto'
-    if (CONFIG.strategy === 'auto' || !CONFIG.strategy) {
+    if (CONFIG.strategy === 'auto') {
       const regime = isSimMode() ? _regimeCache.state : await classifyRegime().catch(() => null);
       const autoStrat = await resolveAutoStrategy(regime);
       CONFIG._activeStrategy = autoStrat || 'rsi_macd';
     } else {
-      CONFIG._activeStrategy = CONFIG.strategy || 'rsi_macd';
+      // Ensure strategy is always a valid string, never null/None/'auto'
+      const strat = CONFIG.strategy;
+      CONFIG._activeStrategy = (strat && strat !== 'None' && strat !== 'null' && strat !== 'auto')
+        ? strat : 'rsi_macd';
+    }
+    // Final guarantee — _activeStrategy must never be falsy
+    if (!CONFIG._activeStrategy || CONFIG._activeStrategy === 'None') {
+      CONFIG._activeStrategy = 'rsi_macd';
     }
 
     // Only log if something actually changed
