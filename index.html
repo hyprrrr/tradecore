@@ -643,6 +643,7 @@
       display: grid;
       grid-template-rows: 48px 1fr;
       height: 100dvh;
+      height: -webkit-fill-available;
       overflow: hidden;
     }
 
@@ -675,11 +676,12 @@
     .leftbar.m-active,
     .rightbar.m-active,
     .chart-area.m-active,
-    .bottom-panels.m-active {
+    .bottom-panels.m-active,
+    .settings-panel-mobile.m-active {
       display: flex !important;
       flex-direction: column;
       position: absolute;
-      inset: 0 0 56px 0; /* leave room for tab bar */
+      inset: 0 0 56px 0;
       width: 100%;
       border-radius: 0 !important;
       overflow-y: auto;
@@ -689,7 +691,17 @@
 
     /* chart-area needs special treatment — it has its own sub-panels */
     .chart-area.m-active {
-      overflow: hidden; /* chart svg handles its own scroll */
+      overflow: hidden;
+    }
+    .chart-area.m-active .chart-canvas-wrap,
+    .chart-area.m-active #chartWrap {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+    }
+    .chart-area.m-active #equityCanvas {
+      position: absolute;
+      inset: 0;
     }
 
     /* Bottom panels stack vertically when shown */
@@ -1489,6 +1501,50 @@
     <span class="conn-time" id="connPing">--ms</span>
   </div>
 
+  <!-- ── Mobile Settings Panel ── -->
+  <div class="settings-panel-mobile main" style="display:none;">
+    <div style="padding:16px;border-bottom:1px solid rgba(255,255,255,0.07);">
+      <div style="font-size:16px;font-weight:700;color:var(--text);">Settings</div>
+    </div>
+    <div style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;">
+      <!-- Strategy -->
+      <div class="panel" style="padding:16px;">
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px;">Strategy</div>
+        <div id="mobileStrategySelect"></div>
+      </div>
+      <!-- Bot Controls -->
+      <div class="panel" style="padding:16px;">
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px;">Bot Controls</div>
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:13px;color:var(--text);">Scalp Mode</span>
+            <label class="toggle"><input type="checkbox" id="scalpToggle2" onchange="toggleSetting('scalp_mode',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:13px;color:var(--text);">Shorts Enabled</span>
+            <label class="toggle"><input type="checkbox" id="shortsToggle2" onchange="toggleSetting('shorts_enabled',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:13px;color:var(--text);">AI News</span>
+            <label class="toggle"><input type="checkbox" id="aiNewsToggle2" onchange="toggleSetting('ai_news_enabled',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:13px;color:var(--text);">Recovery Mode</span>
+            <label class="toggle"><input type="checkbox" id="recoveryToggle2" onchange="toggleSetting('recovery_mode',this.checked)"><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+      </div>
+      <!-- Actions -->
+      <div class="panel" style="padding:16px;">
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px;">Actions</div>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <button class="btn" onclick="$('resetCBBtn')?.click()" style="background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.12);">Reset Circuit Breaker</button>
+          <button class="btn btn-danger" onclick="openExitAllModal()" style="background:linear-gradient(135deg,#ff3b3b,#cc2020);">Exit All Positions</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Mobile bottom tab bar ── -->
   <div class="mobile-tab-bar" id="mobileTabBar">
     <div class="mobile-tab-btn active" id="mtab-chart" onclick="setMobileView('chart')">
@@ -1506,6 +1562,10 @@
     <div class="mobile-tab-btn" id="mtab-right" onclick="setMobileView('right')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
       <span>Stats</span>
+    </div>
+    <div class="mobile-tab-btn" id="mtab-settings" onclick="setMobileView('settings')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+      <span>Settings</span>
     </div>
   </div>
 
@@ -2627,6 +2687,11 @@ function updateSettingsUI(s) {
   $('swingToggle').checked = s.swing_enabled !== false;
   $('recoveryToggle').checked = !!s.recovery_mode;
   if ($('aiNewsToggle')) $('aiNewsToggle').checked = s.ai_news_enabled !== false;
+  // Sync mobile settings panel toggles
+  if ($('scalpToggle2'))   $('scalpToggle2').checked   = !!s.scalp_mode;
+  if ($('shortsToggle2'))  $('shortsToggle2').checked  = s.shorts_enabled !== false;
+  if ($('aiNewsToggle2'))  $('aiNewsToggle2').checked  = s.ai_news_enabled !== false;
+  if ($('recoveryToggle2'))$('recoveryToggle2').checked = !!s.recovery_mode;
 }
 
 function renderPositions(positions) {
@@ -3354,10 +3419,11 @@ let _mobileView = 'chart';
 
 // Map tab names to panel selectors
 const MOBILE_PANELS = {
-  chart:  '.chart-area',
-  trades: '.bottom-panels',
-  left:   '.leftbar',
-  right:  '.rightbar',
+  chart:    '.chart-area',
+  trades:   '.bottom-panels',
+  left:     '.leftbar',
+  right:    '.rightbar',
+  settings: '.settings-panel-mobile',
 };
 
 function setMobileView(view) {
