@@ -1975,6 +1975,13 @@ async function fetchEquity() {
   state.equitySnapshots = snapshots;
   renderEquityChart(snapshots);
   renderSparkline(snapshots);
+
+  // If LW chart exists but has no candles yet, push data in now
+  // This handles the race where fetchEquity resolves after initLWChart runs
+  if (_lwReady && chart._lwSeries && (!chart.allCandles?.length || chart.allCandles.length < 2)) {
+    chart.allCandles = buildCandlesForTF(snapshots, chart.tf);
+    redrawChart();
+  }
 }
 
 async function fetchLogs() {
@@ -3083,11 +3090,18 @@ function initLWChart() {
 
   _lwReady = true;
 
-  // Load any existing data immediately after init
-  if (state.equitySnapshots?.length) {
-    chart.allCandles = buildCandlesForTF(state.equitySnapshots, chart.tf);
-    redrawChart();
+  // Poll until we have equity data, then render
+  // fetchEquity may not have returned yet when initLWChart first runs
+  function waitForData(attempts) {
+    if (state.equitySnapshots?.length) {
+      chart.allCandles = buildCandlesForTF(state.equitySnapshots, chart.tf);
+      redrawChart();
+      return;
+    }
+    if (attempts > 20) return; // give up after 10s
+    setTimeout(() => waitForData(attempts + 1), 500);
   }
+  waitForData(0);
 }
 
 // ── Candle data builder ──────────────────────────────────────────
@@ -4114,7 +4128,19 @@ function init() {
   setInterval(updateClock, 1000);
   initMobileLayout();
   startLivePriceFeed(); // 1s live price updates from bot
-  setTimeout(initLWChart, 500); // init LW Chart after DOM + styles are fully rendered
+  // Init chart with retries — keeps retrying until LW Charts library loads
+  // and the container has real dimensions
+  function tryInitChart(n) {
+    const container = document.getElementById('lwChart');
+    const w = container?.clientWidth || 0;
+    const h = container?.clientHeight || 0;
+    if (window.LightweightCharts && w > 10 && h > 10) {
+      initLWChart();
+    } else if (n < 20) {
+      setTimeout(() => tryInitChart(n + 1), 300);
+    }
+  }
+  setTimeout(() => tryInitChart(0), 200);
 
   // Auto-connect if credentials exist
   if (CONFIG.sbUrl && CONFIG.sbKey) {
