@@ -1370,7 +1370,7 @@
       </div>
       <div style="padding: 8px 14px; border-top: 1px solid var(--border); display: flex; gap: 8px;">
         <button class="btn btn-outline btn-sm" style="flex:1;" onclick="resetCircuit()">Reset CB</button>
-        <button class="btn btn-danger btn-sm" style="flex:1;" onclick="exitAll()">Exit All</button>
+        <button class="btn btn-danger btn-sm" style="flex:1;" onclick="openExitAllModal()">Exit All</button>
       </div>
       <div style="padding: 0 14px 10px; display: flex; gap: 8px;">
         <button class="btn btn-outline btn-sm" style="flex:1;" onclick="exportDiagnostics()" title="Bundle bot + dashboard + DB state into a JSON file for debugging">🩺 Export Diagnostics</button>
@@ -2375,7 +2375,8 @@ async function resetCircuit() {
 }
 
 async function exitAll() {
-  if (!confirm('Exit ALL open positions? Bot will close everything and keep running.')) return;
+  openExitAllModal(); return; // replaced by custom modal
+  if (false) { // dead code below kept for reference
 
   if (!CONFIG.botUrl) {
     addLog('error', 'Exit All needs a Railway bot URL — set it in Config');
@@ -4012,6 +4013,80 @@ function init() {
 
 init();
 </script>
+  <!-- Exit All Confirm Modal -->
+  <div id="exitAllModal" style="display:none;position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.6);backdrop-filter:blur(12px);align-items:center;justify-content:center;">
+    <div style="width:360px;background:rgba(12,12,20,0.98);border:1px solid rgba(255,80,80,0.3);border-radius:20px;padding:28px;box-shadow:0 40px 80px rgba(0,0,0,0.8),0 0 0 1px rgba(255,255,255,0.05);">
+      <!-- Icon -->
+      <div style="width:52px;height:52px;border-radius:16px;background:rgba(255,64,64,0.12);border:1px solid rgba(255,64,64,0.2);display:flex;align-items:center;justify-content:center;margin-bottom:20px;">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ff4040" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+      </div>
+      <!-- Text -->
+      <div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:8px;letter-spacing:-0.02em;">Close All Positions</div>
+      <div style="font-size:13px;color:rgba(255,255,255,0.45);line-height:1.5;margin-bottom:6px;">The bot will immediately close all open long, short, and scalp positions at market price.</div>
+      <div id="exitAllPositionCount" style="font-size:12px;color:rgba(255,80,80,0.8);font-weight:600;margin-bottom:24px;"></div>
+      <!-- Buttons -->
+      <div style="display:flex;gap:10px;">
+        <button onclick="closeExitAllModal()" style="flex:1;height:42px;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:rgba(255,255,255,0.6);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;" onmouseover="this.style.background='rgba(255,255,255,0.12)'" onmouseout="this.style.background='rgba(255,255,255,0.07)'">Cancel</button>
+        <button onclick="confirmExitAll()" id="exitAllConfirmBtn" style="flex:1;height:42px;background:linear-gradient(135deg,#ff3b3b,#cc2020);border:none;border-radius:12px;color:#fff;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 4px 20px rgba(255,50,50,0.35);transition:all .15s;" onmouseover="this.style.transform='translateY(-1px)';this.style.boxShadow='0 6px 24px rgba(255,50,50,0.5)'" onmouseout="this.style.transform='';this.style.boxShadow='0 4px 20px rgba(255,50,50,0.35)'">Exit All Now</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  function openExitAllModal() {
+    const modal = document.getElementById('exitAllModal');
+    const count = (state.positions?.length || 0) + (Object.keys(state.botStatus?.shorts || {}).length || 0);
+    const countEl = document.getElementById('exitAllPositionCount');
+    countEl.textContent = count > 0 ? `${count} position${count !== 1 ? 's' : ''} will be closed` : 'No positions currently open';
+    modal.style.display = 'flex';
+  }
+
+  function closeExitAllModal() {
+    document.getElementById('exitAllModal').style.display = 'none';
+  }
+
+  async function confirmExitAll() {
+    const btn = document.getElementById('exitAllConfirmBtn');
+    btn.textContent = 'Closing...';
+    btn.style.opacity = '0.7';
+    btn.style.pointerEvents = 'none';
+
+    try {
+      const base = (CONFIG.botUrl || 'https://tradecore-q1ll.onrender.com').replace(/\/+$/, '');
+      const r    = await fetch(`${base}/exit-all`, {signal: AbortSignal.timeout(15000)});
+      const data = await r.json().catch(() => ({}));
+      if (data.ok) {
+        closeExitAllModal();
+        const pnl = (data.totalPnl || 0);
+        addLog('warn', `🖐 Exit All: closed ${data.closed} position${data.closed !== 1 ? 's' : ''}${data.failed ? `, ${data.failed} failed` : ''} | P&L: ${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toFixed(2)}`);
+        setTimeout(fetchAll, 1500);
+      } else {
+        addLog('error', `Exit All failed: ${data.message || 'unknown error'}`);
+      }
+    } catch(e) {
+      addLog('error', `Exit All: ${e.message}`);
+    }
+
+    btn.textContent = 'Exit All Now';
+    btn.style.opacity = '';
+    btn.style.pointerEvents = '';
+  }
+
+  // Close on backdrop click
+  document.getElementById('exitAllModal').addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeExitAllModal();
+  });
+
+  // Escape key
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && document.getElementById('exitAllModal').style.display !== 'none') {
+      closeExitAllModal();
+    }
+  });
+  </script>
+
   <!-- Stock Chart Modal — shown when clicking a position -->
   <div id="stockChartModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);align-items:center;justify-content:center;">
     <div style="width:min(900px,95vw);height:min(560px,90vh);background:rgba(10,10,18,0.98);border:1px solid rgba(255,255,255,0.12);border-radius:20px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 40px 100px rgba(0,0,0,0.8);">
