@@ -1780,7 +1780,7 @@ window.addEventListener('unhandledrejection', e => __diagPush('promise_rejection
 
 // ═══════════════════════════════════════ CONFIG ═══════════════════════════════════════
 let CONFIG = {
-  botUrl: localStorage.getItem('botUrl') || '',
+  botUrl: localStorage.getItem('botUrl') || 'https://tradecore-q1ll.onrender.com',
   sbUrl:  localStorage.getItem('sbUrl')  || '',
   sbKey:  localStorage.getItem('sbKey')  || '',
 };
@@ -3222,10 +3222,11 @@ function updateClock() {
 
 let _livePriceFeedActive = false;
 let _livePriceInterval   = null;
-const BOT_URL = (() => {
-  // Auto-detect bot URL from settings or use Railway default
-  return 'https://tradecore-q1ll.onrender.com';
-})();
+// BOT_URL resolves from config — always use current value
+function getBotUrl() {
+  return CONFIG?.botUrl?.trim().replace(/\/$/,'') || 'https://tradecore-q1ll.onrender.com';
+}
+const BOT_URL = 'https://tradecore-q1ll.onrender.com'; // fallback constant
 
 async function startLivePriceFeed() {
   if (_livePriceFeedActive) return;
@@ -3959,7 +3960,7 @@ function init() {
   startLivePriceFeed(); // 1s live price updates from bot
   // Init chart after DOM is painted
   requestAnimationFrame(() => setTimeout(() => {
-    const inst = _getOrInitChart();
+    const inst = _equityChart();
     if (inst && state.equitySnapshots?.length) {
       chart.allCandles = buildCandlesForTF(state.equitySnapshots, chart.tf);
       inst.setData(chart.allCandles);
@@ -3968,7 +3969,7 @@ function init() {
 
   window.addEventListener('load', () => {
     setTimeout(() => {
-      const inst = _getOrInitChart();
+      const inst = _equityChart();
       if (inst && state.equitySnapshots?.length) {
         chart.allCandles = buildCandlesForTF(state.equitySnapshots, chart.tf);
         inst.setData(chart.allCandles);
