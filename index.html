@@ -267,6 +267,8 @@
 
   /* ═══════════════════════════════════════ CENTER CHART ═══════════════════════════════════════ */
   .chart-area { grid-column: 2; grid-row: 1; border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; }
+  .chart-canvas-wrap { display: flex; flex-direction: column; }
+  #lwChart { flex: 1; }
 
   .chart-topbar {
     display: flex; align-items: center; justify-content: space-between;
@@ -310,7 +312,7 @@
   .ind-btn:hover { color: var(--text); background: rgba(255,255,255,0.09); }
   .ind-dot { width: 5px; height: 5px; border-radius: 50%; }
 
-  .chart-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: transparent; min-height: 200px; }
+  .chart-canvas-wrap { flex: 1; min-height: 250px; position: relative; overflow: hidden; background: transparent; }
   #equityChart { width: 100%; height: 100%; }
   .chart-tooltip {
     position: absolute; pointer-events: none;
@@ -1276,12 +1278,7 @@
         </div>
       </div>
       <div class="chart-canvas-wrap" id="chartWrap">
-        <div class="chart-legend">
-          <div class="legend-item"><div class="legend-line" style="background:#f1c40f"></div>EMA(20)</div>
-          <div class="legend-item"><div class="legend-line" style="background:#9b59b6"></div>VWAP</div>
-          <div class="legend-item"><div class="legend-line" style="background:#3498db"></div>BB Upper</div>
-        </div>
-        <div id="lwChart" style="position:absolute;inset:0;width:100%;height:100%;"></div>
+        <div id="lwChart" style="flex:1;min-height:200px;"></div>
         <div class="chart-tooltip" id="chartTooltip" style="display:none;"></div>
       </div>
     </section>
@@ -2991,9 +2988,10 @@ function initLWChart() {
   }
   if (chart._lwChart) { try { chart._lwChart.remove(); } catch(e){} }
 
-  // Ensure container has dimensions before creating chart
-  const w = container.clientWidth  || container.parentElement?.clientWidth  || 800;
-  const h = container.clientHeight || container.parentElement?.clientHeight || 400;
+  // Use getBoundingClientRect for reliable dimensions after layout
+  const rect = container.getBoundingClientRect();
+  const w = Math.max(rect.width  || container.offsetWidth  || container.parentElement?.offsetWidth  || 800, 200);
+  const h = Math.max(rect.height || container.offsetHeight || container.parentElement?.offsetHeight || 400, 200);
 
   chart._lwChart = LightweightCharts.createChart(container, {
     layout: {
@@ -3076,16 +3074,14 @@ function initLWChart() {
   });
 
   // Auto-resize — fires immediately and on every container size change
-  const ro = new ResizeObserver(entries => {
+  const ro = new ResizeObserver(() => {
     if (!chart._lwChart) return;
-    for (const entry of entries) {
-      const w2 = entry.contentRect.width;
-      const h2 = entry.contentRect.height;
-      if (w2 > 0 && h2 > 0) chart._lwChart.resize(w2, h2);
-    }
+    const r = container.getBoundingClientRect();
+    const w2 = r.width  || container.offsetWidth  || 800;
+    const h2 = r.height || container.offsetHeight || 400;
+    if (w2 > 10 && h2 > 10) chart._lwChart.resize(w2, h2);
   });
   ro.observe(container);
-  // Also observe parent in case container itself reports 0
   if (container.parentElement) ro.observe(container.parentElement);
 
   _lwReady = true;
@@ -4132,15 +4128,25 @@ function init() {
   // and the container has real dimensions
   function tryInitChart(n) {
     const container = document.getElementById('lwChart');
-    const w = container?.clientWidth || 0;
-    const h = container?.clientHeight || 0;
-    if (window.LightweightCharts && w > 10 && h > 10) {
+    const w = container?.offsetWidth || container?.clientWidth || 0;
+    // Height check is unreliable in flex — just check width and library exists
+    if (window.LightweightCharts && w > 50) {
       initLWChart();
     } else if (n < 20) {
       setTimeout(() => tryInitChart(n + 1), 300);
     }
   }
   setTimeout(() => tryInitChart(0), 200);
+
+  // Absolute fallback: window.onload fires after full page render
+  window.addEventListener('load', () => {
+    if (!_lwReady) {
+      setTimeout(initLWChart, 100);
+    } else if (chart._lwSeries && !chart.allCandles?.length && state.equitySnapshots?.length) {
+      chart.allCandles = buildCandlesForTF(state.equitySnapshots, chart.tf);
+      redrawChart();
+    }
+  });
 
   // Auto-connect if credentials exist
   if (CONFIG.sbUrl && CONFIG.sbKey) {
