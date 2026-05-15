@@ -210,17 +210,15 @@ class StockChart {
     }
 
     try {
-      // Yahoo Finance blocks direct browser requests (CORS policy)
-      // Use allorigins.win as a CORS proxy — free, no key, reliable
-      const yUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`;
+      // Route through our bot which proxies Yahoo Finance (avoids browser CORS block)
+      // Bot URL is set globally by the dashboard
+      const botUrl = window.ALPHACORE_BOT_URL || 'https://tradecore-q1ll.onrender.com';
       const res  = await fetch(
-        `https://api.allorigins.win/get?url=${encodeURIComponent(yUrl)}`,
+        `${botUrl}/chart/${sym}`,
         { signal: AbortSignal.timeout(12000) }
       );
-      const wrapper = await res.json();
-      // allorigins wraps in {contents: "..."}, parse inner JSON
-      const json = typeof wrapper?.contents === 'string'
-        ? JSON.parse(wrapper.contents) : wrapper;
+      if (!res.ok) throw new Error(`Bot proxy returned ${res.status}`);
+      const json = await res.json();
       const r    = json?.chart?.result?.[0];
       if (!r) return;
       const ts = r.timestamp || [];

@@ -1791,6 +1791,7 @@ function toggleConfig() {
 
 function saveConfig() {
   CONFIG.botUrl = $('botUrl').value.trim();
+  window.ALPHACORE_BOT_URL = CONFIG.botUrl;
   CONFIG.sbUrl  = $('sbUrl').value.trim();
   CONFIG.sbKey  = $('sbKey').value.trim();
   localStorage.setItem('botUrl', CONFIG.botUrl);
@@ -3957,6 +3958,8 @@ function init() {
   updateClock();
   setInterval(updateClock, 1000);
   initMobileLayout();
+  // Expose bot URL globally so chart.js can use it for proxied requests
+  window.ALPHACORE_BOT_URL = CONFIG.botUrl || 'https://tradecore-q1ll.onrender.com';
   startLivePriceFeed(); // 1s live price updates from bot
   // Init chart after DOM is painted
   requestAnimationFrame(() => setTimeout(() => {
