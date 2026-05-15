@@ -10515,6 +10515,29 @@ http.createServer(async (req, res) => {
   }
 
   // ── GET /diagnostic — full state dump for debugging equity spikes ──
+  // ── GET /chart/:sym — proxy Yahoo Finance bars for dashboard ───────
+  // Dashboard can't call Yahoo directly (CORS). Bot can. This proxies it.
+  if (req.method === 'GET' && url.startsWith('/chart/')) {
+    const sym = url.split('/chart/')[1]?.split('?')[0]?.toUpperCase();
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/json');
+    if (!sym) { res.writeHead(400); res.end('{"error":"no symbol"}'); return; }
+    try {
+      const fetch = await getFetch();
+      const r = await fetch(
+        `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) }
+      );
+      const data = await r.text();
+      res.writeHead(r.ok ? 200 : 502);
+      res.end(data);
+    } catch(e) {
+      res.writeHead(502);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   // ── GET /health — liveness check ────────────────────────────────
   if (req.method === 'GET' && url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
