@@ -26,18 +26,22 @@ class AlphaCoreChart {
     this.container = document.getElementById(containerId);
     if (!this.container) { console.error('AlphaCoreChart: no container', containerId); return; }
 
-    this.container.style.cssText += ';position:relative;overflow:hidden;';
+    // Force container to fill its parent immediately
+    const par = this.container.parentElement;
+    if (par) {
+      par.style.position = 'relative';
+      this.container.style.cssText = 'position:absolute;inset:0;';
+    }
 
-    // Main canvas
+    // Canvases fill container via absolute positioning
     this.canvas = document.createElement('canvas');
-    this.canvas.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;';
-    this.container.appendChild(this.canvas);
-    this.ctx = this.canvas.getContext('2d');
-
-    // Overlay canvas for crosshair (separate layer = no full redraw on mouse move)
+    this.canvas.style.cssText = 'display:block;width:100%;height:100%;cursor:crosshair;';
     this.ov = document.createElement('canvas');
-    this.ov.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;';
+    this.ov.style.cssText = 'display:block;width:100%;height:100%;position:absolute;inset:0;pointer-events:none;';
+
+    this.container.appendChild(this.canvas);
     this.container.appendChild(this.ov);
+    this.ctx  = this.canvas.getContext('2d');
     this.octx = this.ov.getContext('2d');
 
     this.candles   = [];
@@ -45,16 +49,37 @@ class AlphaCoreChart {
     this.viewCount = 80;
     this.pad       = {t:10, r:75, b:28, l:0};
     this._dirty    = false;
+    this._pending  = null; // pending setData call waiting for size
 
-    this._resize();
     this._bindResize();
     this._bindEvents();
+
+    // Poll until container has real dimensions, then resize
+    this._waitForSize(0);
+  }
+
+  _waitForSize(attempt) {
+    const w = this.container.offsetWidth  || this.container.parentElement?.offsetWidth  || 0;
+    const h = this.container.offsetHeight || this.container.parentElement?.offsetHeight || 0;
+    if (w > 10 && h > 10) {
+      this._resize();
+      if (this._pending) { this.setData(this._pending); this._pending = null; }
+    } else if (attempt < 30) {
+      setTimeout(() => this._waitForSize(attempt + 1), 100);
+    }
   }
 
   // ─── Public ───────────────────────────────────────────────────────────────
 
   setData(candles) {
-    this.candles = (candles || []).filter(c => isFinite(+c.close));
+    const clean = (candles || []).filter(c => isFinite(+c.close));
+    if (!clean.length) return;
+    // If canvas not sized yet, buffer the call
+    if (!this.canvas.width || !this.canvas.height) {
+      this._pending = clean;
+      return;
+    }
+    this.candles = clean;
     const n = this.candles.length;
     this.viewCount = Math.min(Math.max(10, this.viewCount), n);
     this.viewStart = Math.max(0, n - this.viewCount);
@@ -357,17 +382,19 @@ class AlphaCoreChart {
   // ─── Resize ───────────────────────────────────────────────────────────────
 
   _resize() {
-    const dpr = window.devicePixelRatio || 1;
-    // Get PARENT dimensions — container may report 0 if flex
-    const src  = this.container;
-    const w    = src.offsetWidth  || src.parentElement?.offsetWidth  || 900;
-    const h    = src.offsetHeight || src.parentElement?.offsetHeight || 420;
+    const dpr  = window.devicePixelRatio || 1;
+    const el   = this.container;
+    const par  = el.parentElement;
+    // Walk up to find a parent with real dimensions
+    let w = el.offsetWidth, h = el.offsetHeight;
+    if (!w || !h) { w = par?.offsetWidth  || 900; h = par?.offsetHeight || 420; }
+    if (!w || !h) return; // still no dimensions, skip
     [this.canvas, this.ov].forEach(c => {
+      if (Math.round(c.width) === Math.round(w*dpr) &&
+          Math.round(c.height) === Math.round(h*dpr)) return; // unchanged
       c.width  = Math.round(w * dpr);
       c.height = Math.round(h * dpr);
-      // Reset scale after resize (getContext shares state)
     });
-    // Re-apply DPR scale
     [this.ctx, this.octx].forEach(c => { c.setTransform(1,0,0,1,0,0); c.scale(dpr, dpr); });
     this._draw();
   }
