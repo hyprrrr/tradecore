@@ -2704,7 +2704,7 @@ function renderPositions(positions) {
     const color     = up ? 'var(--buy)' : 'var(--sell)';
     const changeCls = up ? 'up' : 'down';
 
-    let row = existing[p.symbol];
+    let row = existingRows[p.symbol];
     if (!row) {
       // New position — create the row once.
       row = document.createElement('div');
