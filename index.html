@@ -1187,7 +1187,7 @@
   <div class="config-panel" id="configPanel">
     <div class="config-field">
       <label>Bot Base URL</label>
-      <input type="text" id="botUrl" placeholder="https://tradecore.up.railway.app" />
+      <input type="text" id="botUrl" placeholder="https://tradecore-q1ll.onrender.com" />
     </div>
     <div class="config-field">
       <label>Supabase URL</label>
@@ -1699,7 +1699,7 @@
         <div class="settings-section" style="grid-column: 1 / -1;">
           <div class="settings-section-title">🔌 Connection</div>
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end;">
-            <div class="config-field"><label>Bot Base URL (Railway)</label><input type="text" id="setBotUrl" class="settings-input" style="width:100%;text-align:left;" placeholder="https://tradecore.up.railway.app"></div>
+            <div class="config-field"><label>Bot Base URL (Railway)</label><input type="text" id="setBotUrl" class="settings-input" style="width:100%;text-align:left;" placeholder="https://tradecore-q1ll.onrender.com"></div>
             <div class="config-field"><label>Supabase URL</label><input type="text" id="setSbUrl" class="settings-input" style="width:100%;text-align:left;" placeholder="https://xxxx.supabase.co"></div>
             <div class="config-field"><label>Supabase Anon Key</label><input type="password" id="setSbKey" class="settings-input" style="width:100%;text-align:left;" placeholder="eyJ..."></div>
             <button class="btn btn-accent" onclick="saveConnectionSettings()">Connect</button>
@@ -3224,7 +3224,7 @@ let _livePriceFeedActive = false;
 let _livePriceInterval   = null;
 const BOT_URL = (() => {
   // Auto-detect bot URL from settings or use Railway default
-  return 'https://tradecore.up.railway.app';
+  return 'https://tradecore-q1ll.onrender.com';
 })();
 
 async function startLivePriceFeed() {
