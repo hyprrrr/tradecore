@@ -210,15 +210,30 @@ class StockChart {
     }
 
     try {
-      // Route through our bot which proxies Yahoo Finance (avoids browser CORS block)
-      // Bot URL is set globally by the dashboard
-      const botUrl = window.ALPHACORE_BOT_URL || 'https://tradecore-q1ll.onrender.com';
-      const res  = await fetch(
-        `${botUrl}/chart/${sym}`,
-        { signal: AbortSignal.timeout(12000) }
-      );
-      if (!res.ok) throw new Error(`Bot proxy returned ${res.status}`);
-      const json = await res.json();
+      // Try bot proxy first (avoids CORS), fall back to direct Yahoo if bot has endpoint
+      const botUrl = (window.ALPHACORE_BOT_URL || 'https://tradecore-q1ll.onrender.com')
+        .replace(/\/+$/, '');
+
+      // Try multiple proxy approaches in order
+      let json = null;
+
+      // 1. Bot proxy /chart/:sym
+      try {
+        const r1 = await fetch(`${botUrl}/chart/${sym}`, { signal: AbortSignal.timeout(8000) });
+        if (r1.ok) json = await r1.json();
+      } catch(e) {}
+
+      // 2. corsproxy.io fallback
+      if (!json) {
+        try {
+          const yUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`;
+          const r2 = await fetch(`https://corsproxy.io/?${encodeURIComponent(yUrl)}`,
+            { signal: AbortSignal.timeout(8000) });
+          if (r2.ok) json = await r2.json();
+        } catch(e) {}
+      }
+
+      if (!json) throw new Error('All data sources failed');
       const r    = json?.chart?.result?.[0];
       if (!r) return;
       const ts = r.timestamp || [];
