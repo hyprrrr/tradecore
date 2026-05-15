@@ -194,13 +194,19 @@ class StockChart {
       await new Promise(resolve => {
         let attempts = 0;
         const wait = setInterval(() => {
-          // Trigger init now that modal is visible
           if (!this.chart && window.LightweightCharts) this._init();
           if (this.series || ++attempts > 30) { clearInterval(wait); resolve(); }
         }, 100);
       });
     }
     if (!this.series) return;
+
+    // Clear previous data and price lines before loading new symbol
+    this.series.setData([]);
+    if (this._priceLines) {
+      this._priceLines.forEach(pl => { try { this.series.removePriceLine(pl); } catch(e){} });
+    }
+    this._priceLines = [];
 
     // Resize now that container is visible
     const el = this.container;
@@ -210,34 +216,51 @@ class StockChart {
     }
 
     try {
-      const botUrl = (window.ALPHACORE_BOT_URL || 'https://tradecore-q1ll.onrender.com').replace(/\/+$/, '');
-      const yUrl   = `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`;
-      let json     = null;
+      // Always use absolute Render URL — never relative
+      const _rawBotUrl = window.ALPHACORE_BOT_URL || '';
+      const botUrl = _rawBotUrl.startsWith('http')
+        ? _rawBotUrl.replace(/\/+$/, '')
+        : 'https://tradecore-q1ll.onrender.com';
 
-      // Try proxies in order — first one that works wins
-      const proxies = [
-        // 1. Our own bot (best — no rate limits, CORS headers added)
-        () => fetch(`${botUrl}/chart/${sym}`, {signal: AbortSignal.timeout(8000)}),
-        // 2. thingproxy (reliable, free)
-        () => fetch(`https://thingproxy.freeboard.io/fetch/${yUrl}`, {signal: AbortSignal.timeout(8000)}),
-        // 3. corsproxy.io
-        () => fetch(`https://corsproxy.io/?${encodeURIComponent(yUrl)}`, {signal: AbortSignal.timeout(8000)}),
-        // 4. allorigins — returns {contents:string}, needs unwrap
-        () => fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(yUrl)}`, {signal: AbortSignal.timeout(8000)}),
-      ];
+      const yUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`;
+      let json   = null;
 
-      for (const proxy of proxies) {
+      // 1. Bot proxy (own server, most reliable once deployed)
+      try {
+        const u = `${botUrl}/chart/${sym}`;
+        if (u.startsWith('https://')) { // safety: never call relative URL
+          const r1 = await fetch(u, {signal: AbortSignal.timeout(8000)});
+          if (r1.ok) { const d = await r1.json(); if (d?.chart?.result?.[0]) json = d; }
+        }
+      } catch(e) {}
+
+      // 2. allorigins (most reliable public CORS proxy)
+      if (!json) {
         try {
-          const res = await proxy();
-          if (!res.ok) continue;
-          const raw = await res.json();
-          // allorigins wraps in {contents}
-          const parsed = raw?.contents ? JSON.parse(raw.contents) : raw;
-          if (parsed?.chart?.result?.[0]) { json = parsed; break; }
-        } catch(e) { continue; }
+          const r2 = await fetch(
+            `https://api.allorigins.win/get?url=${encodeURIComponent(yUrl)}`,
+            {signal: AbortSignal.timeout(10000)}
+          );
+          if (r2.ok) {
+            const w = await r2.json();
+            const d = w?.contents ? JSON.parse(w.contents) : w;
+            if (d?.chart?.result?.[0]) json = d;
+          }
+        } catch(e) {}
       }
 
-      if (!json) throw new Error('All proxies failed — try again later');
+      // 3. cors-anywhere on herokuapp (requires no-cors header trick)
+      if (!json) {
+        try {
+          const r3 = await fetch(
+            `https://cors-anywhere.herokuapp.com/${yUrl}`,
+            {headers: {'X-Requested-With': 'XMLHttpRequest'}, signal: AbortSignal.timeout(10000)}
+          );
+          if (r3.ok) { const d = await r3.json(); if (d?.chart?.result?.[0]) json = d; }
+        } catch(e) {}
+      }
+
+      if (!json) throw new Error('Chart data unavailable — proxies blocked');
       const r = json?.chart?.result?.[0];
       if (!r) return;
       const ts = r.timestamp || [];
@@ -254,17 +277,41 @@ class StockChart {
       this.series.setData(data);
       this.chart.timeScale().scrollToRealTime();
 
-      // Add entry price line if available
+      // Live price updates — update last candle every 5s
+      if (this._liveInterval) clearInterval(this._liveInterval);
+      this._liveData = data;
+      this._liveSym  = sym;
+      this._liveInterval = setInterval(async () => {
+        if (this._liveSym !== sym) { clearInterval(this._liveInterval); return; }
+        try {
+          const botUrl = (window.ALPHACORE_BOT_URL || 'https://tradecore-q1ll.onrender.com').replace(/\/+$/, '');
+          // Use /prices endpoint for current price
+          const pr = await fetch(`${botUrl}/prices`, {signal: AbortSignal.timeout(3000)});
+          if (!pr.ok) return;
+          const prData = await pr.json();
+          const livePrice = prData?.prices?.[sym];
+          if (!livePrice || !this._liveData?.length) return;
+          const last = { ...this._liveData[this._liveData.length - 1] };
+          last.close = livePrice;
+          if (livePrice > last.high) last.high = livePrice;
+          if (livePrice < last.low)  last.low  = livePrice;
+          try { this.series.update(last); } catch(e) {}
+        } catch(e) {}
+      }, 5000);
+
+      // Add entry price line (tracked so it can be removed on next load)
       if (this._entryPrice) {
         try {
-          this.series.createPriceLine({
-            price:       this._entryPrice,
-            color:       '#05d890',
-            lineWidth:   1,
-            lineStyle:   LightweightCharts.LineStyle.Dashed,
+          const pl = this.series.createPriceLine({
+            price:            this._entryPrice,
+            color:            '#05d890',
+            lineWidth:        1,
+            lineStyle:        LightweightCharts.LineStyle.Dashed,
             axisLabelVisible: true,
-            title:       'Entry',
+            title:            'Entry',
           });
+          if (!this._priceLines) this._priceLines = [];
+          this._priceLines.push(pl);
         } catch(e) {}
       }
     } catch(e) { console.warn('StockChart load failed:', sym, e); }
@@ -272,6 +319,11 @@ class StockChart {
 
   setEntryPrice(price) {
     this._entryPrice = price;
+  }
+
+  stop() {
+    if (this._liveInterval) { clearInterval(this._liveInterval); this._liveInterval = null; }
+    this._liveSym = null;
   }
 }
 

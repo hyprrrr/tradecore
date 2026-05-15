@@ -4061,6 +4061,7 @@ init();
 
   function closeStockChart() {
     document.getElementById('stockChartModal').style.display = 'none';
+    if (_stockChartInst) _stockChartInst.stop();
   }
 
   // Close on backdrop click
