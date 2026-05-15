@@ -210,31 +210,35 @@ class StockChart {
     }
 
     try {
-      // Try bot proxy first (avoids CORS), fall back to direct Yahoo if bot has endpoint
-      const botUrl = (window.ALPHACORE_BOT_URL || 'https://tradecore-q1ll.onrender.com')
-        .replace(/\/+$/, '');
+      const botUrl = (window.ALPHACORE_BOT_URL || 'https://tradecore-q1ll.onrender.com').replace(/\/+$/, '');
+      const yUrl   = `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`;
+      let json     = null;
 
-      // Try multiple proxy approaches in order
-      let json = null;
+      // Try proxies in order — first one that works wins
+      const proxies = [
+        // 1. Our own bot (best — no rate limits, CORS headers added)
+        () => fetch(`${botUrl}/chart/${sym}`, {signal: AbortSignal.timeout(8000)}),
+        // 2. thingproxy (reliable, free)
+        () => fetch(`https://thingproxy.freeboard.io/fetch/${yUrl}`, {signal: AbortSignal.timeout(8000)}),
+        // 3. corsproxy.io
+        () => fetch(`https://corsproxy.io/?${encodeURIComponent(yUrl)}`, {signal: AbortSignal.timeout(8000)}),
+        // 4. allorigins — returns {contents:string}, needs unwrap
+        () => fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(yUrl)}`, {signal: AbortSignal.timeout(8000)}),
+      ];
 
-      // 1. Bot proxy /chart/:sym
-      try {
-        const r1 = await fetch(`${botUrl}/chart/${sym}`, { signal: AbortSignal.timeout(8000) });
-        if (r1.ok) json = await r1.json();
-      } catch(e) {}
-
-      // 2. corsproxy.io fallback
-      if (!json) {
+      for (const proxy of proxies) {
         try {
-          const yUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`;
-          const r2 = await fetch(`https://corsproxy.io/?${encodeURIComponent(yUrl)}`,
-            { signal: AbortSignal.timeout(8000) });
-          if (r2.ok) json = await r2.json();
-        } catch(e) {}
+          const res = await proxy();
+          if (!res.ok) continue;
+          const raw = await res.json();
+          // allorigins wraps in {contents}
+          const parsed = raw?.contents ? JSON.parse(raw.contents) : raw;
+          if (parsed?.chart?.result?.[0]) { json = parsed; break; }
+        } catch(e) { continue; }
       }
 
-      if (!json) throw new Error('All data sources failed');
-      const r    = json?.chart?.result?.[0];
+      if (!json) throw new Error('All proxies failed — try again later');
+      const r = json?.chart?.result?.[0];
       if (!r) return;
       const ts = r.timestamp || [];
       const q  = r.indicators?.quote?.[0] || {};
