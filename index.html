@@ -2707,7 +2707,7 @@ function renderPositions(positions) {
       row.dataset.side = side;
       row.dataset.symbol = p.symbol;
       row.style.cursor = 'pointer';
-      row.onclick = () => openStockChart(cleanSym(p.symbol), side, p.pnl || 0);
+      row.onclick = () => openStockChart(cleanSym(p.symbol), side, p.pnl || 0, p.entry_price || p.cost);
       row.innerHTML = `
         <div class="watch-name">${cleanSym(p.symbol)} <span class="watch-side">${side}</span></div>
         <div class="watch-price"></div>
@@ -4021,11 +4021,11 @@ init();
   <script>
   let _stockChartInst = null;
 
-  function openStockChart(sym, side, pnl) {
+  function openStockChart(sym, side, pnl, entryPrice) {
     const modal = document.getElementById('stockChartModal');
     modal.style.display = 'flex';
 
-    // Header info
+    // Header
     document.getElementById('scSym').textContent = sym;
     const sideEl = document.getElementById('scSide');
     sideEl.textContent = side;
@@ -4036,12 +4036,14 @@ init();
     pnlEl.textContent = (pnlNum >= 0 ? '+' : '') + '$' + Math.abs(pnlNum).toFixed(2);
     pnlEl.style.color = pnlNum >= 0 ? '#05d890' : '#ff4060';
 
-    // Init or reuse chart
+    // Init chart (deferred — modal must be visible first for dimensions)
     if (!_stockChartInst && window.StockChart) {
       _stockChartInst = new StockChart('stockChartContainer');
     }
     if (_stockChartInst) {
-      setTimeout(() => _stockChartInst.loadSymbol(sym), 100);
+      if (entryPrice) _stockChartInst.setEntryPrice(+entryPrice);
+      // Small delay so browser paints modal before we measure dimensions
+      setTimeout(() => _stockChartInst.loadSymbol(sym), 80);
     }
   }
 

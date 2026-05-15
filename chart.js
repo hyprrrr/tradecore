@@ -140,14 +140,14 @@ class EquityChart {
 // ─── Stock Chart (for position click) ────────────────────────────────────
 class StockChart {
   constructor(containerId) {
-    this.id        = containerId;
-    this.container = document.getElementById(containerId);
-    this.chart     = null;
-    this.series    = null;
-    this.sym       = null;
-
-    if (window.LightweightCharts) this._init();
-    else window._lwcReady = () => this._init();
+    this.id          = containerId;
+    this.container   = document.getElementById(containerId);
+    this.chart       = null;
+    this.series      = null;
+    this.sym         = null;
+    this._entryPrice = null;
+    // Don't init yet — container is inside a hidden modal (dimensions = 0)
+    // _init() will be called by loadSymbol once modal is visible
   }
 
   _init() {
@@ -186,12 +186,34 @@ class StockChart {
   }
 
   async loadSymbol(sym) {
-    if (!this.series || !sym) return;
+    if (!sym) return;
     this.sym = sym;
-    try {
-      const res  = await fetch(`https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
+
+    // If chart not ready yet, wait for it (modal was hidden during init)
+    if (!this.series) {
+      await new Promise(resolve => {
+        let attempts = 0;
+        const wait = setInterval(() => {
+          // Trigger init now that modal is visible
+          if (!this.chart && window.LightweightCharts) this._init();
+          if (this.series || ++attempts > 30) { clearInterval(wait); resolve(); }
+        }, 100);
       });
+    }
+    if (!this.series) return;
+
+    // Resize now that container is visible
+    const el = this.container;
+    if (el) {
+      const w = el.offsetWidth || 800, h = el.offsetHeight || 400;
+      if (w > 10 && h > 10) this.chart.resize(w, h);
+    }
+
+    try {
+      const res  = await fetch(
+        `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) }
+      );
       const json = await res.json();
       const r    = json?.chart?.result?.[0];
       if (!r) return;
@@ -199,14 +221,34 @@ class StockChart {
       const q  = r.indicators?.quote?.[0] || {};
       const data = ts.map((t,i) => ({
         time:  t,
-        open:  q.open?.[i], high: q.high?.[i],
-        low:   q.low?.[i],  close: q.close?.[i],
-      })).filter(d => isFinite(d.close) && isFinite(d.open));
+        open:  +(q.open?.[i]  || 0),
+        high:  +(q.high?.[i]  || 0),
+        low:   +(q.low?.[i]   || 0),
+        close: +(q.close?.[i] || 0),
+      })).filter(d => d.close > 0 && d.open > 0 && d.high > 0 && d.low > 0);
 
       if (!data.length) return;
       this.series.setData(data);
       this.chart.timeScale().scrollToRealTime();
+
+      // Add entry price line if available
+      if (this._entryPrice) {
+        try {
+          this.series.createPriceLine({
+            price:       this._entryPrice,
+            color:       '#05d890',
+            lineWidth:   1,
+            lineStyle:   LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title:       'Entry',
+          });
+        } catch(e) {}
+      }
     } catch(e) { console.warn('StockChart load failed:', sym, e); }
+  }
+
+  setEntryPrice(price) {
+    this._entryPrice = price;
   }
 }
 
