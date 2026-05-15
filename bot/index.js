@@ -2009,8 +2009,9 @@ async function syncTrade(trade) {
   // Hard dedup: don't write same sym+side+reason within 5 seconds
   const key = `${trade.sym}_${trade.side}_${trade.reason}`;
   const now = Date.now();
-  if (_lastTradeTs[key] && now - _lastTradeTs[key] < 5000) {
-    log('warn', `⚠️ Duplicate trade suppressed: ${key}`);
+  const dedupWindow = trade.reason === 'SIGNAL' ? 30000 : 5000;
+  if (_lastTradeTs[key] && now - _lastTradeTs[key] < dedupWindow) {
+    log('warn', `⚠️ Duplicate trade suppressed: ${key} (${dedupWindow/1000}s window)`);
     return;
   }
   _lastTradeTs[key] = now;
@@ -6592,13 +6593,15 @@ async function coverShort(sym, price, reason) {
   // Immediately delete from Supabase so dashboard reflects closure instantly.
   sbFetch(`${tbl('tc_positions')}?symbol=eq.${sym}_SHORT`, 'DELETE').catch(() => {});
 
-  // Cooldown on losses + any MANUAL_CLOSE (even breakeven)
-  if ((pnl < 0 && ['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) ||
-      (reason === 'MANUAL_CLOSE' && pnl <= 1)) {
+  // Cooldown on any exit including MANUAL_CLOSE
+  if (['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) {
     const lossAbs = Math.abs(pnl);
-    const cooldownMins = lossAbs > 100 ? 20 : lossAbs > 30 ? 12 : 8;
+    // MANUAL_CLOSE gets a flat 15-minute cooldown regardless of P&L
+    // Stop losses scale by size
+    const cooldownMins = reason === 'MANUAL_CLOSE' ? 15 
+      : lossAbs > 100 ? 20 : lossAbs > 30 ? 12 : 8;
     stopLossCooldown[sym] = Date.now() + cooldownMins * 60 * 1000;
-    log('risk', `⏳ ${sym} cooldown: ${cooldownMins}min after ${reason} ($${pnl.toFixed(2)})`);
+    log('risk', `⏳ ${sym} cooldown: ${cooldownMins}min after ${reason} (pnl=$${pnl.toFixed(2)})`);
     markPMRBFailed(sym);
   }
 
@@ -6868,9 +6871,8 @@ async function exitPosition(sym, price, reason) {
 
   // Stamp cooldown on stop-loss exits — prevents immediate re-entry into same failing trade
   // Cooldown scales with loss: small loss = 5min, large loss = 15min
-  // Cooldown on losing exits + any MANUAL_CLOSE (even at breakeven — prevents re-entry spam)
-  if ((pnl < 0 && ['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) ||
-      (reason === 'MANUAL_CLOSE' && pnl <= 1)) {
+  // Cooldown on any exit — MANUAL_CLOSE always blocks re-entry for 10+ min
+  if (['STOP_LOSS','BREAK_EVEN_STOP','MANUAL_CLOSE'].includes(reason)) {
     const lossAbs = Math.abs(pnl);
     const cooldownMins = lossAbs > 100 ? 20 : lossAbs > 30 ? 12 : 8;
     stopLossCooldown[sym] = Date.now() + cooldownMins * 60 * 1000;
@@ -8198,10 +8200,9 @@ async function syncAlpacaPositions() {
       // from partial fills that haven't settled in Alpaca yet (ARM loop bug)
       const posAge = positions[sym]?.entryTime
         ? (reconcileNow - new Date(positions[sym].entryTime).getTime()) / 1000 : 999;
-      if (posAge < 90) continue; // was 45s — Alpaca fill settlement can take 60s+ AH
-      // Skip if an exit is already in-flight
+      if (posAge < 120) continue; // 2 min grace — Alpaca settlement + confirmation
       if (_exitInFlight.has(sym)) continue;
-      if (_recentlyExited[sym] && Date.now() - _recentlyExited[sym] < 90000) continue;
+      if (_recentlyExited[sym] && Date.now() - _recentlyExited[sym] < 120000) continue;
       if (liveSymbols.has(sym)) continue;
 
       // Snapshot the position object, then remove from memory SYNCHRONOUSLY
