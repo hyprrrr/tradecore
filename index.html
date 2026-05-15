@@ -2375,41 +2375,8 @@ async function resetCircuit() {
 }
 
 async function exitAll() {
-  openExitAllModal(); return; // replaced by custom modal
-  if (false) { // dead code below kept for reference
-
-  if (!CONFIG.botUrl) {
-    addLog('error', 'Exit All needs a Railway bot URL — set it in Config');
-    return;
-  }
-
-  try {
-    const r = await fetch(`${botBase()}/exit-all`);
-    const data = await r.json().catch(() => ({}));
-    if (data.ok) {
-      if (data.closed > 0) {
-        addLog('warn', `🖐 Exit All: closed ${data.closed}${data.failed?`, failed ${data.failed}`:''}, pnl ${data.totalPnl>=0?'+':''}$${(data.totalPnl||0).toFixed(2)}`);
-      } else {
-        addLog('info', 'Exit All: no open positions to close');
-      }
-      // Bot self-clears circuit_breaker — just refresh the UI
-      setTimeout(fetchAll, 1500);
-    } else {
-      addLog('error', `Exit All failed: ${data.message || 'unknown'}`);
-    }
-  } catch(e) {
-    addLog('error', `Exit All failed: ${e.message}`);
-  }
+  openExitAllModal();
 }
-
-// ═══════════════════════════════════════ DIAGNOSTICS EXPORT ═══════════════════════════════════════
-// Bundles everything needed to debug a live issue:
-//  • Bot HTTP /diagnostic (full in-memory state: positions, counters, config)
-//  • Bot HTTP / (summary status)
-//  • Supabase tables (portfolio, settings, positions, recent trades, recent logs, equity)
-//  • Dashboard client state (CONFIG, mode, state object, chart settings)
-//  • Recent browser console output + uncaught errors (last 200 entries)
-//  • Environment info (URL, user agent, viewport, timestamps)
 async function runCleanupNow() {
   const btn = event?.target;
   if (btn) { btn.textContent = '🧹 Cleaning…'; btn.disabled = true; }
