@@ -10515,10 +10515,49 @@ http.createServer(async (req, res) => {
   }
 
   // ── GET /diagnostic — full state dump for debugging equity spikes ──
-  // ── GET /health — liveness check (self-ping + uptime monitors) ──
+  // ── GET /health — liveness check ────────────────────────────────
   if (req.method === 'GET' && url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ status: 'ok', equity: realEquity, uptime: Math.floor(process.uptime()) }));
+    return;
+  }
+
+  // ── GET /exit-all — close all open positions immediately ─────────
+  if (req.method === 'GET' && url === '/exit-all') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/json');
+    const allSyms  = [...Object.keys(positions), ...Object.keys(shortPositions), ...Object.keys(scalpPositions)];
+    if (!allSyms.length) {
+      res.writeHead(200); res.end(JSON.stringify({ ok: true, closed: 0, message: 'No open positions' }));
+      return;
+    }
+    let closed = 0, failed = 0, totalPnl = 0;
+    for (const sym of Object.keys(positions)) {
+      try {
+        const price = alpacaLivePrice[sym] || positions[sym].entryPrice;
+        const pnl   = (price - positions[sym].entryPrice) * (positions[sym].qty || 1);
+        await exitPosition(sym, price, 'MANUAL_DISCORD');
+        closed++; totalPnl += pnl;
+      } catch(e) { failed++; log('error', `Exit All: ${sym} failed: ${e.message}`); }
+    }
+    for (const sym of Object.keys(shortPositions)) {
+      try {
+        const price = alpacaLivePrice[sym] || shortPositions[sym].entryPrice;
+        const pnl   = (shortPositions[sym].entryPrice - price) * (shortPositions[sym].qty || 1);
+        await coverShort(sym, price, 'MANUAL_DISCORD');
+        closed++; totalPnl += pnl;
+      } catch(e) { failed++; }
+    }
+    for (const sym of Object.keys(scalpPositions)) {
+      try {
+        const price = alpacaLivePrice[sym] || scalpPositions[sym].entryPrice;
+        await exitScalp(sym, price, 'MANUAL_DISCORD');
+        closed++;
+      } catch(e) { failed++; }
+    }
+    log('sys', `🖐 Exit All: closed ${closed} positions, P&L ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, closed, failed, totalPnl }));
     return;
   }
 
