@@ -3233,10 +3233,15 @@ async function startLivePriceFeed() {
 
   async function fetchLivePrices() {
     try {
+      // Only fetch if we've confirmed the endpoint exists (not 404)
+      if (startLivePriceFeed._confirmed404) return;
       const res = await fetch(`${BOT_URL}/prices`, {
         signal: AbortSignal.timeout(2000),
       });
-      // 404 = endpoint not deployed yet — skip silently
+      if (res.status === 404) {
+        startLivePriceFeed._confirmed404 = true; // stop retrying
+        return;
+      }
       if (!res.ok) return;
       const data = await res.json();
 
