@@ -10515,6 +10515,13 @@ http.createServer(async (req, res) => {
   }
 
   // ── GET /diagnostic — full state dump for debugging equity spikes ──
+  // ── GET /health — liveness check (self-ping + uptime monitors) ──
+  if (req.method === 'GET' && url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ status: 'ok', equity: realEquity, uptime: Math.floor(process.uptime()) }));
+    return;
+  }
+
   // ── GET /prices — ultra-lightweight live price feed ──────────────
   // Returns alpacaLivePrice for all open positions + watchlist top 20
   // Dashboard polls this every 1 second for real-time position P&L
@@ -10831,9 +10838,27 @@ http.createServer(async (req, res) => {
 
 }).listen(process.env.PORT || 3000, () => {
   log('sys', `Server on port ${process.env.PORT || 3000}`);
-  log('sys', `Health check: https://tradecore.up.railway.app/`);
-  log('sys', `Discord endpoint: https://tradecore.up.railway.app/discord`);
-  log('sys', `Register commands: https://tradecore.up.railway.app/setup-discord`);
+  log('sys', `Health check: https://tradecore-q1ll.onrender.com/`);
+  log('sys', `Discord endpoint: https://tradecore-q1ll.onrender.com/discord`);
+
+// ── Self-ping to prevent Render/Railway free tier sleep ──────────
+// Pings the bot's own /health endpoint every 10 minutes
+// Render free tier sleeps after 15min of inactivity without this
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN}`
+  : null;
+
+if (SELF_URL) {
+  setInterval(async () => {
+    try {
+      const fetch = await getFetch();
+      await fetch(`${SELF_URL}/health`, { signal: AbortSignal.timeout(5000) });
+      log('sys', '🏓 Self-ping OK');
+    } catch(e) { /* silent */ }
+  }, 10 * 60 * 1000); // every 10 minutes
+  log('sys', `🏓 Self-ping enabled → ${SELF_URL}/health`);
+}
+  log('sys', `Register commands: https://tradecore-q1ll.onrender.com/setup-discord`);
   if (CONFIG.discordPublicKey) log('sys', `Discord signature verification: ✅ enabled`);
   else log('warn', `Discord signature verification: ⚠ DISCORD_PUBLIC_KEY not set`);
 });
