@@ -1780,7 +1780,15 @@ window.addEventListener('unhandledrejection', e => __diagPush('promise_rejection
 
 // ═══════════════════════════════════════ CONFIG ═══════════════════════════════════════
 let CONFIG = {
-  botUrl: localStorage.getItem('botUrl') || 'https://tradecore-q1ll.onrender.com',
+  botUrl: (() => {
+    const stored = localStorage.getItem('botUrl') || '';
+    // Clear stale Railway URL — always use Render
+    if (stored.includes('railway.app')) {
+      localStorage.setItem('botUrl', 'https://tradecore-q1ll.onrender.com');
+      return 'https://tradecore-q1ll.onrender.com';
+    }
+    return stored || 'https://tradecore-q1ll.onrender.com';
+  })(),
   sbUrl:  localStorage.getItem('sbUrl')  || '',
   sbKey:  localStorage.getItem('sbKey')  || '',
 };
