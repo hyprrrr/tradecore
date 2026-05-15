@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+  <script src="chart.js"></script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ALPHACORE // Trading Bot Command Center</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2300e5c7'/><text x='16' y='22' font-family='Inter,system-ui,sans-serif' font-size='19' font-weight='800' text-anchor='middle' fill='%23070708'>A</text></svg>" />
@@ -1288,8 +1289,7 @@
         </div>
       </div>
       <div class="chart-canvas-wrap" id="chartWrap">
-        <svg id="equityChart" style="flex:1;width:100%;min-height:200px;" preserveAspectRatio="none"></svg>
-        <div class="chart-tooltip" id="chartTooltip" style="display:none;"></div>
+        <div id="equityCanvas" style="width:100%;height:100%;min-height:280px;"></div>
       </div>
     </section>
 
@@ -2955,32 +2955,34 @@ function renderEquityChart(snapshots) {
   const last = snapshots[snapshots.length - 1];
   const hash = `${snapshots.length}|${last.created_at}|${(+last.value).toFixed(2)}`;
   if (hash === state._lastEquityHash && chart.allCandles.length) return;
-  state._lastEquityHash  = hash;
-  state.equitySnapshots  = snapshots;
+  state._lastEquityHash = hash;
+  state.equitySnapshots = snapshots;
   chart.allCandles = buildCandlesForTF(snapshots, chart.tf);
-  chart.viewCount = Math.min(80, chart.allCandles.length);
-  chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
-  redrawChart();
+  const inst = _getOrInitChart();
+  if (inst) inst.setData(chart.allCandles);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// SVG CHART ENGINE — clean, reliable, no external dependencies
+// ALPHACORE CHART ENGINE — wraps chart.js canvas renderer
 // ═══════════════════════════════════════════════════════════════════
 
 const chart = {
   tf:         '1H',
   allCandles: [],
-  viewStart:  0,
-  viewCount:  80,
-  yScale:     1.0,
-  yOffset:    0,
-  isDragging: false,
+  _inst:      null,  // AlphaCoreChart instance
 };
 
 let _liveCandleLastBucketKey = 0;
-let _redrawScheduled = false;
 
-// ── Build candles from equity snapshots ──────────────────────────
+function _getOrInitChart() {
+  if (chart._inst) return chart._inst;
+  if (!window.AlphaCoreChart) return null;
+  const el = document.getElementById('equityCanvas');
+  if (!el || el.clientWidth < 10) return null;
+  chart._inst = new AlphaCoreChart('equityCanvas');
+  return chart._inst;
+}
+
 function buildCandlesForTF(snapshots, tf) {
   if (!snapshots?.length) return [];
   const msMap = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
@@ -3013,102 +3015,14 @@ function buildCandlesForTF(snapshots, tf) {
   return out;
 }
 
-// ── Main draw function ───────────────────────────────────────────
 function redrawChart() {
-  if (_redrawScheduled) return;
-  _redrawScheduled = true;
-  requestAnimationFrame(() => {
-    _redrawScheduled = false;
-    _drawChart();
-  });
+  const inst = _getOrInitChart();
+  if (!inst || !chart.allCandles?.length) return;
+  inst.setData(chart.allCandles);
 }
 
 function scheduleRedraw() { redrawChart(); }
 
-function _drawChart() {
-  const svg = $('equityChart');
-  if (!svg) return;
-  const candles = chart.allCandles;
-  if (!candles?.length) return;
-
-  const W = svg.clientWidth || svg.parentElement?.clientWidth || 900;
-  const H = svg.clientHeight || svg.parentElement?.clientHeight || 400;
-  if (W < 10 || H < 10) return;
-
-  svg.setAttribute('width', W);
-  svg.setAttribute('height', H);
-  svg.innerHTML = '';
-
-  const pad = {t:15, r:75, b:28, l:8};
-  const cw = W - pad.l - pad.r;
-  const ch = H - pad.t - pad.b;
-
-  // Clamp view
-  chart.viewCount = Math.max(10, Math.min(candles.length, chart.viewCount));
-  chart.viewStart = Math.max(0, Math.min(candles.length - chart.viewCount, chart.viewStart));
-  const visible = candles.slice(chart.viewStart, chart.viewStart + chart.viewCount);
-  if (!visible.length) return;
-
-  // Y range
-  const prices = visible.flatMap(d => [d.high, d.low]).filter(isFinite);
-  const minP = Math.min(...prices), maxP = Math.max(...prices);
-  const rawRng = maxP - minP || 1;
-  const rng = Math.max(rawRng, maxP * 0.006);
-  const mid = (minP + maxP) / 2;
-  const half = (rng * 0.65) / (chart.yScale || 1);
-  const yMin = mid - half + (chart.yOffset||0);
-  const yMax = mid + half + (chart.yOffset||0);
-  const yRng = yMax - yMin || 1;
-
-  const xOf = i => pad.l + (i / Math.max(visible.length-1,1)) * cw;
-  const yOf = p => pad.t + ch - ((p-yMin)/yRng)*ch;
-
-  // Grid
-  const ns = 'http://www.w3.org/2000/svg';
-  const mk = (tag,attrs) => {
-    const el = document.createElementNS(ns,tag);
-    Object.entries(attrs).forEach(([k,v]) => el.setAttribute(k,v));
-    return el;
-  };
-  for (let i=0; i<=5; i++) {
-    const y = pad.t + (ch/5)*i;
-    const price = yMax - ((y-pad.t)/ch)*yRng;
-    svg.appendChild(mk('line',{x1:pad.l,y1:y,x2:W-pad.r,y2:y,stroke:'rgba(255,255,255,0.05)','stroke-width':'1'}));
-    const t = mk('text',{x:W-pad.r+4,y:y+4,'font-size':'9','fill':'rgba(255,255,255,0.35)','font-family':'monospace'});
-    t.textContent = '$'+price.toLocaleString([],{minimumFractionDigits:0,maximumFractionDigits:0});
-    svg.appendChild(t);
-  }
-
-  // Candles
-  const slotW = cw / Math.max(visible.length,1);
-  const candleW = Math.max(1.5, Math.min(18, slotW * 0.6));
-  visible.forEach((d,i) => {
-    const x = xOf(i);
-    const up = d.close >= d.open;
-    const yo = yOf(d.open), yc = yOf(d.close), yh = yOf(d.high), yl = yOf(d.low);
-    const top = Math.min(yo,yc), bodyH = Math.max(Math.abs(yo-yc),1.5);
-    // Wick
-    const wick = mk('line',{x1:x,y1:yh,x2:x,y2:yl,stroke:'#2962ff','stroke-width':'1'});
-    svg.appendChild(wick);
-    // Body
-    const body = mk('rect',{x:x-candleW/2,y:top,width:candleW,height:bodyH,rx:'1'});
-    body.setAttribute('fill', up ? '#2962ff' : '#131722');
-    if (!up) body.setAttribute('stroke','#2962ff'), body.setAttribute('stroke-width','1');
-    svg.appendChild(body);
-  });
-
-  // Price label
-  const last = visible[visible.length-1];
-  const ly = Math.max(pad.t+9, Math.min(pad.t+ch-9, yOf(last.close)));
-  svg.appendChild(mk('line',{x1:pad.l,y1:ly,x2:W-pad.r,y2:ly,stroke:'#2962ff','stroke-width':'0.8','stroke-dasharray':'4,3'}));
-  const lbg = mk('rect',{x:W-pad.r+1,y:ly-9,width:72,height:18,rx:'4',fill:last.close>=last.open?'#2962ff':'#ef5350'});
-  svg.appendChild(lbg);
-  const lt = mk('text',{x:W-pad.r+37,y:ly+4,'font-size':'9.5','fill':'white','text-anchor':'middle','font-weight':'700','font-family':'monospace'});
-  lt.textContent = last.close.toLocaleString([],{minimumFractionDigits:2,maximumFractionDigits:2});
-  svg.appendChild(lt);
-}
-
-// ── Live candle ──────────────────────────────────────────────────
 function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
   if (!isFinite(v) || v <= 0 || !chart.allCandles?.length) return;
@@ -3117,77 +3031,35 @@ function tickLiveCandle() {
   const key = Math.floor(Date.now()/bucketMs)*bucketMs;
   const last = chart.allCandles[chart.allCandles.length-1];
   const lastKey = Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time)/bucketMs)*bucketMs;
-  const wasAtEdge = chart.viewStart + chart.viewCount >= chart.allCandles.length - 1;
   if (key > lastKey) {
     chart.allCandles.push({time:new Date(key), open:last.close, high:Math.max(last.close,v), low:Math.min(last.close,v), close:v, volume:1, live:true});
-    if (wasAtEdge) chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
   } else {
     last.close = v;
     if (v > last.high) last.high = v;
-    if (v < last.low) last.low = v;
+    if (v < last.low)  last.low  = v;
   }
-  redrawChart();
+  const inst = _getOrInitChart();
+  if (inst) inst.update({time:new Date(key), open:last.open, high:last.high, low:last.low, close:v, volume:1});
 }
 
-// ── TF switch ────────────────────────────────────────────────────
 function setTF(tf) {
   chart.tf = tf;
   document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
   const btn = document.querySelector(`.tf-btn[data-tf="${tf}"]`);
   if (btn) btn.classList.add('active');
-  chart.yScale = 1.0; chart.yOffset = 0;
   _liveCandleLastBucketKey = 0;
   fetchEquity().then(() => {
     chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
-    chart.viewCount = Math.min(80, chart.allCandles.length);
-    chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
     redrawChart();
   }).catch(() => redrawChart());
 }
 
-// ── Chart interaction ────────────────────────────────────────────
 function initChartInteraction() {
-  const wrap = $('chartWrap');
-  if (!wrap || wrap._inited) return;
-  wrap._inited = true;
-  wrap.style.cursor = 'crosshair';
-
-  // Wheel zoom
-  wrap.addEventListener('wheel', e => {
-    e.preventDefault();
-    const factor = e.deltaY > 0 ? 1.15 : 0.87;
-    const svg = $('equityChart');
-    const rect = svg?.getBoundingClientRect() || {left:0,width:900};
-    const ratio = (e.clientX - rect.left) / rect.width;
-    const prev = chart.viewCount;
-    chart.viewCount = Math.max(10, Math.min(chart.allCandles?.length||80, Math.round(prev*factor)));
-    chart.viewStart = Math.max(0, Math.min((chart.allCandles?.length||0)-chart.viewCount, Math.round(chart.viewStart - (chart.viewCount-prev)*ratio)));
-    redrawChart();
-  }, {passive:false});
-
-  // Drag pan
-  let dragX = 0, dragView = 0, dragging = false;
-  wrap.addEventListener('mousedown', e => { dragging=true; dragX=e.clientX; dragView=chart.viewStart; wrap.style.cursor='grabbing'; e.preventDefault(); });
-  window.addEventListener('mousemove', e => {
-    if (!dragging || !chart.allCandles?.length) return;
-    const svg = $('equityChart');
-    const pw = svg?.clientWidth || 900;
-    const pxPerCandle = pw / chart.viewCount;
-    chart.viewStart = Math.max(0, Math.min(chart.allCandles.length-chart.viewCount, Math.round(dragView-(e.clientX-dragX)/pxPerCandle)));
-    redrawChart();
-  });
-  window.addEventListener('mouseup', () => { dragging=false; const w=$('chartWrap'); if(w)w.style.cursor='crosshair'; });
-
-  // Double-click reset
-  wrap.addEventListener('dblclick', () => {
-    chart.viewCount=80; chart.yScale=1; chart.yOffset=0;
-    chart.viewStart=Math.max(0,(chart.allCandles?.length||0)-80);
-    redrawChart();
-  });
-
-  // Auto-resize
-  const ro = new ResizeObserver(() => redrawChart());
-  ro.observe(wrap);
+  // Chart is self-initializing via AlphaCoreChart — just trigger first render
+  setTimeout(() => {
+    const inst = _getOrInitChart();
+    if (inst && chart.allCandles?.length) inst.setData(chart.allCandles);
+  }, 200);
 }
 
 // ── Compatibility wrapper so old code calling drawCandlestickChart still works ──
@@ -4099,17 +3971,23 @@ function init() {
   setInterval(updateClock, 1000);
   initMobileLayout();
   startLivePriceFeed(); // 1s live price updates from bot
-  setTimeout(initChartInteraction, 100);
-
-  // Init chart interaction on load
-  window.addEventListener('load', () => {
-    initChartInteraction();
-    if (state.equitySnapshots?.length) {
+  // Init chart after DOM is painted
+  requestAnimationFrame(() => setTimeout(() => {
+    const inst = _getOrInitChart();
+    if (inst && state.equitySnapshots?.length) {
       chart.allCandles = buildCandlesForTF(state.equitySnapshots, chart.tf);
-      chart.viewCount = Math.min(80, chart.allCandles.length);
-      chart.viewStart = Math.max(0, chart.allCandles.length - chart.viewCount);
-      redrawChart();
+      inst.setData(chart.allCandles);
     }
+  }, 300));
+
+  window.addEventListener('load', () => {
+    setTimeout(() => {
+      const inst = _getOrInitChart();
+      if (inst && state.equitySnapshots?.length) {
+        chart.allCandles = buildCandlesForTF(state.equitySnapshots, chart.tf);
+        inst.setData(chart.allCandles);
+      }
+    }, 500);
   });
 
   // Auto-connect if credentials exist
