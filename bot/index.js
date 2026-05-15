@@ -114,7 +114,7 @@ const CONFIG = {
   positionTradingEnabled: process.env.POSITION_TRADING === 'true',
   scalpMode:           process.env.SCALP_MODE === 'true',
   aiNewsEnabled:       process.env.AI_NEWS !== 'false', // default ON, toggleable via dashboard
-  shortsEnabled:       process.env.ENABLE_SHORTS === 'true',
+  shortsEnabled:       process.env.ENABLE_SHORTS !== 'false', // default ON — set ENABLE_SHORTS=false to disable
   recoveryMode:        process.env.RECOVERY_MODE === 'true',
   minConfidence:       +(process.env.MIN_CONFIDENCE || 62),
   scalpSymbols:        (process.env.SCALP_SYMBOLS || 'NVDA,TSLA,MSTR,COIN,AMD,META,AAPL,SPY,QQQ').split(',').map(s => s.trim().toUpperCase()),
@@ -9988,8 +9988,10 @@ CONFIG.rsiOverbought = 65;
 CONFIG.minConfidence = 62;
 CONFIG.maxPositionPct = 0.10;
 CONFIG.adaptTargetWR  = 0.65;
-CONFIG.strategy       = CONFIG.strategy || 'rsi_macd';
-CONFIG._activeStrategy = CONFIG.strategy;
+CONFIG.strategy        = (CONFIG.strategy && CONFIG.strategy !== 'None' && CONFIG.strategy !== 'null')
+  ? CONFIG.strategy : 'rsi_macd';
+CONFIG._activeStrategy  = CONFIG.strategy;
+CONFIG.shortsEnabled    = CONFIG.shortsEnabled !== false; // ensure it's never accidentally false
 log('sys', `⚙️ Adaptive params reset: RSI ${CONFIG.rsiOversold}/${CONFIG.rsiOverbought} conf:${CONFIG.minConfidence} pos:${(CONFIG.maxPositionPct*100).toFixed(0)}% strategy:${CONFIG.strategy}`);
 
 // Pre-warm bar cache on startup so first scan is instant
@@ -10516,7 +10518,19 @@ http.createServer(async (req, res) => {
   // Returns alpacaLivePrice for all open positions + watchlist top 20
   // Dashboard polls this every 1 second for real-time position P&L
   // No DB calls, no Alpaca calls — just returns in-memory data instantly
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin':  '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Max-Age':       '86400',
+    });
+    res.end(); return;
+  }
+
   if (req.method === 'GET' && url === '/prices') {
+    // CORS — allow the Vercel dashboard to fetch directly
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     const openSyms = [
       ...Object.keys(positions),
       ...Object.keys(shortPositions),
