@@ -1283,7 +1283,7 @@
         </div>
       </div>
       <div class="chart-canvas-wrap" id="chartWrap">
-        <div id="equityCanvas" style="position:absolute;inset:0;"></div>
+        <div id="equityCanvas"></div>
       </div>
     </section>
 
@@ -2706,6 +2706,8 @@ function renderPositions(positions) {
       row.className = 'watch-row';
       row.dataset.side = side;
       row.dataset.symbol = p.symbol;
+      row.style.cursor = 'pointer';
+      row.onclick = () => openStockChart(cleanSym(p.symbol), side, p.pnl || 0);
       row.innerHTML = `
         <div class="watch-name">${cleanSym(p.symbol)} <span class="watch-side">${side}</span></div>
         <div class="watch-price"></div>
@@ -2952,28 +2954,20 @@ function renderEquityChart(snapshots) {
   state._lastEquityHash = hash;
   state.equitySnapshots = snapshots;
   chart.allCandles = buildCandlesForTF(snapshots, chart.tf);
-  const inst = _getOrInitChart();
-  if (inst) inst.setData(chart.allCandles);
+  redrawChart();
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// ALPHACORE CHART ENGINE — wraps chart.js canvas renderer
+// CHART ENGINE — wraps chart.js (EquityChart + StockChart)
 // ═══════════════════════════════════════════════════════════════════
 
-const chart = {
-  tf:         '1H',
-  allCandles: [],
-  _inst:      null,  // AlphaCoreChart instance
-};
-
+const chart = { tf: '1H', allCandles: [], _inst: null };
 let _liveCandleLastBucketKey = 0;
 
-function _getOrInitChart() {
+function _equityChart() {
   if (chart._inst) return chart._inst;
-  if (!window.AlphaCoreChart) return null;
-  const el = document.getElementById('equityCanvas');
-  if (!el || el.clientWidth < 10) return null;
-  chart._inst = new AlphaCoreChart('equityCanvas');
+  if (!window.EquityChart) return null;
+  chart._inst = new EquityChart('equityCanvas');
   return chart._inst;
 }
 
@@ -2990,29 +2984,27 @@ function buildCandlesForTF(snapshots, tf) {
     if (!buckets[key]) buckets[key] = [];
     buckets[key].push(val);
     if (key < firstKey) firstKey = key;
-    if (key > lastKey) lastKey = key;
+    if (key > lastKey)  lastKey  = key;
   });
   if (firstKey === Infinity) return [];
-  const out = [];
-  let lastClose = null;
+  const out = []; let lastClose = null;
   const endKey = Math.min(lastKey, Math.floor(Date.now()/bucketMs)*bucketMs);
   for (let k = firstKey; k <= endKey; k += bucketMs) {
     const v = buckets[k];
     if (v) {
       const open = lastClose ?? v[0], close = v[v.length-1];
-      out.push({time:new Date(k), open, high:Math.max(open,close,...v), low:Math.min(open,close,...v), close, volume:v.length});
+      out.push({time:new Date(k), open, high:Math.max(open,close,...v), low:Math.min(open,close,...v), close});
       lastClose = close;
     } else if (lastClose !== null) {
-      out.push({time:new Date(k), open:lastClose, high:lastClose, low:lastClose, close:lastClose, volume:0});
+      out.push({time:new Date(k), open:lastClose, high:lastClose, low:lastClose, close:lastClose});
     }
   }
   return out;
 }
 
 function redrawChart() {
-  const inst = _getOrInitChart();
-  if (!inst || !chart.allCandles?.length) return;
-  inst.setData(chart.allCandles);
+  const inst = _equityChart();
+  if (inst && chart.allCandles?.length) inst.setData(chart.allCandles);
 }
 
 function scheduleRedraw() { redrawChart(); }
@@ -3022,18 +3014,16 @@ function tickLiveCandle() {
   if (!isFinite(v) || v <= 0 || !chart.allCandles?.length) return;
   const msMap = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
   const bucketMs = msMap[chart.tf] || 3600e3;
-  const key = Math.floor(Date.now()/bucketMs)*bucketMs;
+  const key  = Math.floor(Date.now()/bucketMs)*bucketMs;
   const last = chart.allCandles[chart.allCandles.length-1];
-  const lastKey = Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time)/bucketMs)*bucketMs;
-  if (key > lastKey) {
-    chart.allCandles.push({time:new Date(key), open:last.close, high:Math.max(last.close,v), low:Math.min(last.close,v), close:v, volume:1, live:true});
+  const lkey = Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time)/bucketMs)*bucketMs;
+  if (key > lkey) {
+    chart.allCandles.push({time:new Date(key), open:last.close, high:Math.max(last.close,v), low:Math.min(last.close,v), close:v});
   } else {
-    last.close = v;
-    if (v > last.high) last.high = v;
-    if (v < last.low)  last.low  = v;
+    last.close = v; if (v > last.high) last.high = v; if (v < last.low) last.low = v;
   }
-  const inst = _getOrInitChart();
-  if (inst) inst.update({time:new Date(key), open:last.open, high:last.high, low:last.low, close:v, volume:1});
+  const inst = _equityChart();
+  if (inst) inst.update({time:new Date(key), open:last.open, high:last.high, low:last.low, close:v});
 }
 
 function setTF(tf) {
@@ -3045,15 +3035,12 @@ function setTF(tf) {
   fetchEquity().then(() => {
     chart.allCandles = buildCandlesForTF(state.equitySnapshots, tf);
     redrawChart();
-  }).catch(() => redrawChart());
+  }).catch(() => {});
 }
 
 function initChartInteraction() {
-  // Chart is self-initializing via AlphaCoreChart — just trigger first render
-  setTimeout(() => {
-    const inst = _getOrInitChart();
-    if (inst && chart.allCandles?.length) inst.setData(chart.allCandles);
-  }, 200);
+  // EquityChart self-initializes — just trigger first render after data loads
+  setTimeout(redrawChart, 800);
 }
 
 // ── Compatibility wrapper so old code calling drawCandlestickChart still works ──
@@ -4008,5 +3995,64 @@ function init() {
 
 init();
 </script>
+  <!-- Stock Chart Modal — shown when clicking a position -->
+  <div id="stockChartModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);align-items:center;justify-content:center;">
+    <div style="width:min(900px,95vw);height:min(560px,90vh);background:rgba(10,10,18,0.98);border:1px solid rgba(255,255,255,0.12);border-radius:20px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 40px 100px rgba(0,0,0,0.8);">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid rgba(255,255,255,0.07);">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span id="scSym" style="font-size:20px;font-weight:800;color:#fff;letter-spacing:-0.02em;"></span>
+          <span id="scSide" style="font-size:11px;font-weight:600;padding:3px 8px;border-radius:6px;"></span>
+          <span id="scPnl" style="font-size:14px;font-weight:700;"></span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:11px;color:rgba(255,255,255,0.35);">5M · Today</span>
+          <button onclick="closeStockChart()" style="background:rgba(255,255,255,0.08);border:none;color:rgba(255,255,255,0.6);width:32px;height:32px;border-radius:8px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;">×</button>
+        </div>
+      </div>
+      <div id="stockChartContainer" style="flex:1;min-height:0;"></div>
+    </div>
+  </div>
+
+  <script>
+  let _stockChartInst = null;
+
+  function openStockChart(sym, side, pnl) {
+    const modal = document.getElementById('stockChartModal');
+    modal.style.display = 'flex';
+
+    // Header info
+    document.getElementById('scSym').textContent = sym;
+    const sideEl = document.getElementById('scSide');
+    sideEl.textContent = side;
+    sideEl.style.background = side === 'SHORT' ? 'rgba(255,64,96,0.2)' : 'rgba(41,98,255,0.2)';
+    sideEl.style.color = side === 'SHORT' ? '#ff4060' : '#2962ff';
+    const pnlEl = document.getElementById('scPnl');
+    const pnlNum = +pnl || 0;
+    pnlEl.textContent = (pnlNum >= 0 ? '+' : '') + '$' + Math.abs(pnlNum).toFixed(2);
+    pnlEl.style.color = pnlNum >= 0 ? '#05d890' : '#ff4060';
+
+    // Init or reuse chart
+    if (!_stockChartInst && window.StockChart) {
+      _stockChartInst = new StockChart('stockChartContainer');
+    }
+    if (_stockChartInst) {
+      setTimeout(() => _stockChartInst.loadSymbol(sym), 100);
+    }
+  }
+
+  function closeStockChart() {
+    document.getElementById('stockChartModal').style.display = 'none';
+  }
+
+  // Close on backdrop click
+  document.getElementById('stockChartModal').addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeStockChart();
+  });
+
+  // Close on Escape
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeStockChart();
+  });
+  </script>
 </body>
 </html>
