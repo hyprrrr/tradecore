@@ -3028,6 +3028,8 @@ function updateConnStatus() {
 }
 
 // ═══════════════════════════════════════ EQUITY CHART (CANDLESTICKS FROM SNAPSHOTS) ═══════════════════════════════════════
+let _tickInterval = null;
+
 function renderEquityChart(snapshots) {
   if (!snapshots?.length) return;
   const last = snapshots[snapshots.length - 1];
@@ -3036,7 +3038,33 @@ function renderEquityChart(snapshots) {
   state._lastEquityHash = hash;
   state.equitySnapshots = snapshots;
   chart.allCandles = buildCandlesForTF(snapshots, chart.tf);
-  redrawChart();
+
+  // Start live tick interval to create new candles every bucket
+  if (!_tickInterval) {
+    _tickInterval = setInterval(tickLiveCandle, 10000);
+  }
+
+  const inst = _equityChart();
+  if (inst && chart.allCandles.length) {
+    const seen = new Set();
+    const data = chart.allCandles
+      .map(c => ({
+        time:  Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000),
+        open:  +c.open, high: +c.high, low: +c.low, close: +c.close,
+      }))
+      .filter(c => isFinite(c.close) && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
+      .sort((a,b) => a.time - b.time);
+    if (inst.series) inst.series.setData(data);
+    if (inst.ema) {
+      const k = 2/21; let e = data[0]?.close || 0;
+      const emaData = data.map((d,i) => { e = i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; });
+      inst.ema.setData(emaData);
+    }
+    if (inst.chart) inst.chart.timeScale().scrollToRealTime();
+    setTimeout(tickLiveCandle, 500);
+  } else {
+    redrawChart();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3091,21 +3119,59 @@ function redrawChart() {
 
 function scheduleRedraw() { redrawChart(); }
 
+let _tickInterval = null;
+
 function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
-  if (!isFinite(v) || v <= 0 || !chart.allCandles?.length) return;
+  if (!isFinite(v) || v <= 0) return;
+
   const msMap = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
   const bucketMs = msMap[chart.tf] || 3600e3;
-  const key  = Math.floor(Date.now()/bucketMs)*bucketMs;
-  const last = chart.allCandles[chart.allCandles.length-1];
-  const lkey = Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time)/bucketMs)*bucketMs;
-  if (key > lkey) {
-    chart.allCandles.push({time:new Date(key), open:last.close, high:Math.max(last.close,v), low:Math.min(last.close,v), close:v});
-  } else {
-    last.close = v; if (v > last.high) last.high = v; if (v < last.low) last.low = v;
+  const nowMs    = Date.now();
+  const key      = Math.floor(nowMs / bucketMs) * bucketMs;
+
+  // Seed allCandles if empty
+  if (!chart.allCandles?.length) {
+    chart.allCandles = [{time: new Date(key), open: v, high: v, low: v, close: v}];
   }
+
+  const last = chart.allCandles[chart.allCandles.length - 1];
+  const lkey = Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time) / bucketMs) * bucketMs;
+  const wasAtEdge = true; // always scroll to latest
+
+  if (key > lkey) {
+    // New time bucket — always create, even if flat
+    // Fill any skipped buckets (bot was down/paused)
+    let k = lkey + bucketMs;
+    while (k < key) {
+      chart.allCandles.push({time: new Date(k), open: last.close, high: last.close, low: last.close, close: last.close});
+      k += bucketMs;
+    }
+    chart.allCandles.push({
+      time:  new Date(key),
+      open:  last.close,
+      high:  Math.max(last.close, v),
+      low:   Math.min(last.close, v),
+      close: v,
+    });
+  } else {
+    // Same bucket — update in place
+    last.close = v;
+    if (v > last.high) last.high = v;
+    if (v < last.low)  last.low  = v;
+  }
+
   const inst = _equityChart();
-  if (inst) inst.update({time:new Date(key), open:last.open, high:last.high, low:last.low, close:v});
+  if (inst) {
+    const c = chart.allCandles[chart.allCandles.length - 1];
+    inst.update({
+      time:  Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000),
+      open:  c.open,
+      high:  c.high,
+      low:   c.low,
+      close: c.close,
+    });
+  }
 }
 
 function setTF(tf) {
