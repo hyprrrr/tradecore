@@ -2699,6 +2699,18 @@ function getETTime() {
 // Set BYPASS_HOURS=true in Render to test the bot outside market hours
 const BYPASS_HOURS = process.env.BYPASS_HOURS === 'true';
 
+// Crypto symbols trade 24/7 on Alpaca — never blocked by market hours
+// Alpaca supports: BTCUSD, ETHUSD, LTCUSD, BCHUSD, UNIUSD, LINKUSD, etc.
+const CRYPTO_SYMBOLS = new Set([
+  'BTCUSD','ETHUSD','LTCUSD','BCHUSD','UNIUSD','LINKUSD',
+  'AAVEUSD','MATICUSD','SOLUSD','AVAXUSD','DOGEUSD','SHIBUSD',
+  'XRPUSD','ADAUSD','DOTUSD','ALGOUSD','XLMUSD','BATUSD',
+]);
+
+function isCrypto(sym) {
+  return CRYPTO_SYMBOLS.has(sym) || sym?.endsWith('USD') && sym?.length >= 6;
+}
+
 function isMarketOpen() {
   if (BYPASS_HOURS) return true; // testing mode
   const et = getETTime();
@@ -2774,6 +2786,18 @@ async function alpacaFetch(url, opts = {}, retries = 2) {
 }
 
 async function fetchBars(symbol, timeframe, limit) {
+  // ── CRYPTO: Use Alpaca crypto endpoint (24/7, no Yahoo support) ──
+  if (isCrypto(symbol)) {
+    try {
+      const start = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const url = `https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=${symbol}&timeframe=${timeframe === '5Min' ? '5Min' : timeframe === '15Min' ? '15Min' : timeframe === '1Day' ? '1Day' : '1Hour'}&start=${start}&limit=${Math.max(limit, 100)}`;
+      const data = await alpacaFetch(url);
+      const bars = data?.bars?.[symbol] || [];
+      if (bars.length >= 15) return bars.map(b => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0 }));
+    } catch(e) {}
+    return null;
+  }
+
   // ── PRIMARY: Yahoo Finance — no rate limit, no API key needed ──
   // Alpaca is reserved for order execution only. Yahoo handles all bar data.
   try {
@@ -6150,7 +6174,8 @@ async function edgeGate(sym, direction, sigInfo, bars5m) {
 async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   const isIntlETF = !!ETF_SESSIONS[sym];
   // In sim mode — always allow entries (we're replaying historical market hours)
-  if (!isSimMode() && !isIntlETF && !isMarketOpen()) {
+  // Crypto trades 24/7 — never block on market hours
+  if (!isSimMode() && !isIntlETF && !isCrypto(sym) && !isMarketOpen()) {
     log('warn', `🚫 Blocked ${sym} — market closed`);
     return;
   }
@@ -7448,7 +7473,9 @@ ${headlines}`,
 async function runNewsScanner() {
   if (!AI_ADVISOR_KEY) return;           // no key = disabled
   if (isSimMode()) return;               // never run in sim — saves tokens
-  if (!isMarketOpen()) return;           // only during live trading hours
+  // Run during market hours OR if there's crypto on the watchlist (24/7 news)
+  const hasCrypto = (CONFIG.symbols||[]).some(s => isCrypto(s));
+  if (!isMarketOpen() && !hasCrypto) return;
   if (CONFIG.aiNewsEnabled === false) return; // user toggled off in dashboard
 
   const now = Date.now();
@@ -7961,6 +7988,8 @@ async function runScan() {
   await syncAlpacaPositions();
   // Throttle scan size during off-hours — rate limits hit hardest outside US hours
   const isUSOpen = isMarketOpen();
+  // Always include crypto in scan — it trades 24/7
+  const cryptoSyms = (CONFIG.symbols || []).filter(s => isCrypto(s));
   const maxScanSize = isUSOpen ? symbolsToScan.length : Math.min(40, symbolsToScan.length);
   if (symbolsToScan.length > maxScanSize) {
     symbolsToScan = symbolsToScan.slice(0, maxScanSize);
@@ -7989,6 +8018,13 @@ async function runScan() {
   // ── News scanner — AI-powered, ~$0.01/day via Claude Haiku ──────
   // Only fires when new relevant headlines exist. Requires ANTHROPIC_API_KEY.
   runNewsScanner().catch(e => log('error', `News scanner: ${e.message}`));
+
+  // Outside market hours: only scan crypto (trades 24/7)
+  if (!isSimMode() && !isUSOpen && cryptoSyms.length > 0) {
+    // Filter scan list to crypto only during off-hours
+    symbolsToScan = symbolsToScan.filter(s => isCrypto(s));
+    if (symbolsToScan.length === 0 && cryptoSyms.length > 0) symbolsToScan = cryptoSyms;
+  }
 
   // Market regime only matters during US hours
   const marketOk = isMarketOpen() ? await getMarketRegime() : true;
@@ -8875,6 +8911,20 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   if (Object.keys(scalpPositions).length >= CONFIG.scalpMaxPositions) {
     log('scalp', `Max scalp positions (${CONFIG.scalpMaxPositions}) reached`);
     return;
+  }
+
+  // ── CRYPTO position size cap ────────────────────────────────────
+  // Crypto is much more volatile — cap at 3% of account per position
+  if (isCrypto(sym)) {
+    const cryptoCap = (realEquity > 0 ? realEquity : CONFIG.startingCapital) * 0.03;
+    const cryptoMaxQty = Math.floor(cryptoCap / price);
+    if (finalQty > cryptoMaxQty && cryptoMaxQty >= 1) {
+      log('risk', `🪙 ${sym} crypto cap: ${finalQty} → ${cryptoMaxQty} (3% account)`);
+      finalQty = cryptoMaxQty;
+    } else if (cryptoMaxQty < 1) {
+      // For high-price crypto (BTC at $100k), use notional ordering
+      finalQty = 1; // Alpaca handles fractional
+    }
   }
 
   // ── VOLATILITY GUARD for scalps ─────────────────────────────────
@@ -9992,6 +10042,13 @@ CONFIG.adaptTargetWR  = 0.65;
 CONFIG.strategy        = (CONFIG.strategy && CONFIG.strategy !== 'None' && CONFIG.strategy !== 'null')
   ? CONFIG.strategy : 'rsi_macd';
 CONFIG._activeStrategy  = CONFIG.strategy;
+
+// Ensure crypto symbols are in watchlist for 24/7 trading
+const DEFAULT_CRYPTO = ['BTCUSD', 'ETHUSD'];
+for (const cs of DEFAULT_CRYPTO) {
+  if (!CONFIG.symbols.includes(cs)) CONFIG.symbols.unshift(cs);
+}
+log('sys', `🪙 Crypto 24/7 enabled: ${DEFAULT_CRYPTO.join(', ')}`);
 CONFIG.shortsEnabled    = CONFIG.shortsEnabled !== false; // ensure it's never accidentally false
 log('sys', `⚙️ Adaptive params reset: RSI ${CONFIG.rsiOversold}/${CONFIG.rsiOverbought} conf:${CONFIG.minConfidence} pos:${(CONFIG.maxPositionPct*100).toFixed(0)}% strategy:${CONFIG.strategy}`);
 
