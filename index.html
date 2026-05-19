@@ -3046,25 +3046,31 @@ function renderEquityChart(snapshots) {
   }
 
   const inst = _equityChart();
-  if (inst && chart.allCandles.length) {
+  if (inst) {
+    // buildCandlesForTF now returns Unix seconds directly (not Date objects)
     const seen = new Set();
     const data = chart.allCandles
-      .map(c => ({
-        time:  Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000),
-        open:  +c.open, high: +c.high, low: +c.low, close: +c.close,
-      }))
-      .filter(c => isFinite(c.close) && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
+      .map(c => {
+        const t = typeof c.time === 'number' ? c.time
+                : c.time instanceof Date ? Math.floor(c.time.getTime()/1000)
+                : Math.floor(+c.time/1000);
+        return { time: t, open: +c.open, high: +c.high, low: +c.low, close: +c.close };
+      })
+      .filter(c => isFinite(c.close) && c.close > 0 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
       .sort((a,b) => a.time - b.time);
+
+    if (!data.length) return;
     if (inst.series) inst.series.setData(data);
     if (inst.ema) {
-      const k = 2/21; let e = data[0]?.close || 0;
+      const k = 2/21; let e = data[0].close;
       const emaData = data.map((d,i) => { e = i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; });
       inst.ema.setData(emaData);
     }
-    if (inst.chart) inst.chart.timeScale().scrollToRealTime();
+    if (inst.chart) {
+      inst.chart.applyOptions({ rightPriceScale: { scaleMargins: { top: 0.15, bottom: 0.15 } } });
+      inst.chart.timeScale().scrollToRealTime();
+    }
     setTimeout(tickLiveCandle, 500);
-  } else {
-    redrawChart();
   }
 }
 
@@ -3103,11 +3109,27 @@ function buildCandlesForTF(snapshots, tf) {
   for (let k = firstKey; k <= endKey; k += bucketMs) {
     const v = buckets[k];
     if (v) {
-      const open = lastClose ?? v[0], close = v[v.length-1];
-      out.push({time:new Date(k), open, high:Math.max(open,close,...v), low:Math.min(open,close,...v), close});
+      const open  = lastClose ?? v[0];
+      const close = v[v.length-1];
+      let high = Math.max(open, close, ...v);
+      let low  = Math.min(open, close, ...v);
+      // Ensure minimum candle height so LW Charts renders visible bodies
+      // Flat candles (high==low) become invisible — add 0.01% range
+      if (high === low) {
+        high = high * 1.0001;
+        low  = low  * 0.9999;
+      }
+      out.push({time: Math.floor(k/1000), open, high, low, close});
       lastClose = close;
     } else if (lastClose !== null) {
-      out.push({time:new Date(k), open:lastClose, high:lastClose, low:lastClose, close:lastClose});
+      // Forward-fill with tiny range so empty buckets show as doji not invisible
+      out.push({
+        time:  Math.floor(k/1000),
+        open:  lastClose,
+        high:  lastClose * 1.00005,
+        low:   lastClose * 0.99995,
+        close: lastClose,
+      });
     }
   }
   return out;
@@ -3125,52 +3147,40 @@ function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
   if (!isFinite(v) || v <= 0) return;
 
-  const msMap = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
+  const msMap   = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
   const bucketMs = msMap[chart.tf] || 3600e3;
-  const nowMs    = Date.now();
-  const key      = Math.floor(nowMs / bucketMs) * bucketMs;
+  const keySec  = Math.floor(Date.now() / bucketMs) * bucketMs / 1000; // Unix seconds
 
-  // Seed allCandles if empty
+  // Seed if empty
   if (!chart.allCandles?.length) {
-    chart.allCandles = [{time: new Date(key), open: v, high: v, low: v, close: v}];
+    chart.allCandles = [{time: keySec, open: v, high: v * 1.00005, low: v * 0.99995, close: v}];
   }
 
-  const last = chart.allCandles[chart.allCandles.length - 1];
-  const lkey = Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time) / bucketMs) * bucketMs;
-  const wasAtEdge = true; // always scroll to latest
+  const last       = chart.allCandles[chart.allCandles.length - 1];
+  const lastSec    = typeof last.time === 'number' ? last.time
+                   : Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time) / 1000);
+  const bucketSec  = bucketMs / 1000;
+  const lastBucket = Math.floor(lastSec / bucketSec) * bucketSec;
 
-  if (key > lkey) {
-    // New time bucket — always create, even if flat
-    // Fill any skipped buckets (bot was down/paused)
-    let k = lkey + bucketMs;
-    while (k < key) {
-      chart.allCandles.push({time: new Date(k), open: last.close, high: last.close, low: last.close, close: last.close});
-      k += bucketMs;
+  if (keySec > lastBucket) {
+    // New time bucket — fill gaps and create new candle
+    for (let k = lastBucket + bucketSec; k < keySec; k += bucketSec) {
+      chart.allCandles.push({time: k, open: last.close, high: last.close*1.00005, low: last.close*0.99995, close: last.close});
     }
-    chart.allCandles.push({
-      time:  new Date(key),
-      open:  last.close,
-      high:  Math.max(last.close, v),
-      low:   Math.min(last.close, v),
-      close: v,
-    });
+    chart.allCandles.push({time: keySec, open: last.close, high: Math.max(last.close, v), low: Math.min(last.close, v), close: v});
   } else {
-    // Same bucket — update in place
     last.close = v;
-    if (v > last.high) last.high = v;
-    if (v < last.low)  last.low  = v;
+    last.high  = Math.max(last.high || v, v);
+    last.low   = Math.min(last.low  || v, v);
+    if (last.high === last.low) { last.high *= 1.0001; last.low *= 0.9999; }
   }
 
   const inst = _equityChart();
-  if (inst) {
-    const c = chart.allCandles[chart.allCandles.length - 1];
-    inst.update({
-      time:  Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000),
-      open:  c.open,
-      high:  c.high,
-      low:   c.low,
-      close: c.close,
-    });
+  const c    = chart.allCandles[chart.allCandles.length - 1];
+  if (inst?.series) {
+    try {
+      inst.series.update({time: c.time, open: +c.open, high: +c.high, low: +c.low, close: +c.close});
+    } catch(e) {}
   }
 }
 
