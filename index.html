@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="AlphaCore" />
   <meta name="theme-color" content="#07070b" />
@@ -3119,7 +3120,6 @@ function redrawChart() {
 
 function scheduleRedraw() { redrawChart(); }
 
-let _tickInterval = null;
 
 function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
