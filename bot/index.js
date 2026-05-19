@@ -233,9 +233,12 @@ async function loadRemoteConfig() {
     if (s.swing_enabled  !== undefined) CONFIG.swingEnabled          = !!s.swing_enabled;
     if (s.scalp_mode     !== undefined) CONFIG.scalpMode             = !!s.scalp_mode;
     if (s.shorts_enabled !== undefined) {
-      CONFIG.shortsEnabled = !!s.shorts_enabled;
+      // Only load from Supabase if no env var override
+      if (process.env.ENABLE_SHORTS === undefined) {
+        CONFIG.shortsEnabled = !!s.shorts_enabled;
+      }
       if (!CONFIG.shortsEnabled) {
-        log('warn', '⚠️ SHORTS DISABLED in settings — RSI overbought signals blocked. Enable Shorts in Bot Controls.');
+        log('warn', '⚠️ SHORTS DISABLED — RSI overbought signals blocked. Toggle Shorts ON in Bot Controls.');
       }
     }
     if (s.position_trading !== undefined) CONFIG.positionTradingEnabled = !!s.position_trading;
@@ -967,7 +970,7 @@ function apexFilter(sig, ctx = {}) {
   if (!APEX.rules.length) return sig;
   let confBoost = 0;
   let blocked   = null;
-  let minConf   = CONFIG.minConfidence || 70;
+  let minConf   = CONFIG.minConfidence || 62;
   const hour    = new Date().getHours();
   const hourBand = hour < 10 ? 'open' : hour < 12 ? 'mid-am' : hour < 14 ? 'lunch' : hour < 16 ? 'pm' : 'after';
 
@@ -1201,7 +1204,8 @@ async function runAdaptiveTuning() {
 
     // 1. Drastically raise minimum confidence
     const newConf = Math.min(75, CONFIG.minConfidence + _step(CONFIG.minConfidence, 75, 2)); // hard cap 75
-    if (newConf !== CONFIG.minConfidence) { CONFIG.minConfidence = Math.round(newConf); changes.minConfidence = CONFIG.minConfidence; reasons.push('Emergency: raise confidence threshold'); }
+    const cappedEmergencyConf = Math.min(70, Math.round(newConf));
+  if (cappedEmergencyConf !== CONFIG.minConfidence) { CONFIG.minConfidence = cappedEmergencyConf; changes.minConfidence = CONFIG.minConfidence; reasons.push('Emergency: raise confidence threshold (capped 70)'); }
 
     // 2. Tighten RSI to only deepest extremes
     const newRSI = Math.max(ADAPT_BOUNDS.rsiOversold.min, CONFIG.rsiOversold - _step(CONFIG.rsiOversold, 25, 1.5));
@@ -1239,7 +1243,8 @@ async function runAdaptiveTuning() {
       // Higher confidence trades win clearly more — raise threshold toward sweet spot
       const target = CONFIG.minConfidence + step;
       const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, target);
-      if (Math.abs(newConf - CONFIG.minConfidence) > 0.5) { CONFIG.minConfidence = Math.round(newConf); changes.minConfidence = CONFIG.minConfidence; reasons.push(`Confidence sweet spot: ${highWR.toFixed(0)*100}% vs ${lowWR.toFixed(0)*100}%`); }
+      const clampedConf1 = Math.min(70, Math.max(55, Math.round(newConf)));
+      if (Math.abs(clampedConf1 - CONFIG.minConfidence) > 0.5) { CONFIG.minConfidence = clampedConf1; changes.minConfidence = CONFIG.minConfidence; reasons.push(`Confidence sweet spot (capped 55-70)`); }
     } else if (lowWR !== null && lowWR < 0.45) {
       // Even minimum confidence trades losing — raise floor
       const newConf = Math.min(ADAPT_BOUNDS.minConfidence.max, CONFIG.minConfidence + step * 0.5);
@@ -6677,10 +6682,11 @@ async function manageShort(sym, price, bars) {
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
 
   // Intraday only — close shorts before market close too
-  if (!isSimMode() && isMarketOpen()) {
+  // Close after market — don't require isMarketOpen() since it's already false
+  if (!isSimMode() && isWeekday()) {
     const mins = minsToClose();
-    if (mins <= 0 && mins > -60) {
-      log('risk', `⏰ SHORT ${sym} INTRADAY CLOSE — market closing`);
+    if (mins <= 0 && mins > -120) { // up to 2 hours after close to catch restarts
+      log('risk', `⏰ SHORT ${sym} INTRADAY CLOSE — market closed`);
       return coverShort(sym, price, 'INTRADAY_CLOSE');
     }
   }
@@ -7682,12 +7688,11 @@ async function managePosition(sym, price, bars) {
 
   // ── INTRADAY ONLY — close 15 min before market close ─────────────
   // Never hold overnight — gaps are unpredictable and can blow through stops
-  if (!isSimMode() && isMarketOpen()) {
+  if (!isSimMode() && isWeekday()) {
     const mins = minsToClose();
-    if (mins <= 0 && mins > -60) {
-      // Within the closing window — exit at whatever price we have
+    if (mins <= 0 && mins > -120) { // up to 2 hours after close
       const exitPct = (chg * 100).toFixed(2);
-      log('risk', `⏰ ${sym} INTRADAY CLOSE — market closing, exiting at ${exitPct >= 0 ? '+' : ''}${exitPct}%`);
+      log('risk', `⏰ ${sym} INTRADAY CLOSE — market closed, exiting at ${exitPct >= 0 ? '+' : ''}${exitPct}%`);
       return exitPosition(sym, price, 'INTRADAY_CLOSE');
     }
   }
@@ -9908,7 +9913,7 @@ async function tick() {
   // Belt-and-suspenders: even if managePosition missed the 3:45 signal
   if (!isSimMode() && isWeekday()) {
     const minsLeft = minsToClose();
-    if (minsLeft <= -5 && minsLeft > -30) { // 3:50 PM window
+    if (minsLeft <= -5 && minsLeft > -120) { // 3:50 PM to 5:45 PM — wider window catches restarts
       const allOpen = [...Object.keys(positions), ...Object.keys(shortPositions), ...Object.keys(scalpPositions)];
       if (allOpen.length > 0) {
         log('risk', `⏰ INTRADAY CLOSE-ALL: ${allOpen.length} positions still open at market close`);
@@ -10088,7 +10093,7 @@ CONFIG.rsiOversold   = 35;
 CONFIG.rsiOverbought = 65;
 CONFIG.minConfidence = 62;
 CONFIG.maxPositionPct = 0.10;
-CONFIG.adaptTargetWR  = 0.65;
+CONFIG.adaptTargetWR  = 0.60;
 CONFIG.strategy        = (CONFIG.strategy && CONFIG.strategy !== 'None' && CONFIG.strategy !== 'null')
   ? CONFIG.strategy : 'rsi_macd';
 CONFIG._activeStrategy  = CONFIG.strategy;
