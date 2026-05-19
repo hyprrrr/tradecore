@@ -2751,18 +2751,12 @@ function isPreMarket() {
  * Set BYPASS_HOURS=true to override for testing.
  */
 function shouldScanSymbol(symbol) {
-  if (BYPASS_HOURS) return true; // testing mode — scan everything
-  // SIM MODE: replay historical bars regardless of wall-clock market hours.
-  // Without this, sim silently stops at 4pm ET (when isMarketOpen() flips
-  // false) even though the historical replay has plenty of trading bars
-  // left. User reported: "still having the sim not taking trades issue"
-  // after several hours — was actually wall clock past US close.
+  if (BYPASS_HOURS) return true;
   if (isSimMode()) return true;
+  if (isCrypto(symbol)) return true; // crypto 24/7 — never blocked by market hours
   if (!isWeekday()) return false;
   const isIntlETF = !!ETF_SESSIONS[symbol];
-  if (!isIntlETF) {
-    return isMarketOpen();
-  }
+  if (!isIntlETF) return isMarketOpen();
   return true;
 }
 
@@ -2971,12 +2965,14 @@ async function syncScreenerResults(candidates) {
 
 // Build the final scan list: favorites + screener candidates, deduplicated
 function buildScanList() {
-  const favorites  = CONFIG.symbols.slice(0, 200); // was 20 — large watchlist support
-  // Only take TOP 5 screener picks (by score) — never bloat excessively
+  const favorites  = CONFIG.symbols.slice(0, 200);
+  // Always include crypto at the front for 24/7 scanning
+  const cryptoSyms = ['BTCUSD', 'ETHUSD'];
   const discovered = screenerCandidates.slice(0, 5);
-  const combined   = [...new Set([...favorites, ...discovered])];
-  const valid = combined.filter(s => /^[A-Z]{1,5}$/.test(s));
-  return valid.slice(0, 200); // hard cap — 200 symbols max
+  const combined   = [...new Set([...cryptoSyms, ...favorites, ...discovered])];
+  // Allow crypto symbols (6-7 chars ending in USD) + standard ticker format
+  const valid = combined.filter(s => /^[A-Z]{1,5}$/.test(s) || isCrypto(s));
+  return valid.slice(0, 200);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -10129,6 +10125,7 @@ loadRemoteConfig().then(async () => {
     }
   }
   log('sys', `🪙 Crypto 24/7 enabled: ${DEFAULT_CRYPTO.join(', ')}`);
+  log('sys', '🆕 AlphaCore v2 — NaN fix ✅ crypto 24/7 ✅ adaptive cap ✅');
 
   await updateDayBias();
   if (isMarketOpen()) {
