@@ -232,7 +232,12 @@ async function loadRemoteConfig() {
     // Mode flags — controlled from dashboard
     if (s.swing_enabled  !== undefined) CONFIG.swingEnabled          = !!s.swing_enabled;
     if (s.scalp_mode     !== undefined) CONFIG.scalpMode             = !!s.scalp_mode;
-    if (s.shorts_enabled !== undefined) CONFIG.shortsEnabled         = !!s.shorts_enabled;
+    if (s.shorts_enabled !== undefined) {
+      CONFIG.shortsEnabled = !!s.shorts_enabled;
+      if (!CONFIG.shortsEnabled) {
+        log('warn', '⚠️ SHORTS DISABLED in settings — RSI overbought signals blocked. Enable Shorts in Bot Controls.');
+      }
+    }
     if (s.position_trading !== undefined) CONFIG.positionTradingEnabled = !!s.position_trading;
     if (s.recovery_mode !== undefined) CONFIG.recoveryMode          = !!s.recovery_mode;
     if (s.ai_news_enabled !== undefined) CONFIG.aiNewsEnabled        = !!s.ai_news_enabled;
@@ -9513,11 +9518,33 @@ async function fetchAllBarsParallel(symbols) {
   const CONCURRENCY = 20;
 
   // Check which symbols need fresh 5m bars (cache miss)
+  // Crypto uses Alpaca endpoint — fetch separately before Yahoo
+  const cryptoToFetch = symbols.filter(s => isCrypto(s));
+  if (cryptoToFetch.length > 0) {
+    const start5m = new Date(Date.now() - 2*24*60*60*1000).toISOString();
+    await Promise.allSettled(cryptoToFetch.map(async sym => {
+      const cached = barCache.get(`${sym}_5Min`);
+      if (cached && Date.now() - cached.ts < 30000) return; // fresh enough
+      try {
+        const url = `https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=${sym}&timeframe=5Min&start=${start5m}&limit=100`;
+        const data = await alpacaFetch(url);
+        const bars = (data?.bars?.[sym] || []).map(b => ({t:b.t,o:+b.o,h:+b.h,l:+b.l,c:+b.c,v:+b.v||0}));
+        if (bars.length >= 15) {
+          barCache.set(`${sym}_5Min`,  {bars, ts: Date.now()});
+          barCache.set(`${sym}_15Min`, {bars: bars.filter((_,i) => i%3===0), ts: Date.now()});
+        }
+      } catch(e) {}
+    }));
+  }
+
+  // Skip crypto in Yahoo fetch — Yahoo format is BTC-USD not BTCUSD
   const needFresh5m  = symbols.filter(s => {
+    if (isCrypto(s)) return false;
     const hit = barCache.get(`${s}_5Min`);
     return !hit || Date.now() - hit.ts > BAR_CACHE_TTL_MAP['5Min'];
   });
   const needFresh15m = symbols.filter(s => {
+    if (isCrypto(s)) return false;
     const hit = barCache.get(`${s}_15Min`);
     return !hit || Date.now() - hit.ts > BAR_CACHE_TTL_MAP['15Min'];
   });
@@ -9563,8 +9590,13 @@ async function fetchAllBarsParallel(symbols) {
   for (const sym of symbols) {
     const cached5m  = barCache.get(`${sym}_5Min`);
     const cached15m = barCache.get(`${sym}_15Min`);
-    const bars5m    = yahoo5m[sym]  || cached5m?.bars  || await fetchBarsCached(sym, '5Min',  60).catch(() => null);
-    const bars15m   = yahoo15m[sym] || cached15m?.bars || await fetchBarsCached(sym, '15Min', 40).catch(() => null);
+    // Crypto uses Alpaca cache; stocks use Yahoo or Alpaca fallback
+    const bars5m  = isCrypto(sym)
+      ? (cached5m?.bars || null)
+      : (yahoo5m[sym] || cached5m?.bars || await fetchBarsCached(sym, '5Min', 60).catch(() => null));
+    const bars15m = isCrypto(sym)
+      ? (cached15m?.bars || null)
+      : (yahoo15m[sym] || cached15m?.bars || await fetchBarsCached(sym, '15Min', 40).catch(() => null));
     if (bars5m?.length >= 15) results.push({ sym, bars5m, bars15m: bars15m || [] });
   }
 
