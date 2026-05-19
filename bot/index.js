@@ -10043,12 +10043,8 @@ CONFIG.strategy        = (CONFIG.strategy && CONFIG.strategy !== 'None' && CONFI
   ? CONFIG.strategy : 'rsi_macd';
 CONFIG._activeStrategy  = CONFIG.strategy;
 
-// Ensure crypto symbols are in watchlist for 24/7 trading
-const DEFAULT_CRYPTO = ['BTCUSD', 'ETHUSD'];
-for (const cs of DEFAULT_CRYPTO) {
-  if (!CONFIG.symbols.includes(cs)) CONFIG.symbols.unshift(cs);
-}
-log('sys', `🪙 Crypto 24/7 enabled: ${DEFAULT_CRYPTO.join(', ')}`);
+// Ensure crypto symbols are in watchlist — done safely after CONFIG loads
+// (moved to post-loadRemoteConfig to ensure CONFIG.symbols is populated)
 CONFIG.shortsEnabled    = CONFIG.shortsEnabled !== false; // ensure it's never accidentally false
 log('sys', `⚙️ Adaptive params reset: RSI ${CONFIG.rsiOversold}/${CONFIG.rsiOverbought} conf:${CONFIG.minConfidence} pos:${(CONFIG.maxPositionPct*100).toFixed(0)}% strategy:${CONFIG.strategy}`);
 
@@ -10070,6 +10066,15 @@ async function prewarmBarCache() {
 }
 
 loadRemoteConfig().then(async () => {
+  // Add crypto to watchlist after config is loaded (CONFIG.symbols is populated)
+  const DEFAULT_CRYPTO = ['BTCUSD', 'ETHUSD'];
+  for (const cs of DEFAULT_CRYPTO) {
+    if (Array.isArray(CONFIG.symbols) && !CONFIG.symbols.includes(cs)) {
+      CONFIG.symbols.unshift(cs);
+    }
+  }
+  log('sys', `🪙 Crypto 24/7 enabled: ${DEFAULT_CRYPTO.join(', ')}`);
+
   await updateDayBias();
   if (isMarketOpen()) {
     screenerCandidates = (await runMarketScreener()).slice(0, 5);
