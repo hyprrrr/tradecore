@@ -5260,7 +5260,11 @@ function generateSignal(sym, bars5m, bars15m) {
     rsiScore = 2; direction = 'buy';
     reasons.push(`RSI oversold ${r.toFixed(1)} + price stabilizing ✅`);
   } else if (r > CONFIG.rsiOverbought) {
-    if (!CONFIG.shortsEnabled) return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi:r };
+    if (!CONFIG.shortsEnabled) {
+      // Shorts disabled in settings — all sell signals blocked
+      // Fix: enable Shorts in Bot Controls dashboard toggle
+      return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled in settings`], rsi:r };
+    }
     // Rising tide check: if still surging, short too early
     if (isRisingTide) {
       return { signal:'HOLD', confidence:0, score:0,
@@ -9975,6 +9979,11 @@ setInterval(async () => {
     const prevSentiment = CONFIG.marketSentiment;
     await loadRemoteConfig();
     // Auto-strategy: resolve best strategy from regime if set to 'auto'
+    // Ensure strategy is never None/null after remote config loads
+    if (!CONFIG.strategy || CONFIG.strategy === 'None' || CONFIG.strategy === 'null') {
+      CONFIG.strategy = 'rsi_macd';
+    }
+
     if (CONFIG.strategy === 'auto') {
       const regime = isSimMode() ? _regimeCache.state : await classifyRegime().catch(() => null);
       const autoStrat = await resolveAutoStrategy(regime);
