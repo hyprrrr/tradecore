@@ -10968,9 +10968,8 @@ http.createServer(async (req, res) => {
 // ── Self-ping to prevent Render/Railway free tier sleep ──────────
 // Pings the bot's own /health endpoint every 10 minutes
 // Render free tier sleeps after 15min of inactivity without this
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN
-  ? `https://${process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN}`
-  : null;
+const _selfDomain = process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN || '';
+const SELF_URL = _selfDomain ? `https://${_selfDomain.replace(/^https?:\/\//, '')}` : null;
 
 if (SELF_URL) {
   setInterval(async () => {
