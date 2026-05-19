@@ -5333,13 +5333,22 @@ function generateSignal(sym, bars5m, bars15m) {
   const macdAgrees = (direction === 'buy' && macdBull) || (direction === 'sell' && !macdBull);
   let macdScore = 0; // declared here so score formula below can always reference it
   if (!macdAgrees) {
+    // RSI extreme (>78 overbought or <22 oversold) overrides MACD disagreement
+    // At extreme RSI levels, mean-reversion is more reliable than MACD trend
+    const rsiExtreme = (direction === 'sell' && r > 78) || (direction === 'buy' && r < 22);
     const rsiModerate = (direction === 'buy' && r < 40) || (direction === 'sell' && r > 60);
-    if (!rsiModerate) {
+    if (rsiExtreme) {
+      macdScore = -1; // penalty but not blocked
+    } else if (!rsiModerate) {
       return { signal:'HOLD', confidence:0, score:0,
         reasons:[...reasons, `MACD disagrees with ${direction} — blocked`], rsi:r };
     }
-    macdScore = -1; // penalty for disagreement but allow if RSI moderately extended
-    reasons.push(`MACD disagrees but RSI ${r.toFixed(1)} warrants caution entry`);
+    if (!rsiExtreme) { // only add penalty message if not already handled above
+      macdScore = -1;
+      reasons.push(`MACD disagrees but RSI ${r.toFixed(1)} warrants caution entry`);
+    } else {
+      reasons.push(`RSI extreme (${r.toFixed(1)}) — overriding MACD disagreement`);
+    }
   } else {
     macdScore = macdCross ? 2 : 1;
     if (macdCross) reasons.push(`MACD crossover ${direction==='buy'?'↑':'↓'} ✅`);
