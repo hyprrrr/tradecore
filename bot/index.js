@@ -2794,17 +2794,21 @@ async function alpacaFetch(url, opts = {}, retries = 2) {
 }
 
 async function fetchBars(symbol, timeframe, limit) {
-  // ── CRYPTO: Use Alpaca crypto endpoint (24/7, no Yahoo support) ──
+  // ── CRYPTO: Binance public API — no auth, reliable ──
   if (isCrypto(symbol)) {
     try {
-      const start = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-      const apiSym2 = symbol.replace(/([A-Z]+)USD$/, '$1/USD');
-      const tf2 = timeframe === '5Min' ? '5Min' : timeframe === '15Min' ? '15Min' : timeframe === '1Day' ? '1Day' : '1Hour';
-      const url = `https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(apiSym2)}&timeframe=${tf2}&start=${start}&limit=${Math.max(limit, 100)}`;
-      const data = await alpacaFetch(url);
-      const bars = data?.bars?.[apiSym2] || data?.bars?.[symbol] || [];
-      if (bars.length >= 15) return bars.map(b => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0 }));
-    } catch(e) {}
+      const fetch = await getFetch();
+      const binanceSym = symbol.replace(/USD$/, 'USDT');
+      const interval = timeframe === '5Min' ? '5m' : timeframe === '15Min' ? '15m' : timeframe === '1Day' ? '1d' : '1h';
+      const url = `https://api.binance.com/api/v3/klines?symbol=${binanceSym}&interval=${interval}&limit=${Math.max(limit, 100)}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) throw new Error(`Binance HTTP ${res.status}`);
+      const klines = await res.json();
+      const bars = klines.map(k => ({
+        t: new Date(k[0]).toISOString(), o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]
+      })).filter(b => isFinite(b.c) && b.c > 0);
+      if (bars.length >= 15) return bars;
+    } catch(e) { log('warn', `Crypto fetchBars ${symbol}: ${e.message?.slice(0,60)}`); }
     return null;
   }
 
@@ -9549,34 +9553,35 @@ async function fetchAllBarsParallel(symbols) {
   const CONCURRENCY = 20;
 
   // Check which symbols need fresh 5m bars (cache miss)
-  // Crypto uses Alpaca endpoint — fetch separately before Yahoo
+  // Crypto: fetch from Binance public API (no auth, reliable, free)
+  // BTCUSD -> BTCUSDT, ETHUSD -> ETHUSDT on Binance
   const cryptoToFetch = symbols.filter(s => isCrypto(s));
   if (cryptoToFetch.length > 0) {
-    const start5m = new Date(Date.now() - 2*24*60*60*1000).toISOString();
+    const fetch = await getFetch();
     await Promise.allSettled(cryptoToFetch.map(async sym => {
       const cached = barCache.get(`${sym}_5Min`);
-      // Always re-fetch if no bars or bars are stale (> 60s for crypto = live data)
       if (cached?.bars?.length >= 15 && Date.now() - cached.ts < 60000) return;
       try {
-        // Alpaca v1beta3 uses slash format: BTC/USD not BTCUSD
-        const apiSym = sym.replace(/USD$/, '/USD').replace(/BTC\//, 'BTC/');
-        const url = `https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(apiSym)}&timeframe=5Min&start=${start5m}&limit=100`;
-        const data = await alpacaFetch(url);
-        // Response key may be BTC/USD or BTCUSD — check both
-        const rawBars = data?.bars?.[apiSym] || data?.bars?.[sym] || [];
-        log('data', `🪙 ${sym} Alpaca crypto: ${rawBars.length} raw bars (apiSym=${apiSym}) | allKeys: ${Object.keys(data?.bars||{}).join(',') || 'none'}`);
-        const bars = rawBars.map(b => ({
-          t: b.t, o: +b.o, h: +b.h, l: +b.l, c: +b.c, v: +b.v || 0
+        // Convert BTCUSD -> BTCUSDT for Binance
+        const binanceSym = sym.replace(/USD$/, 'USDT');
+        const url = `https://api.binance.com/api/v3/klines?symbol=${binanceSym}&interval=5m&limit=100`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        if (!res.ok) throw new Error(`Binance ${res.status}`);
+        const klines = await res.json();
+        // Binance kline format: [openTime, open, high, low, close, volume, ...]
+        const bars = klines.map(k => ({
+          t: new Date(k[0]).toISOString(),
+          o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]
         })).filter(b => isFinite(b.c) && b.c > 0);
         if (bars.length >= 15) {
-          barCache.set(`${sym}_5Min`,  {bars, ts: Date.now()});
-          barCache.set(`${sym}_15Min`, {bars: bars.filter((_,i) => i%3===0), ts: Date.now()});
-          log('data', `🪙 ${sym} cached ${bars.length} bars OK`);
+          barCache.set(`${sym}_5Min`,  { bars, ts: Date.now() });
+          barCache.set(`${sym}_15Min`, { bars: bars.filter((_,i) => i%3===0), ts: Date.now() });
+          log('data', `🪙 ${sym} (${binanceSym}): ${bars.length} bars @ $${bars[bars.length-1].c.toFixed(2)}`);
         } else {
-          log('warn', `🪙 ${sym} crypto bars insufficient: ${bars.length} (need 15+)`);
+          log('warn', `🪙 ${sym} Binance: only ${bars.length} bars`);
         }
       } catch(e) {
-        log('warn', `🪙 ${sym} crypto fetch error: ${e.message?.slice(0,80)}`);
+        log('warn', `🪙 ${sym} Binance error: ${e.message?.slice(0,60)}`);
       }
     }));
   }
