@@ -91,7 +91,7 @@ class EquityChart {
       lineWidth:        1,
       priceLineVisible: false,
       lastValueVisible: false,
-      lineStyle:        LightweightCharts.LineStyle.Dashed,
+      lineStyle:        1, // 1 = Dashed
     });
 
     // Auto-resize

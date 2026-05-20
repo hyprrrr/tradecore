@@ -1,4 +1,4 @@
-const CACHE = 'alphacore-v2';
+const CACHE = 'alphacore-v3'; // bumped — forces old cache to clear
 const STATIC = ['/index.html', '/chart.js', '/manifest.json'];
 
 self.addEventListener('install', e => {
@@ -18,15 +18,9 @@ self.addEventListener('activate', e => {
 });
 
 self.addEventListener('fetch', e => {
-  // Only cache same-origin requests — never try to cache external APIs
   if (!e.request.url.startsWith(self.location.origin)) return;
-
-  // Network-first for HTML (always fresh), cache-first for assets
-  const isHTML = e.request.destination === 'document' ||
-                 e.request.url.endsWith('.html');
-
+  const isHTML = e.request.destination === 'document' || e.request.url.endsWith('.html');
   if (isHTML) {
-    // Always fetch fresh HTML, update cache after
     e.respondWith(
       fetch(e.request)
         .then(res => {
@@ -39,7 +33,6 @@ self.addEventListener('fetch', e => {
         .catch(() => caches.match(e.request))
     );
   } else {
-    // Cache-first for JS/CSS/images
     e.respondWith(
       caches.match(e.request).then(cached => {
         if (cached) return cached;
