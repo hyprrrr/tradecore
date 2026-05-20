@@ -5247,9 +5247,9 @@ function generateSignal(sym, bars5m, bars15m) {
   // We'll use these in Gate 1 to filter bad RSI signals
 
   // ── GATE 1: RSI must be in meaningful territory ──
-  // Primary mode: mean-reversion at RSI extremes
-  // Momentum mode: activates on trending days when RSI stays 45-65
   const r = rsi(c5, CONFIG.rsiPeriod);
+  // Crypto uses wider RSI bands (more volatile, 24/7, different dynamics)
+  const _isCryptoSym = isCrypto(sym);
   let rsiScore = 0;
 
   // Detect if this is a trending day vs mean-reversion day
@@ -5263,19 +5263,21 @@ function generateSignal(sym, bars5m, bars15m) {
   const macdRising  = _macdLine > _prevMacd && _macdLine > 0;
   const macdFalling = _macdLine < _prevMacd && _macdLine < 0;
 
-  if (r < CONFIG.rsiOversold) {
-    // Falling knife check: if price still dropping steeply, wait for stabilization
-    if (isFallingKnife) {
+  // Crypto uses wider RSI bands — more volatile, 24/7 market
+  const _rsiOs = _isCryptoSym ? 48 : CONFIG.rsiOversold;
+  const _rsiOb = _isCryptoSym ? 54 : CONFIG.rsiOverbought;
+
+  if (r < _rsiOs) {
+    if (isFallingKnife && !_isCryptoSym) { // crypto: skip falling knife check (too strict)
       return { signal:'HOLD', confidence:0, score:0,
-        reasons:[`RSI oversold (${r.toFixed(1)}) but price still falling (${(slope3*100).toFixed(2)}% in 3 bars) — falling knife`], rsi:r };
+        reasons:[`RSI oversold (${r.toFixed(1)}) but price still falling — falling knife`], rsi:r };
     }
     rsiScore = 2; direction = 'buy';
-    reasons.push(`RSI oversold ${r.toFixed(1)} + price stabilizing ✅`);
-  } else if (r > CONFIG.rsiOverbought) {
-    if (!CONFIG.shortsEnabled) {
-      // Shorts disabled in settings — all sell signals blocked
-      // Fix: enable Shorts in Bot Controls dashboard toggle
-      return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled in settings`], rsi:r };
+    reasons.push(`RSI ${_isCryptoSym?'crypto ':''}oversold ${r.toFixed(1)} ✅`);
+  } else if (r > _rsiOb) {
+    // For crypto shorts: only if explicitly enabled
+    if (!CONFIG.shortsEnabled && !_isCryptoSym) {
+      return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi:r };
     }
     // Rising tide check: if still surging, short too early
     if (isRisingTide) {
@@ -5324,11 +5326,11 @@ function generateSignal(sym, bars5m, bars15m) {
     } else if (volSpike && priceDn3 && CONFIG.shortsEnabled) {
       rsiScore = 1; direction = 'sell';
       reasons.push(`Volume breakdown (${(vol[vol.length-1]/(vol.slice(-6,-1).reduce((a,b)=>a+b,0)/5)).toFixed(1)}x) with price down ✅`);
-    } else if (!isMarketOpen() && (r < 38 || r > 62)) {
-      // After-hours: allow weak RSI signals without volume spike
-      // Volume is structurally low overnight — don't require it
-      if (r < 38) { rsiScore = 1; direction = 'buy'; reasons.push(`RSI ${r.toFixed(1)} — leaning oversold AH`); }
-      else         { rsiScore = 1; direction = 'sell'; reasons.push(`RSI ${r.toFixed(1)} — leaning overbought AH`); }
+    } else if (!isMarketOpen() && (r < 45 || r > 58)) {
+      // After-hours: wider RSI bands (volume is near zero so use looser thresholds)
+      // Also applies to crypto which trades 24/7 but with similar low-volume dynamics
+      if (r < 45) { rsiScore = 1; direction = 'buy';  reasons.push(`RSI ${r.toFixed(1)} — oversold AH ✅`); }
+      else         { rsiScore = 1; direction = 'sell'; reasons.push(`RSI ${r.toFixed(1)} — overbought AH ✅`); }
     } else {
       return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no edge`], rsi: r };
     }
