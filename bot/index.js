@@ -5324,6 +5324,11 @@ function generateSignal(sym, bars5m, bars15m) {
     } else if (volSpike && priceDn3 && CONFIG.shortsEnabled) {
       rsiScore = 1; direction = 'sell';
       reasons.push(`Volume breakdown (${(vol[vol.length-1]/(vol.slice(-6,-1).reduce((a,b)=>a+b,0)/5)).toFixed(1)}x) with price down ✅`);
+    } else if (!isMarketOpen() && (r < 38 || r > 62)) {
+      // After-hours: allow weak RSI signals without volume spike
+      // Volume is structurally low overnight — don't require it
+      if (r < 38) { rsiScore = 1; direction = 'buy'; reasons.push(`RSI ${r.toFixed(1)} — leaning oversold AH`); }
+      else         { rsiScore = 1; direction = 'sell'; reasons.push(`RSI ${r.toFixed(1)} — leaning overbought AH`); }
     } else {
       return { signal: 'HOLD', confidence: 0, score: 0, reasons: [`RSI neutral (${r.toFixed(1)}) — no edge`], rsi: r };
     }
@@ -5342,8 +5347,12 @@ function generateSignal(sym, bars5m, bars15m) {
   if (!macdAgrees) {
     // RSI extreme (>78 overbought or <22 oversold) overrides MACD disagreement
     // At extreme RSI levels, mean-reversion is more reliable than MACD trend
-    const rsiExtreme = (direction === 'sell' && r > 78) || (direction === 'buy' && r < 22);
-    const rsiModerate = (direction === 'buy' && r < 40) || (direction === 'sell' && r > 60);
+    // After hours: lower thresholds for MACD override
+    const ahMode = !isMarketOpen();
+    const rsiExtreme = (direction === 'sell' && r > (ahMode ? 70 : 78)) || 
+                       (direction === 'buy'  && r < (ahMode ? 30 : 22));
+    const rsiModerate = (direction === 'buy' && r < (ahMode ? 45 : 40)) || 
+                        (direction === 'sell' && r > (ahMode ? 55 : 60));
     if (rsiExtreme) {
       macdScore = -1; // penalty but not blocked
     } else if (!rsiModerate) {
@@ -5521,8 +5530,9 @@ function generateSignal(sym, bars5m, bars15m) {
     reasons.push(`Only ${passedGates}/${minGates} gates passed — need more confluence`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
-  // Require at least 1 bonus confirmation
-  if (bonus < 1) {
+  // After hours: don't require bonus (volume/momentum signals are weak overnight)
+  // During market hours: require at least 1 bonus confirmation for quality
+  if (bonus < 1 && isMarketOpen()) {
     reasons.push(`No bonus confluence — waiting for stronger setup`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
