@@ -3054,13 +3054,14 @@ function renderEquityChart(snapshots) {
         const t = typeof c.time === 'number' ? c.time
                 : c.time instanceof Date ? Math.floor(c.time.getTime()/1000)
                 : Math.floor(+c.time/1000);
-        return { time: t, open: +c.open, high: +c.high, low: +c.low, close: +c.close };
+        const v = +c.value || +c.close || 0;
+        return { time: t, value: v };
       })
-      .filter(c => isFinite(c.close) && c.close > 0 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
+      .filter(c => isFinite(c.value) && c.value > 0 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
       .sort((a,b) => a.time - b.time);
 
     if (!data.length) return;
-    if (inst.series) inst.series.setData(data);
+    if (inst.series) { try { inst.series.setData(data); } catch(e) { console.warn('Chart setData:', e); } }
     if (inst.ema) {
       const k = 2/21; let e = data[0].close;
       const emaData = data.map((d,i) => { e = i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; });
@@ -3109,27 +3110,11 @@ function buildCandlesForTF(snapshots, tf) {
   for (let k = firstKey; k <= endKey; k += bucketMs) {
     const v = buckets[k];
     if (v) {
-      const open  = lastClose ?? v[0];
-      const close = v[v.length-1];
-      let high = Math.max(open, close, ...v);
-      let low  = Math.min(open, close, ...v);
-      // Ensure minimum candle height so LW Charts renders visible bodies
-      // Flat candles (high==low) become invisible — add 0.01% range
-      if (high === low) {
-        high = high * 1.0001;
-        low  = low  * 0.9999;
-      }
-      out.push({time: Math.floor(k/1000), open, high, low, close});
-      lastClose = close;
+      const value = v[v.length - 1]; // use last value in bucket
+      out.push({ time: Math.floor(k/1000), value, close: value });
+      lastClose = value;
     } else if (lastClose !== null) {
-      // Forward-fill with tiny range so empty buckets show as doji not invisible
-      out.push({
-        time:  Math.floor(k/1000),
-        open:  lastClose,
-        high:  lastClose * 1.00005,
-        low:   lastClose * 0.99995,
-        close: lastClose,
-      });
+      out.push({ time: Math.floor(k/1000), value: lastClose, close: lastClose });
     }
   }
   return out;
@@ -3153,7 +3138,7 @@ function tickLiveCandle() {
 
   // Seed if empty
   if (!chart.allCandles?.length) {
-    chart.allCandles = [{time: keySec, open: v, high: v * 1.00005, low: v * 0.99995, close: v}];
+    chart.allCandles = [{ time: keySec, value: v, close: v }];
   }
 
   const last       = chart.allCandles[chart.allCandles.length - 1];
@@ -3165,21 +3150,20 @@ function tickLiveCandle() {
   if (keySec > lastBucket) {
     // New time bucket — fill gaps and create new candle
     for (let k = lastBucket + bucketSec; k < keySec; k += bucketSec) {
-      chart.allCandles.push({time: k, open: last.close, high: last.close*1.00005, low: last.close*0.99995, close: last.close});
+      chart.allCandles.push({ time: k, value: last.value || last.close, close: last.value || last.close });
     }
-    chart.allCandles.push({time: keySec, open: last.close, high: Math.max(last.close, v), low: Math.min(last.close, v), close: v});
+    chart.allCandles.push({ time: keySec, value: v, close: v });
   } else {
+    last.value = v;
     last.close = v;
-    last.high  = Math.max(last.high || v, v);
-    last.low   = Math.min(last.low  || v, v);
-    if (last.high === last.low) { last.high *= 1.0001; last.low *= 0.9999; }
   }
 
   const inst = _equityChart();
   const c    = chart.allCandles[chart.allCandles.length - 1];
   if (inst?.series) {
     try {
-      inst.series.update({time: c.time, open: +c.open, high: +c.high, low: +c.low, close: +c.close});
+      const val = +c.value || +c.close || 0;
+      if (isFinite(val) && val > 0) inst.series.update({ time: c.time, value: val });
     } catch(e) {}
   }
 }
