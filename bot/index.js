@@ -7561,7 +7561,13 @@ ${headlines}`,
 
 // Main news scanner — runs every 90s during market hours
 async function runNewsScanner() {
-  if (!AI_ADVISOR_KEY) return;           // no key = disabled
+  if (!AI_ADVISOR_KEY) {
+    if (!runNewsScanner._warned) {
+      log('warn', '⚠️ AI news disabled — ANTHROPIC_API_KEY not set in Render env vars');
+      runNewsScanner._warned = true;
+    }
+    return;
+  }
   if (isSimMode()) return;               // never run in sim — saves tokens
   // Run during market hours OR if there's crypto on the watchlist (24/7 news)
   const hasCrypto = (CONFIG.symbols||[]).some(s => isCrypto(s));
@@ -9806,11 +9812,17 @@ async function updateDayBias() {
     const todayOpen = bars[bars.length - 1].o || prevClose;
     const gapPct    = (todayOpen - prevClose) / prevClose;
 
-    if      (gapPct >  0.003) { dayBias = 'bullish'; dayBiasBonus = Math.min(20, Math.round(gapPct * 3000)); }
-    else if (gapPct < -0.003) { dayBias = 'bearish'; dayBiasBonus = Math.min(20, Math.round(Math.abs(gapPct) * 3000)); }
-    else                      { dayBias = 'neutral';  dayBiasBonus = 0; }
+    // Weight intraday move heavily — stale gap bias causes bad short entries
+    const spyNow       = alpacaLivePrice?.['SPY'] || 0;
+    const intradayPct  = (spyNow > 0 && todayOpen > 0) ? (spyNow - todayOpen) / todayOpen : 0;
+    // 40% gap + 60% intraday = bias tracks live market, not just morning gap
+    const effectivePct = gapPct * 0.4 + intradayPct * 0.6;
 
-    log('sys', `Day bias: ${dayBias.toUpperCase()} (SPY gap ${gapPct >= 0 ? '+' : ''}${(gapPct*100).toFixed(2)}%${dayBiasBonus ? `, bonus ±${dayBiasBonus}pts` : ''})`);
+    if      (effectivePct >  0.003) { dayBias = 'bullish'; dayBiasBonus = Math.min(16, Math.round(Math.abs(effectivePct) * 2000)); }
+    else if (effectivePct < -0.003) { dayBias = 'bearish'; dayBiasBonus = Math.min(16, Math.round(Math.abs(effectivePct) * 2000)); }
+    else                            { dayBias = 'neutral';  dayBiasBonus = 0; }
+
+    log('sys', `Day bias: ${dayBias.toUpperCase()} (gap ${gapPct>=0?'+':''}${(gapPct*100).toFixed(2)}% intraday ${intradayPct>=0?'+':''}${(intradayPct*100).toFixed(2)}% → effective ${(effectivePct*100).toFixed(2)}%)`);
   } catch (e) {}
 }
 
@@ -10220,6 +10232,7 @@ loadRemoteConfig().then(async () => {
   }
   log('sys', `🪙 Crypto 24/7 enabled: ${DEFAULT_CRYPTO.join(', ')}`);
   log('sys', '🆕 AlphaCore v2 — NaN fix ✅ crypto 24/7 ✅ adaptive cap ✅');
+  setInterval(() => { if (isMarketOpen()) updateDayBias(); }, 15 * 60 * 1000);
 
   await updateDayBias();
   if (isMarketOpen()) {
