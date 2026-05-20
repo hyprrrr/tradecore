@@ -3450,8 +3450,9 @@ function ema(prices, period) {
 
 function rsi(prices, period) {
   if (!prices || prices.length < period + 1) return 50;
-  // Filter out NaN/null/undefined values that cause NaN propagation
-  const clean = prices.filter(p => Number.isFinite(p));
+  const clean = prices
+    .map(p => typeof p === 'string' ? +p : p)  // coerce strings
+    .filter(p => Number.isFinite(p) && p > 0);  // must be positive price
   if (clean.length < period + 1) return 50;
   let gains = 0, losses = 0;
   for (let i = clean.length - period; i < clean.length; i++) {
@@ -5277,6 +5278,12 @@ function generateSignal(sym, bars5m, bars15m) {
   const _rsiOb = _isCryptoSym ? 54 : CONFIG.rsiOverbought;
 
   const _afterHours = !isMarketOpen();
+
+  // Debug: log first crypto signal computation
+  if (_isCryptoSym) {
+    const _dbgRsi = rsi(c5.slice(0,50), CONFIG.rsiPeriod);
+    log('data', `🪙 ${sym} signal debug: bars=${bars5m.length} c5len=${c5.length} c5[0]=${c5[0]} c5last=${c5[c5.length-1]} rsi=${_dbgRsi} type=${typeof c5[0]}`);
+  }
 
   // ── AFTER-HOURS FAST PATH ────────────────────────────────────
   // After market close, most gates use stale bars that produce false signals:
@@ -9633,7 +9640,8 @@ async function fetchAllBarsParallel(symbols) {
         if (bars.length >= 15) {
           barCache.set(`${sym}_5Min`,  { bars, ts: Date.now() });
           barCache.set(`${sym}_15Min`, { bars: bars.filter((_,i) => i%3===0), ts: Date.now() });
-          log('data', `🪙 ${sym}: ${bars.length} bars @ $${bars[bars.length-1].c.toFixed(2)} (Kraken)`);
+          const lastBar = bars[bars.length-1];
+          log('data', `🪙 ${sym}: ${bars.length} bars @ $${(+lastBar.c).toFixed(2)} (Kraken) | c=${typeof lastBar.c}:${lastBar.c}`);
         } else {
           log('warn', `🪙 ${sym} Kraken: only ${bars.length} bars`);
         }
