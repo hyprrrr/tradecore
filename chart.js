@@ -72,18 +72,20 @@ class EquityChart {
       handleScale:  true,
     });
 
-    // Equity curve: area chart looks much better than candles for portfolio value
+    // Equity curve: area chart — clean, professional, shows full history
     this.series = this.chart.addAreaSeries({
-      lineColor:        '#2962ff',
-      lineWidth:        2,
-      topColor:         'rgba(41,98,255,0.18)',
-      bottomColor:      'rgba(41,98,255,0.00)',
-      priceLineColor:   '#2962ff',
-      priceLineWidth:   1,
-      lastValueVisible: true,
+      lineColor:              '#2962ff',
+      lineWidth:              2,
+      topColor:               'rgba(41,98,255,0.25)',
+      bottomColor:            'rgba(41,98,255,0.02)',
+      priceLineColor:         '#2962ff',
+      priceLineWidth:         1,
+      priceLineStyle:         1, // dashed
+      lastValueVisible:       true,
       crosshairMarkerVisible: true,
-      crosshairMarkerRadius:  4,
+      crosshairMarkerRadius:  5,
       crosshairMarkerBackgroundColor: '#2962ff',
+      priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
     });
 
     this.ema = this.chart.addLineSeries({
@@ -132,7 +134,7 @@ class EquityChart {
       return { time: d.time, value: e };
     });
     this.ema.setData(emaData);
-    this.chart.timeScale().scrollToRealTime();
+    this.chart.timeScale().fitContent();
   }
 
   update(c) {
@@ -144,6 +146,11 @@ class EquityChart {
       if (!isFinite(v) || v <= 0) return;
       this.series.update({ time: t, value: v });
     } catch(e) {}
+  }
+
+  /** Force chart to show all data */
+  fitAll() {
+    try { this.chart?.timeScale().fitContent(); } catch(e) {}
   }
 }
 
@@ -285,7 +292,7 @@ class StockChart {
 
       if (!data.length) return;
       this.series.setData(data);
-      this.chart.timeScale().scrollToRealTime();
+      this.chart.timeScale().fitContent();
 
       // Live price updates — update last candle every 5s
       if (this._liveInterval) clearInterval(this._liveInterval);

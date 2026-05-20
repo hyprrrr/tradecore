@@ -3068,8 +3068,8 @@ function renderEquityChart(snapshots) {
       inst.ema.setData(emaData);
     }
     if (inst.chart) {
-      inst.chart.applyOptions({ rightPriceScale: { scaleMargins: { top: 0.15, bottom: 0.15 } } });
-      inst.chart.timeScale().scrollToRealTime();
+      inst.chart.applyOptions({ rightPriceScale: { scaleMargins: { top: 0.1, bottom: 0.1 } } });
+      inst.chart.timeScale().fitContent(); // show full equity curve
     }
     setTimeout(tickLiveCandle, 500);
   }
