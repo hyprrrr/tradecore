@@ -2718,7 +2718,11 @@ const CRYPTO_SYMBOLS = new Set([
 ]);
 
 function isCrypto(sym) {
-  return CRYPTO_SYMBOLS.has(sym) || sym?.endsWith('USD') && sym?.length >= 6;
+  if (!sym) return false;
+  const base = sym.replace('/', ''); // normalize BTC/USD -> BTCUSD
+  return CRYPTO_SYMBOLS.has(base) || CRYPTO_SYMBOLS.has(sym) ||
+    (sym.endsWith('USD') && sym.length >= 6) ||
+    (sym.endsWith('/USD') && sym.length >= 7);
 }
 
 function isMarketOpen() {
@@ -2794,9 +2798,11 @@ async function fetchBars(symbol, timeframe, limit) {
   if (isCrypto(symbol)) {
     try {
       const start = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-      const url = `https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=${symbol}&timeframe=${timeframe === '5Min' ? '5Min' : timeframe === '15Min' ? '15Min' : timeframe === '1Day' ? '1Day' : '1Hour'}&start=${start}&limit=${Math.max(limit, 100)}`;
+      const apiSym2 = symbol.replace(/([A-Z]+)USD$/, '$1/USD');
+      const tf2 = timeframe === '5Min' ? '5Min' : timeframe === '15Min' ? '15Min' : timeframe === '1Day' ? '1Day' : '1Hour';
+      const url = `https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(apiSym2)}&timeframe=${tf2}&start=${start}&limit=${Math.max(limit, 100)}`;
       const data = await alpacaFetch(url);
-      const bars = data?.bars?.[symbol] || [];
+      const bars = data?.bars?.[apiSym2] || data?.bars?.[symbol] || [];
       if (bars.length >= 15) return bars.map(b => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0 }));
     } catch(e) {}
     return null;
@@ -5505,7 +5511,9 @@ function generateSignal(sym, bars5m, bars15m) {
   }
   // Gates passed (required) + bonus confluence (nice to have)
   // Need at least 5 gates AND at least 1 bonus for a trade
-  const minGates = c15 ? 5 : 4; // gates needed — soft gates mean we need fewer hard passes
+  // After-hours: fewer gates required (lower volume, fewer indicators reliable)
+  const isAfterHours = !isMarketOpen();
+  const minGates = c15 ? (isAfterHours ? 4 : 5) : (isAfterHours ? 3 : 4);
   const score    = passedGates * 10 + bonus * 5 + rsiScore * 5 + macdScore * 5 + volScore * 3;
   const confidence = Math.min(99, Math.round((passedGates / (minGates + 2)) * 100));
 
@@ -8069,8 +8077,9 @@ async function runScan() {
         : '[US stock]';
 
       // Use cached bars from parallel prefetch
-      const bars5m  = barData5m[sym]  || await fetchBarsCached(sym, '5Min',  60);
-      const bars15m = barData15m[sym] || await fetchBarsCached(sym, '15Min', 40);
+      // Never use fetchBarsCached for crypto — it hits the stock endpoint
+      const bars5m  = barData5m[sym]  || (isCrypto(sym) ? null : await fetchBarsCached(sym, '5Min',  60));
+      const bars15m = barData15m[sym] || (isCrypto(sym) ? null : await fetchBarsCached(sym, '15Min', 40));
       // PMRB: capture 8AM candle from 15m bars whenever we have them
       if (bars15m?.length >= 2) capturePMRBRange(sym, bars15m).catch(() => {});
       if (bars5m?.length  >= 50) capture4HRange(sym, bars5m); // 4HR strategy
@@ -9534,16 +9543,29 @@ async function fetchAllBarsParallel(symbols) {
     const start5m = new Date(Date.now() - 2*24*60*60*1000).toISOString();
     await Promise.allSettled(cryptoToFetch.map(async sym => {
       const cached = barCache.get(`${sym}_5Min`);
-      if (cached && Date.now() - cached.ts < 30000) return; // fresh enough
+      // Always re-fetch if no bars or bars are stale (> 60s for crypto = live data)
+      if (cached?.bars?.length >= 15 && Date.now() - cached.ts < 60000) return;
       try {
-        const url = `https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=${sym}&timeframe=5Min&start=${start5m}&limit=100`;
+        // Alpaca v1beta3 uses slash format: BTC/USD not BTCUSD
+        const apiSym = sym.replace(/USD$/, '/USD').replace(/BTC\//, 'BTC/');
+        const url = `https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(apiSym)}&timeframe=5Min&start=${start5m}&limit=100`;
         const data = await alpacaFetch(url);
-        const bars = (data?.bars?.[sym] || []).map(b => ({t:b.t,o:+b.o,h:+b.h,l:+b.l,c:+b.c,v:+b.v||0}));
+        // Response key may be BTC/USD or BTCUSD — check both
+        const rawBars = data?.bars?.[apiSym] || data?.bars?.[sym] || [];
+        log('data', `🪙 ${sym} Alpaca crypto: ${rawBars.length} raw bars (apiSym=${apiSym}) | allKeys: ${Object.keys(data?.bars||{}).join(',') || 'none'}`);
+        const bars = rawBars.map(b => ({
+          t: b.t, o: +b.o, h: +b.h, l: +b.l, c: +b.c, v: +b.v || 0
+        })).filter(b => isFinite(b.c) && b.c > 0);
         if (bars.length >= 15) {
           barCache.set(`${sym}_5Min`,  {bars, ts: Date.now()});
           barCache.set(`${sym}_15Min`, {bars: bars.filter((_,i) => i%3===0), ts: Date.now()});
+          log('data', `🪙 ${sym} cached ${bars.length} bars OK`);
+        } else {
+          log('warn', `🪙 ${sym} crypto bars insufficient: ${bars.length} (need 15+)`);
         }
-      } catch(e) {}
+      } catch(e) {
+        log('warn', `🪙 ${sym} crypto fetch error: ${e.message?.slice(0,80)}`);
+      }
     }));
   }
 
@@ -9570,7 +9592,7 @@ async function fetchAllBarsParallel(symbols) {
         batch.map(async sym => ({ sym, bars: await yahooFetchBars(sym, '5m', '5d') }))
       );
       for (const r of settled) {
-        if (r.status === 'fulfilled' && r.value?.bars?.length >= 15) {
+        if (r.status === 'fulfilled' && r.value?.bars?.length >= 15 && !isCrypto(r.value.sym)) {
           yahoo5m[r.value.sym] = r.value.bars;
           barCache.set(`${r.value.sym}_5Min`, { bars: r.value.bars, ts: Date.now() });
         }
@@ -9587,7 +9609,7 @@ async function fetchAllBarsParallel(symbols) {
         batch.map(async sym => ({ sym, bars: await yahooFetchBars(sym, '15m', '7d') }))
       );
       for (const r of settled) {
-        if (r.status === 'fulfilled' && r.value?.bars?.length >= 10) {
+        if (r.status === 'fulfilled' && r.value?.bars?.length >= 10 && !isCrypto(r.value.sym)) {
           yahoo15m[r.value.sym] = r.value.bars;
           barCache.set(`${r.value.sym}_15Min`, { bars: r.value.bars, ts: Date.now() });
         }
@@ -9602,12 +9624,16 @@ async function fetchAllBarsParallel(symbols) {
     const cached15m = barCache.get(`${sym}_15Min`);
     // Crypto uses Alpaca cache; stocks use Yahoo or Alpaca fallback
     const bars5m  = isCrypto(sym)
-      ? (cached5m?.bars || null)
+      ? (cached5m?.bars || null)  // crypto ONLY from Alpaca cache — no Yahoo/stock fallback
       : (yahoo5m[sym] || cached5m?.bars || await fetchBarsCached(sym, '5Min', 60).catch(() => null));
     const bars15m = isCrypto(sym)
       ? (cached15m?.bars || null)
       : (yahoo15m[sym] || cached15m?.bars || await fetchBarsCached(sym, '15Min', 40).catch(() => null));
-    if (bars5m?.length >= 15) results.push({ sym, bars5m, bars15m: bars15m || [] });
+    if (bars5m?.length >= 15) {
+      results.push({ sym, bars5m, bars15m: bars15m || [] });
+    } else if (isCrypto(sym)) {
+      log('warn', `🪙 ${sym} no cached bars yet — will retry next scan`);
+    }
   }
 
   const fresh = needFresh5m.length;
