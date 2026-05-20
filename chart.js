@@ -72,20 +72,15 @@ class EquityChart {
       handleScale:  true,
     });
 
-    // Equity curve: area chart — clean, professional, shows full history
-    this.series = this.chart.addAreaSeries({
-      lineColor:              '#2962ff',
-      lineWidth:              2,
-      topColor:               'rgba(41,98,255,0.25)',
-      bottomColor:            'rgba(41,98,255,0.02)',
-      priceLineColor:         '#2962ff',
-      priceLineWidth:         1,
-      priceLineStyle:         1, // dashed
-      lastValueVisible:       true,
-      crosshairMarkerVisible: true,
-      crosshairMarkerRadius:  5,
-      crosshairMarkerBackgroundColor: '#2962ff',
-      priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+    // Candlestick equity chart — TV style
+    this.series = this.chart.addCandlestickSeries({
+      upColor:         '#2962ff',
+      downColor:       '#131722',
+      borderUpColor:   '#2962ff',
+      borderDownColor: '#2962ff',
+      wickUpColor:     '#2962ff',
+      wickDownColor:   '#2962ff',
+      priceFormat:     { type: 'price', precision: 2, minMove: 0.01 },
     });
 
     this.ema = this.chart.addLineSeries({
@@ -115,12 +110,19 @@ class EquityChart {
 
     const seen = new Set();
     const data = candles
-      .map(c => ({
-        time:  typeof c.time === 'number' ? c.time
-               : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000),
-        value: +c.close || +c.value || 0,
-      }))
-      .filter(c => isFinite(c.value) && c.value > 0 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
+      .map(c => {
+        const t = typeof c.time === 'number' ? c.time
+                : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000);
+        const v = +c.close || +c.value || 0;
+        const o = +c.open  || v;
+        const h = +c.high  || Math.max(o, v);
+        const l = +c.low   || Math.min(o, v);
+        // Ensure minimum candle body height (0.005%) so candles are visible
+        const hh = h === l ? h * 1.00005 : h;
+        const ll = h === l ? l * 0.99995 : l;
+        return { time: t, open: o, high: hh, low: ll, close: v };
+      })
+      .filter(c => isFinite(c.close) && c.close > 0 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
       .sort((a,b) => a.time - b.time);
 
     if (!data.length) return;
@@ -128,9 +130,9 @@ class EquityChart {
 
     // EMA(20)
     const k = 2/21;
-    let e = data[0].value;
+    let e = data[0].close;
     const emaData = data.map((d,i) => {
-      e = i === 0 ? d.value : d.value*k + e*(1-k);
+      e = i === 0 ? d.close : d.close*k + e*(1-k);
       return { time: d.time, value: e };
     });
     this.ema.setData(emaData);
@@ -143,8 +145,14 @@ class EquityChart {
       const t = typeof c.time === 'number' ? c.time
                 : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000);
       const v = +c.close || +c.value || 0;
+      const o = +c.open  || v;
+      const h = +c.high  || Math.max(o, v);
+      const l = +c.low   || Math.min(o, v);
       if (!isFinite(v) || v <= 0) return;
-      this.series.update({ time: t, value: v });
+      // Ensure visible candle body
+      const hh = h === l ? h * 1.00005 : h;
+      const ll = h === l ? l * 0.99995 : l;
+      this.series.update({ time: t, open: o, high: hh, low: ll, close: v });
     } catch(e) {}
   }
 
