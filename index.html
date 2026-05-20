@@ -3150,53 +3150,53 @@ function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
   if (!isFinite(v) || v <= 0) return;
 
-  const msMap   = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
-  const bucketMs = msMap[chart.tf] || 3600e3;
-  const keySec  = Math.floor(Date.now() / bucketMs) * bucketMs / 1000; // Unix seconds
+  // Only update current candle body when actively trading
+  const hasOpenPositions = (state.positions?.length || 0) > 0;
+  const prevV = tickLiveCandle._lastV || 0;
+  const equityChanged = Math.abs(v - prevV) > 0.01;
+  tickLiveCandle._lastV = v;
 
-  // Seed if empty
+  const msMap    = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
+  const bucketMs = msMap[chart.tf] || 3600e3;
+  const bucketSec = bucketMs / 1000;
+  const keySec   = Math.floor(Date.now() / bucketMs) * bucketMs / 1000;
+
   if (!chart.allCandles?.length) {
-    chart.allCandles = [{ time: keySec, open: v, high: v*1.00005, low: v*0.99995, close: v }];
+    chart.allCandles = [{ time: keySec, open: v, high: v * 1.00005, low: v * 0.99995, close: v }];
   }
 
-  const last       = chart.allCandles[chart.allCandles.length - 1];
-  const lastSec    = typeof last.time === 'number' ? last.time
-                   : Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time) / 1000);
-  const bucketSec  = bucketMs / 1000;
+  const last = chart.allCandles[chart.allCandles.length - 1];
+  const lastSec = typeof last.time === 'number' ? last.time
+                : Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time) / 1000);
   const lastBucket = Math.floor(lastSec / bucketSec) * bucketSec;
+  const newBucket  = keySec > lastBucket;
 
-  if (keySec > lastBucket) {
-    // New time bucket — fill gaps and create new candle
+  if (newBucket) {
+    // Always advance to new time buckets to keep timeframe accurate
     for (let k = lastBucket + bucketSec; k < keySec; k += bucketSec) {
       const fc = last.close || v;
-      chart.allCandles.push({ time: k, open: fc, high: fc*1.00005, low: fc*0.99995, close: fc });
+      chart.allCandles.push({ time: k, open: fc, high: fc * 1.00005, low: fc * 0.99995, close: fc });
     }
     chart.allCandles.push({
-      time: keySec,
-      open:  last.close || v,
-      high:  Math.max(last.close || v, v) * 1.00005,
-      low:   Math.min(last.close || v, v) * 0.99995,
-      close: v,
+      time: keySec, open: last.close || v,
+      high: last.close || v, low: last.close || v, close: v,
     });
-  } else {
+  } else if (hasOpenPositions || equityChanged) {
+    // Only update within bucket when positions are open or equity moved
     last.close = v;
-    last.high  = Math.max(last.high || v, v);
-    last.low   = Math.min(last.low  || v, v);
-    if (last.high === last.low) { last.high *= 1.00005; last.low *= 0.99995; }
+    last.high  = Math.max(last.high, v);
+    last.low   = Math.min(last.low, v);
+  } else {
+    return; // flat with no positions — skip render
   }
 
+  const c = chart.allCandles[chart.allCandles.length - 1];
+  if (c.high <= c.low) { c.high *= 1.00005; c.low *= 0.99995; }
+
   const inst = _equityChart();
-  const c    = chart.allCandles[chart.allCandles.length - 1];
   if (inst?.series && c) {
-    try {
-      inst.series.update({
-        time:  c.time,
-        open:  +c.open  || +c.close,
-        high:  +c.high  || +c.close * 1.00005,
-        low:   +c.low   || +c.close * 0.99995,
-        close: +c.close,
-      });
-    } catch(e) {}
+    try { inst.series.update({ time: c.time, open: +c.open, high: +c.high, low: +c.low, close: +c.close }); }
+    catch(e) {}
   }
 }
 
