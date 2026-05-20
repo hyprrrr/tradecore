@@ -2794,18 +2794,23 @@ async function alpacaFetch(url, opts = {}, retries = 2) {
 }
 
 async function fetchBars(symbol, timeframe, limit) {
-  // ── CRYPTO: Binance public API — no auth, reliable ──
+  // ── CRYPTO: Kraken public API ──
   if (isCrypto(symbol)) {
     try {
       const fetch = await getFetch();
-      const binanceSym = symbol.replace(/USD$/, 'USDT');
-      const interval = timeframe === '5Min' ? '5m' : timeframe === '15Min' ? '15m' : timeframe === '1Day' ? '1d' : '1h';
-      const url = `https://api.binance.com/api/v3/klines?symbol=${binanceSym}&interval=${interval}&limit=${Math.max(limit, 100)}`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) throw new Error(`Binance HTTP ${res.status}`);
-      const klines = await res.json();
-      const bars = klines.map(k => ({
-        t: new Date(k[0]).toISOString(), o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]
+      const KRAKEN_MAP = { BTCUSD: 'XBTUSD', ETHUSD: 'ETHUSD', LTCUSD: 'LTCUSD' };
+      const krakenSym = KRAKEN_MAP[symbol] || symbol;
+      const kInterval = timeframe === '5Min' ? 5 : timeframe === '15Min' ? 15 : timeframe === '1Day' ? 1440 : 60;
+      const since = Math.floor((Date.now() - 7*24*60*60*1000) / 1000);
+      const url = `https://api.kraken.com/0/public/OHLC?pair=${krakenSym}&interval=${kInterval}&since=${since}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) throw new Error(`Kraken ${res.status}`);
+      const json = await res.json();
+      if (json.error?.length) throw new Error(json.error[0]);
+      const pairKey = Object.keys(json.result || {}).find(k => k !== 'last');
+      const ohlc = json.result?.[pairKey] || [];
+      const bars = ohlc.map(k => ({
+        t: new Date(k[0]*1000).toISOString(), o:+k[1], h:+k[2], l:+k[3], c:+k[4], v:+k[6]
       })).filter(b => isFinite(b.c) && b.c > 0);
       if (bars.length >= 15) return bars;
     } catch(e) { log('warn', `Crypto fetchBars ${symbol}: ${e.message?.slice(0,60)}`); }
@@ -5271,22 +5276,24 @@ function generateSignal(sym, bars5m, bars15m) {
   const _rsiOs = _isCryptoSym ? 48 : CONFIG.rsiOversold;
   const _rsiOb = _isCryptoSym ? 54 : CONFIG.rsiOverbought;
 
+  const _afterHours = !isMarketOpen();
+
   if (r < _rsiOs) {
-    if (isFallingKnife && !_isCryptoSym) { // crypto: skip falling knife check (too strict)
+    // Falling knife: skip after-hours (bars are stale from yesterday's close)
+    if (isFallingKnife && !_isCryptoSym && !_afterHours) {
       return { signal:'HOLD', confidence:0, score:0,
         reasons:[`RSI oversold (${r.toFixed(1)}) but price still falling — falling knife`], rsi:r };
     }
     rsiScore = 2; direction = 'buy';
     reasons.push(`RSI ${_isCryptoSym?'crypto ':''}oversold ${r.toFixed(1)} ✅`);
   } else if (r > _rsiOb) {
-    // For crypto shorts: only if explicitly enabled
     if (!CONFIG.shortsEnabled && !_isCryptoSym) {
       return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi:r };
     }
-    // Rising tide check: if still surging, short too early
-    if (isRisingTide) {
+    // Rising tide: skip after-hours
+    if (isRisingTide && !_afterHours) {
       return { signal:'HOLD', confidence:0, score:0,
-        reasons:[`RSI overbought (${r.toFixed(1)}) but price still rising (${(slope3*100).toFixed(2)}% in 3 bars) — wait for peak`], rsi:r };
+        reasons:[`RSI overbought (${r.toFixed(1)}) but price still rising — wait for peak`], rsi:r };
     }
     rsiScore = 2; direction = 'sell';
     reasons.push(`RSI overbought ${r.toFixed(1)} + momentum fading ✅`);
@@ -5354,11 +5361,12 @@ function generateSignal(sym, bars5m, bars15m) {
     // RSI extreme (>78 overbought or <22 oversold) overrides MACD disagreement
     // At extreme RSI levels, mean-reversion is more reliable than MACD trend
     // After hours: lower thresholds for MACD override
-    const ahMode = !isMarketOpen();
-    const rsiExtreme = (direction === 'sell' && r > (ahMode ? 70 : 78)) || 
-                       (direction === 'buy'  && r < (ahMode ? 30 : 22));
-    const rsiModerate = (direction === 'buy' && r < (ahMode ? 45 : 40)) || 
-                        (direction === 'sell' && r > (ahMode ? 55 : 60));
+    // After hours: much more permissive MACD gate
+    // Bars are stale, EMA trends don't reflect true overnight sentiment
+    const rsiExtreme = (direction === 'sell' && r > (_afterHours ? 65 : 78)) || 
+                       (direction === 'buy'  && r < (_afterHours ? 35 : 22));
+    const rsiModerate = (direction === 'buy' && r < (_afterHours ? 50 : 40)) || 
+                        (direction === 'sell' && r > (_afterHours ? 50 : 60));
     if (rsiExtreme) {
       macdScore = -1; // penalty but not blocked
     } else if (!rsiModerate) {
@@ -9553,35 +9561,40 @@ async function fetchAllBarsParallel(symbols) {
   const CONCURRENCY = 20;
 
   // Check which symbols need fresh 5m bars (cache miss)
-  // Crypto: fetch from Binance public API (no auth, reliable, free)
-  // BTCUSD -> BTCUSDT, ETHUSD -> ETHUSDT on Binance
+  // Crypto: fetch from Kraken public API (no auth, no geo-restrictions)
+  // BTCUSD -> XBTUSD, ETHUSD -> ETHUSD on Kraken OHLC endpoint
   const cryptoToFetch = symbols.filter(s => isCrypto(s));
   if (cryptoToFetch.length > 0) {
     const fetch = await getFetch();
+    const KRAKEN_MAP = { BTCUSD: 'XBTUSD', ETHUSD: 'ETHUSD', LTCUSD: 'LTCUSD', SOLUSD: 'SOLUSD' };
     await Promise.allSettled(cryptoToFetch.map(async sym => {
       const cached = barCache.get(`${sym}_5Min`);
       if (cached?.bars?.length >= 15 && Date.now() - cached.ts < 60000) return;
       try {
-        // Convert BTCUSD -> BTCUSDT for Binance
-        const binanceSym = sym.replace(/USD$/, 'USDT');
-        const url = `https://api.binance.com/api/v3/klines?symbol=${binanceSym}&interval=5m&limit=100`;
-        const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-        if (!res.ok) throw new Error(`Binance ${res.status}`);
-        const klines = await res.json();
-        // Binance kline format: [openTime, open, high, low, close, volume, ...]
-        const bars = klines.map(k => ({
-          t: new Date(k[0]).toISOString(),
-          o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]
+        const krakenSym = KRAKEN_MAP[sym] || sym;
+        // Kraken OHLC: interval=5 (minutes), since = 2 days ago
+        const since = Math.floor((Date.now() - 2*24*60*60*1000) / 1000);
+        const url = `https://api.kraken.com/0/public/OHLC?pair=${krakenSym}&interval=5&since=${since}`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (!res.ok) throw new Error(`Kraken ${res.status}`);
+        const json = await res.json();
+        if (json.error?.length) throw new Error(json.error[0]);
+        // Kraken returns {result: {XBTUSD: [[time,open,high,low,close,vwap,vol,count], ...], last: N}}
+        const pairKey = Object.keys(json.result || {}).find(k => k !== 'last');
+        const ohlc = json.result?.[pairKey] || [];
+        const bars = ohlc.map(k => ({
+          t: new Date(k[0] * 1000).toISOString(),
+          o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[6]
         })).filter(b => isFinite(b.c) && b.c > 0);
         if (bars.length >= 15) {
           barCache.set(`${sym}_5Min`,  { bars, ts: Date.now() });
           barCache.set(`${sym}_15Min`, { bars: bars.filter((_,i) => i%3===0), ts: Date.now() });
-          log('data', `🪙 ${sym} (${binanceSym}): ${bars.length} bars @ $${bars[bars.length-1].c.toFixed(2)}`);
+          log('data', `🪙 ${sym}: ${bars.length} bars @ $${bars[bars.length-1].c.toFixed(2)} (Kraken)`);
         } else {
-          log('warn', `🪙 ${sym} Binance: only ${bars.length} bars`);
+          log('warn', `🪙 ${sym} Kraken: only ${bars.length} bars`);
         }
       } catch(e) {
-        log('warn', `🪙 ${sym} Binance error: ${e.message?.slice(0,60)}`);
+        log('warn', `🪙 ${sym} Kraken error: ${e.message?.slice(0,60)}`);
       }
     }));
   }
