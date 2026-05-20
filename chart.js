@@ -72,20 +72,26 @@ class EquityChart {
       handleScale:  true,
     });
 
-    this.series = this.chart.addCandlestickSeries({
-      upColor:         '#2962ff',
-      downColor:       '#131722',
-      borderUpColor:   '#2962ff',
-      borderDownColor: '#2962ff',
-      wickUpColor:     '#2962ff',
-      wickDownColor:   '#2962ff',
+    // Equity curve: area chart looks much better than candles for portfolio value
+    this.series = this.chart.addAreaSeries({
+      lineColor:        '#2962ff',
+      lineWidth:        2,
+      topColor:         'rgba(41,98,255,0.18)',
+      bottomColor:      'rgba(41,98,255,0.00)',
+      priceLineColor:   '#2962ff',
+      priceLineWidth:   1,
+      lastValueVisible: true,
+      crosshairMarkerVisible: true,
+      crosshairMarkerRadius:  4,
+      crosshairMarkerBackgroundColor: '#2962ff',
     });
 
     this.ema = this.chart.addLineSeries({
-      color:            'rgba(245,197,24,0.8)',
-      lineWidth:        1.5,
+      color:            'rgba(245,197,24,0.7)',
+      lineWidth:        1,
       priceLineVisible: false,
       lastValueVisible: false,
+      lineStyle:        LightweightCharts.LineStyle.Dashed,
     });
 
     // Auto-resize
@@ -108,10 +114,11 @@ class EquityChart {
     const seen = new Set();
     const data = candles
       .map(c => ({
-        time:  Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000),
-        open:  +c.open, high: +c.high, low: +c.low, close: +c.close,
+        time:  typeof c.time === 'number' ? c.time
+               : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000),
+        value: +c.close || +c.value || 0,
       }))
-      .filter(c => isFinite(c.close) && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
+      .filter(c => isFinite(c.value) && c.value > 0 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
       .sort((a,b) => a.time - b.time);
 
     if (!data.length) return;
@@ -119,9 +126,9 @@ class EquityChart {
 
     // EMA(20)
     const k = 2/21;
-    let e = data[0].close;
+    let e = data[0].value;
     const emaData = data.map((d,i) => {
-      e = i === 0 ? d.close : d.close*k + e*(1-k);
+      e = i === 0 ? d.value : d.value*k + e*(1-k);
       return { time: d.time, value: e };
     });
     this.ema.setData(emaData);
@@ -131,8 +138,11 @@ class EquityChart {
   update(c) {
     if (!this.series) return;
     try {
-      const t = Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000);
-      this.series.update({ time:t, open:+c.open, high:+c.high, low:+c.low, close:+c.close });
+      const t = typeof c.time === 'number' ? c.time
+                : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000);
+      const v = +c.close || +c.value || 0;
+      if (!isFinite(v) || v <= 0) return;
+      this.series.update({ time: t, value: v });
     } catch(e) {}
   }
 }
