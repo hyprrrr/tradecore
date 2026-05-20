@@ -5278,6 +5278,45 @@ function generateSignal(sym, bars5m, bars15m) {
 
   const _afterHours = !isMarketOpen();
 
+  // ── AFTER-HOURS FAST PATH ────────────────────────────────────
+  // After market close, most gates use stale bars that produce false signals:
+  // - Volume is near zero (volRatio < 0.4 → hard block)
+  // - ADX < 15 (choppy reading on flat overnight bars)  
+  // - 15min EMA still shows yesterday's downtrend
+  // - 200 EMA reads yesterday's position
+  // Solution: use a simplified 2-gate check (RSI + MACD only)
+  if (_afterHours && !_isCryptoSym) {
+    // RSI must be clearly oversold or overbought
+    if (r < 30) {
+      // Check MACD isn't screaming sell
+      const _ahE8 = ema(c5, 8), _ahE21 = ema(c5, 21);
+      const _ahMacdOk = _ahE8 >= _ahE21 * 0.995; // allow slight bearish (within 0.5%)
+      if (!_ahMacdOk) {
+        return { signal:'HOLD', confidence:0, score:0, reasons:[`AH: RSI oversold ${r.toFixed(1)} but MACD strongly bearish`], rsi:r };
+      }
+      const _ahScore = 20 + (30 - r) * 2; // 20-80 based on how oversold
+      const _ahConf  = Math.min(85, 62 + (30 - r));
+      return { signal:'BUY', confidence:_ahConf, score:_ahScore, direction:'buy',
+               reasons:[`AH oversold RSI:${r.toFixed(1)} — mean reversion setup`], rsi:r };
+    }
+    if (r > 72) {
+      if (!CONFIG.shortsEnabled) {
+        return { signal:'HOLD', confidence:0, score:0, reasons:[`AH: RSI overbought but shorts disabled`], rsi:r };
+      }
+      const _ahE8 = ema(c5, 8), _ahE21 = ema(c5, 21);
+      const _ahMacdOk = _ahE8 <= _ahE21 * 1.005;
+      if (!_ahMacdOk) {
+        return { signal:'HOLD', confidence:0, score:0, reasons:[`AH: RSI overbought ${r.toFixed(1)} but MACD strongly bullish`], rsi:r };
+      }
+      const _ahScore = 20 + (r - 72) * 2;
+      const _ahConf  = Math.min(85, 62 + (r - 72));
+      return { signal:'SELL', confidence:_ahConf, score:_ahScore, direction:'sell',
+               reasons:[`AH overbought RSI:${r.toFixed(1)} — mean reversion setup`], rsi:r };
+    }
+    // Neutral after-hours — no trade
+    return { signal:'HOLD', confidence:0, score:0, reasons:[`AH: RSI neutral ${r.toFixed(1)} — no after-hours edge`], rsi:r };
+  }
+
   if (r < _rsiOs) {
     // Falling knife: skip after-hours (bars are stale from yesterday's close)
     if (isFallingKnife && !_isCryptoSym && !_afterHours) {
@@ -5427,9 +5466,8 @@ function generateSignal(sym, bars5m, bars15m) {
   const avgVol  = vol.slice(-20).reduce((a,b)=>a+b,0) / Math.min(20, vol.length);
   const curVol  = vol[vol.length-1];
   const volRatio = avgVol > 0 ? curVol / avgVol : 1;
-  if (volRatio < 0.4) {
-    // Hard block on very low volume — applies in sim too
-    // Sim bars during off-hours have near-zero volume = stale/unreliable
+  if (volRatio < 0.4 && !_afterHours && !_isCryptoSym) {
+    // Hard block on very low volume during market hours (not crypto/after-hours)
     return { signal: 'HOLD', confidence: 0, score: 0,
       reasons: [...reasons, `Volume very low (${volRatio.toFixed(1)}x avg) — no conviction`], rsi: r };
   }
@@ -5438,23 +5476,22 @@ function generateSignal(sym, bars5m, bars15m) {
   else { reasons.push(`Volume low (${volRatio.toFixed(1)}x)`); }
 
   // ── GATE 5: 15-minute timeframe — HARD GATE ───────────────────
-  // 15min must agree with 5min direction. Multi-timeframe confluence
-  // is the most reliable filter against bad entries.
-  if (c15 && c15.length >= 15) {
+  // Skip after-hours: 15min EMA shows yesterday's trend, not current
+  if (!_afterHours && !_isCryptoSym && c15 && c15.length >= 15) {
     const r15    = rsi(c15, CONFIG.rsiPeriod);
     const e8_15  = ema(c15, 8), e21_15 = ema(c15, 21);
     const price15 = c15[c15.length - 1];
-    const bull15 = e8_15 > e21_15;   // 15m EMA bullish
-    const bear15 = e8_15 < e21_15;   // 15m EMA bearish
+    const bull15 = e8_15 > e21_15;
+    const bear15 = e8_15 < e21_15;
     const rsiAgrees15 = (direction === 'buy' && r15 < 70) ||
                         (direction === 'sell' && r15 > 30);
     if (direction === 'buy' && (!bull15 || !rsiAgrees15)) {
       return { signal:'HOLD', confidence:0, score:0,
-        reasons:[...reasons, `15min disagrees with long (e8_15=${e8_15.toFixed(2)} vs e21_15=${e21_15.toFixed(2)}, RSI15=${r15.toFixed(0)})`], rsi:r };
+        reasons:[...reasons, `15min disagrees with long (RSI15=${r15.toFixed(0)})`], rsi:r };
     }
     if (direction === 'sell' && (!bear15 || !rsiAgrees15)) {
       return { signal:'HOLD', confidence:0, score:0,
-        reasons:[...reasons, `15min disagrees with short (e8_15=${e8_15.toFixed(2)} vs e21_15=${e21_15.toFixed(2)}, RSI15=${r15.toFixed(0)})`], rsi:r };
+        reasons:[...reasons, `15min disagrees with short (RSI15=${r15.toFixed(0)})`], rsi:r };
     }
     reasons.push(`15min ${direction==='buy'?'bullish':'bearish'} confirmed ✅`);
     passedGates++;
@@ -5463,8 +5500,9 @@ function generateSignal(sym, bars5m, bars15m) {
   // ── GATE 6: ADX — trend strength (soft gate) ──
   const adxData = adx(bars5m);
   if (adxData.adx > 0) {
-    if (adxData.adx < 15) {
-      // Weak ADX = no trend = choppy = bad entries in both sim and live
+    if (adxData.adx < 15 && !_afterHours && !_isCryptoSym) {
+      // Weak ADX during market hours = choppy = bad entry
+      // After-hours: ADX is always low (flat bars) — don't block
       return { signal: 'HOLD', confidence: 0, score: 0,
         reasons: [...reasons, `ADX ${adxData.adx.toFixed(0)} < 15 — market choppy, no trend`], rsi: r };
     }
