@@ -11121,8 +11121,8 @@ http.createServer(async (req, res) => {
 
 }).listen(process.env.PORT || 3000, () => {
   log('sys', `Server on port ${process.env.PORT || 3000}`);
-  log('sys', `Health check: https://tradecore-q1ll.onrender.com/`);
-  log('sys', `Discord endpoint: https://tradecore-q1ll.onrender.com/discord`);
+  log('sys', `Health check: https://tradecore-cyvw.onrender.com/`);
+  log('sys', `Discord endpoint: https://tradecore-cyvw.onrender.com/discord`);
 
 // ── Self-ping to prevent Render/Railway free tier sleep ──────────
 // Pings the bot's own /health endpoint every 10 minutes
@@ -11140,7 +11140,7 @@ if (SELF_URL) {
   }, 10 * 60 * 1000); // every 10 minutes
   log('sys', `🏓 Self-ping enabled → ${SELF_URL}/health`);
 }
-  log('sys', `Register commands: https://tradecore-q1ll.onrender.com/setup-discord`);
+  log('sys', `Register commands: https://tradecore-cyvw.onrender.com/setup-discord`);
   if (CONFIG.discordPublicKey) log('sys', `Discord signature verification: ✅ enabled`);
   else log('warn', `Discord signature verification: ⚠ DISCORD_PUBLIC_KEY not set`);
 });
