@@ -1207,7 +1207,7 @@
   <div class="config-panel" id="configPanel">
     <div class="config-field">
       <label>Bot Base URL</label>
-      <input type="text" id="botUrl" placeholder="https://tradecore-q1ll.onrender.com" />
+      <input type="text" id="botUrl" placeholder="https://tradecore-cyvw.onrender.com" />
     </div>
     <div class="config-field">
       <label>Supabase URL</label>
@@ -1800,7 +1800,7 @@
         <div class="settings-section" style="grid-column: 1 / -1;">
           <div class="settings-section-title">🔌 Connection</div>
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end;">
-            <div class="config-field"><label>Bot Base URL (Railway)</label><input type="text" id="setBotUrl" class="settings-input" style="width:100%;text-align:left;" placeholder="https://tradecore-q1ll.onrender.com"></div>
+            <div class="config-field"><label>Bot Base URL (Railway)</label><input type="text" id="setBotUrl" class="settings-input" style="width:100%;text-align:left;" placeholder="https://tradecore-cyvw.onrender.com"></div>
             <div class="config-field"><label>Supabase URL</label><input type="text" id="setSbUrl" class="settings-input" style="width:100%;text-align:left;" placeholder="https://xxxx.supabase.co"></div>
             <div class="config-field"><label>Supabase Anon Key</label><input type="password" id="setSbKey" class="settings-input" style="width:100%;text-align:left;" placeholder="eyJ..."></div>
             <button class="btn btn-accent" onclick="saveConnectionSettings()">Connect</button>
@@ -1885,10 +1885,10 @@ let CONFIG = {
     const stored = localStorage.getItem('botUrl') || '';
     // Clear stale Railway URL — always use Render
     if (stored.includes('railway.app')) {
-      localStorage.setItem('botUrl', 'https://tradecore-q1ll.onrender.com');
-      return 'https://tradecore-q1ll.onrender.com';
+      localStorage.setItem('botUrl', 'https://tradecore-cyvw.onrender.com');
+      return 'https://tradecore-cyvw.onrender.com';
     }
-    return stored || 'https://tradecore-q1ll.onrender.com';
+    return stored || 'https://tradecore-cyvw.onrender.com';
   })(),
   sbUrl:  localStorage.getItem('sbUrl')  || '',
   sbKey:  localStorage.getItem('sbKey')  || '',
@@ -3366,9 +3366,9 @@ let _livePriceFeedActive = false;
 let _livePriceInterval   = null;
 // BOT_URL resolves from config — always use current value
 function getBotUrl() {
-  return CONFIG?.botUrl?.trim().replace(/\/$/,'') || 'https://tradecore-q1ll.onrender.com';
+  return CONFIG?.botUrl?.trim().replace(/\/$/,'') || 'https://tradecore-cyvw.onrender.com';
 }
-const BOT_URL = 'https://tradecore-q1ll.onrender.com'; // fallback constant
+const BOT_URL = 'https://tradecore-cyvw.onrender.com'; // fallback constant
 
 async function startLivePriceFeed() {
   if (_livePriceFeedActive) return;
@@ -4220,7 +4220,7 @@ function init() {
   setInterval(updateClock, 1000);
   initMobileLayout();
   // Expose bot URL globally so chart.js can use it for proxied requests
-  window.ALPHACORE_BOT_URL = CONFIG.botUrl || 'https://tradecore-q1ll.onrender.com';
+  window.ALPHACORE_BOT_URL = CONFIG.botUrl || 'https://tradecore-cyvw.onrender.com';
   startLivePriceFeed(); // 1s live price updates from bot
   // Init chart after DOM is painted
   requestAnimationFrame(() => setTimeout(() => {
@@ -4306,7 +4306,7 @@ init();
     btn.style.pointerEvents = 'none';
 
     try {
-      const base = (CONFIG.botUrl || 'https://tradecore-q1ll.onrender.com').replace(/\/+$/, '');
+      const base = (CONFIG.botUrl || 'https://tradecore-cyvw.onrender.com').replace(/\/+$/, '');
       const r    = await fetch(`${base}/exit-all`, {signal: AbortSignal.timeout(15000)});
       const data = await r.json().catch(() => ({}));
       if (data.ok) {
