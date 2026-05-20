@@ -237,7 +237,7 @@ class StockChart {
       const _rawBotUrl = window.ALPHACORE_BOT_URL || '';
       const botUrl = _rawBotUrl.startsWith('http')
         ? _rawBotUrl.replace(/\/+$/, '')
-        : 'https://tradecore-q1ll.onrender.com';
+        : 'https://tradecore-cyvw.onrender.com';
 
       const yUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=1d`;
       let json   = null;
@@ -301,7 +301,7 @@ class StockChart {
       this._liveInterval = setInterval(async () => {
         if (this._liveSym !== sym) { clearInterval(this._liveInterval); return; }
         try {
-          const botUrl = (window.ALPHACORE_BOT_URL || 'https://tradecore-q1ll.onrender.com').replace(/\/+$/, '');
+          const botUrl = (window.ALPHACORE_BOT_URL || 'https://tradecore-cyvw.onrender.com').replace(/\/+$/, '');
           // Use /prices endpoint for current price
           const pr = await fetch(`${botUrl}/prices`, {signal: AbortSignal.timeout(3000)});
           if (!pr.ok) return;
