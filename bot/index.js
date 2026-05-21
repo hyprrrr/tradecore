@@ -5218,7 +5218,11 @@ function generateSignal(sym, bars5m, bars15m) {
   bars5m = bars5m.filter(b => Number.isFinite(b.c) && Number.isFinite(b.h) && Number.isFinite(b.l));
   if (bars5m.length < 20) return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Not enough valid bars after NaN filter'], rsi: 50 };
 
-  const c5    = bars5m.map(b => b.c).filter(v => Number.isFinite(v));
+  const c5raw = bars5m.map(b => b.c);
+  const c5    = c5raw.filter(v => Number.isFinite(v));
+  if (_isCryptoSym && c5.length < 20) {
+    log('warn', `🪙 ${sym} c5 too short: raw=${c5raw.length} filtered=${c5.length} sample=${JSON.stringify(c5raw.slice(0,3))}`);
+  }
   const c15   = bars15m?.length >= 20 ? bars15m.map(b => b.c) : null;
   const vol   = bars5m.map(b => +b.v || 0);
   const highs = bars5m.map(b => b.h);
@@ -8138,8 +8142,9 @@ async function runScan() {
     try {
       // Skip benched symbols at source (saves bar fetches + signal CPU)
       if (isSymbolBenched(sym) && !positions[sym] && !shortPositions[sym]) continue;
-      // Skip cheap stocks — wide spreads kill R ratio (unless we're already in position)
-      if (!isCrypto(sym) && price > 0 && price < CONFIG.minPrice && !positions[sym] && !shortPositions[sym]) continue;
+      // Skip cheap stocks — use live price cache (price var not yet declared here)
+      const _earlyPrice = alpacaLivePrice?.[sym] || 0;
+      if (!isCrypto(sym) && _earlyPrice > 0 && _earlyPrice < CONFIG.minPrice && !positions[sym] && !shortPositions[sym]) continue;
 
       // Boost signal if news scanner flagged this symbol
       const newsHit = _newsSignals[sym];
@@ -8151,9 +8156,18 @@ async function runScan() {
         : '[US stock]';
 
       // Use cached bars from parallel prefetch
-      // Never use fetchBarsCached for crypto — it hits the stock endpoint
-      const bars5m  = barData5m[sym]  || (isCrypto(sym) ? null : await fetchBarsCached(sym, '5Min',  60));
-      const bars15m = barData15m[sym] || (isCrypto(sym) ? null : await fetchBarsCached(sym, '15Min', 40));
+      // Crypto: always read fresh from barCache (Kraken-fetched), never stock fallback
+      let bars5m, bars15m;
+      if (isCrypto(sym)) {
+        const cc5  = barCache.get(`${sym}_5Min`);
+        const cc15 = barCache.get(`${sym}_15Min`);
+        bars5m  = cc5?.bars  || null;
+        bars15m = cc15?.bars || null;
+        if (!bars5m) log('warn', `🪙 ${sym} barCache miss — Kraken not fetched yet`);
+      } else {
+        bars5m  = barData5m[sym]  || await fetchBarsCached(sym, '5Min',  60);
+        bars15m = barData15m[sym] || await fetchBarsCached(sym, '15Min', 40);
+      }
       // PMRB: capture 8AM candle from 15m bars whenever we have them
       if (bars15m?.length >= 2) capturePMRBRange(sym, bars15m).catch(() => {});
       if (bars5m?.length  >= 50) capture4HRange(sym, bars5m); // 4HR strategy
