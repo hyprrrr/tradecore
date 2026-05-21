@@ -71,7 +71,8 @@ const CONFIG = {
   startingCapital:  +(process.env.CAPITAL          || 100000),
   maxPositionPct:   +(process.env.MAX_POSITION_PCT  || 15) / 100,
   maxOpenPositions: +(process.env.MAX_POSITIONS     || 3),
-  stopLossPct:      +(process.env.STOP_LOSS_PCT     || 4)  / 100,
+  stopLossPct:      +(process.env.STOP_LOSS_PCT     || 2.5)/ 100, // 2.5% default — tighter R ratio
+  minPrice:         15,    // skip sub-$15 stocks — wide spreads kill R ratio
   takeProfitPct:    +(process.env.TAKE_PROFIT_PCT   || 8)  / 100,
   trailingStop:     process.env.TRAILING_STOP       !== 'false',
   trailingStopPct:  +(process.env.TRAILING_STOP_PCT || 3)  / 100,
@@ -5036,10 +5037,12 @@ function signalBBDivergence(sym, bars5m, bars15m) {
 }
 
 function generateSignalByStrategy(sym, bars5m, bars15m) {
+  // Crypto always uses the main RSI/MACD path — other strategies aren't calibrated for $77k prices
+  if (isCrypto(sym)) return null;
+
   // _activeStrategy is set by auto-switcher each scan; falls back to CONFIG.strategy
-  // Guarantee strategy is never null — rsi_macd is always the fallback
   const strategy = CONFIG._activeStrategy || CONFIG.strategy || 'rsi_macd';
-  if (!CONFIG._activeStrategy) CONFIG._activeStrategy = strategy; // cache for edge gate
+  if (!CONFIG._activeStrategy) CONFIG._activeStrategy = strategy;
 
   switch(strategy) {
     case 'smc':            return signalSMC(sym, bars5m, bars15m);
@@ -5278,12 +5281,6 @@ function generateSignal(sym, bars5m, bars15m) {
   const _rsiOb = _isCryptoSym ? 54 : CONFIG.rsiOverbought;
 
   const _afterHours = !isMarketOpen();
-
-  // Debug: log first crypto signal computation
-  if (_isCryptoSym) {
-    const _dbgRsi = rsi(c5.slice(0,50), CONFIG.rsiPeriod);
-    log('data', `🪙 ${sym} signal debug: bars=${bars5m.length} c5len=${c5.length} c5[0]=${c5[0]} c5last=${c5[c5.length-1]} rsi=${_dbgRsi} type=${typeof c5[0]}`);
-  }
 
   // ── AFTER-HOURS FAST PATH ────────────────────────────────────
   // After market close, most gates use stale bars that produce false signals:
@@ -8141,6 +8138,8 @@ async function runScan() {
     try {
       // Skip benched symbols at source (saves bar fetches + signal CPU)
       if (isSymbolBenched(sym) && !positions[sym] && !shortPositions[sym]) continue;
+      // Skip cheap stocks — wide spreads kill R ratio (unless we're already in position)
+      if (!isCrypto(sym) && price > 0 && price < CONFIG.minPrice && !positions[sym] && !shortPositions[sym]) continue;
 
       // Boost signal if news scanner flagged this symbol
       const newsHit = _newsSignals[sym];
