@@ -70,7 +70,7 @@ const CONFIG = {
 
   startingCapital:  +(process.env.CAPITAL          || 100000),
   maxPositionPct:   +(process.env.MAX_POSITION_PCT  || 15) / 100,
-  maxOpenPositions: +(process.env.MAX_POSITIONS     || 3),
+  maxOpenPositions: +(process.env.MAX_POSITIONS     || 2),  // max 2 concurrent positions
   stopLossPct:      +(process.env.STOP_LOSS_PCT     || 2.5)/ 100, // 2.5% default — tighter R ratio
   minPrice:         15,    // skip sub-$15 stocks — wide spreads kill R ratio
   takeProfitPct:    +(process.env.TAKE_PROFIT_PCT   || 8)  / 100,
@@ -6669,6 +6669,20 @@ const _coverInFlight  = new Set();
 const _recentlyCovered = {}; // sym → timestamp, blocks re-cover within 60s
 
 async function coverShort(sym, price, reason) {
+  // Sync qty from Alpaca before covering to prevent "insufficient qty" errors
+  if (shortPositions[sym]) {
+    try {
+      const ap = await alpacaFetch(`${ALPACA_BASE}/v2/positions/${encodeURIComponent(sym)}`).catch(() => null);
+      if (ap) {
+        const aqty = Math.abs(+(ap.qty || 0));
+        if (aqty === 0) { delete shortPositions[sym]; log('sys', `🔧 ${sym} already flat on Alpaca`); return; }
+        if (aqty !== shortPositions[sym].qty) {
+          log('sys', `🔧 ${sym} qty sync ${shortPositions[sym].qty}→${aqty}`);
+          shortPositions[sym].qty = aqty;
+        }
+      }
+    } catch(e) {}
+  }
   const pos = shortPositions[sym];
   if (!pos) return;
   if (_coverInFlight.has(sym)) {
@@ -8085,6 +8099,7 @@ async function runScan() {
 
   log('scan', `Scan rotation: ${symbolsToScan.length}/${eligible.length} symbols this cycle`);
   log('scan', `═══ ${session} — Scanning ${symbolsToScan.length} symbols ═══`);
+  _confirmationsThisCycle = 0; // reset per-cycle entry limit
   await syncLog('sys', `Scan started — ${session} — ${symbolsToScan.length}/${eligible.length} symbols (rotating)`);
 
   // Always sync real-time prices BEFORE managing positions
@@ -9813,6 +9828,7 @@ async function spreadIsAcceptable(symbol, price) {
 // Eliminates single-candle spikes that look like signals but reverse
 // immediately. The most effective false-positive filter possible.
 const pendingSignals = new Map(); // sym → { signal, count, sigInfo }
+let _confirmationsThisCycle = 0;  // reset each scan to limit burst entries
 
 function confirmSignal(sym, sig) {
   if (sig.signal === 'HOLD') {
@@ -9831,7 +9847,20 @@ function confirmSignal(sym, sig) {
 
     if (prev.count >= required) {
       pendingSignals.delete(sym);
-      log('signal', `✅ ${sym} signal CONFIRMED after ${prev.count} scans → ${sig.signal} (conf:${sig.confidence}%)`);
+      // Final confidence check
+      const minConf = CONFIG.minConfidence || 62;
+      if (sig.confidence < minConf) {
+        log('signal', `⛔ ${sym} conf:${sig.confidence}% < min:${minConf}% — rejected`);
+        return false;
+      }
+      // Per-cycle entry limit — max 1 new trade per scan cycle
+      if (_confirmationsThisCycle >= 1) {
+        log('signal', `⏸ ${sym} confirmed but entry limit reached this cycle — queuing next scan`);
+        pendingSignals.set(sym, { signal: sig.signal, count: required, sigInfo: sig }); // re-add so it fires next cycle
+        return false;
+      }
+      _confirmationsThisCycle++;
+      log('signal', `✅ ${sym} CONFIRMED → ${sig.signal} (conf:${sig.confidence}%)`);
       return true;
     }
     log('signal', `⏳ ${sym} ${sig.signal} pending (${prev.count}/${required})`);
