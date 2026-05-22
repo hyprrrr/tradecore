@@ -5214,15 +5214,13 @@ async function runMomentumScanner(symbols, barData5m) {
 
 function generateSignal(sym, bars5m, bars15m) {
   if (!bars5m || bars5m.length < 30) return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Need 30+ bars'], rsi: 50 };
+  // Declare early — used throughout the function
+  const _isCryptoSym = isCrypto(sym);
   // Pre-filter: remove bars with null/NaN close prices (Yahoo sometimes returns these)
   bars5m = bars5m.filter(b => Number.isFinite(b.c) && Number.isFinite(b.h) && Number.isFinite(b.l));
   if (bars5m.length < 20) return { signal: 'HOLD', confidence: 0, score: 0, reasons: ['Not enough valid bars after NaN filter'], rsi: 50 };
 
-  const c5raw = bars5m.map(b => b.c);
-  const c5    = c5raw.filter(v => Number.isFinite(v));
-  if (_isCryptoSym && c5.length < 20) {
-    log('warn', `🪙 ${sym} c5 too short: raw=${c5raw.length} filtered=${c5.length} sample=${JSON.stringify(c5raw.slice(0,3))}`);
-  }
+  const c5 = bars5m.map(b => b.c).filter(v => Number.isFinite(v));
   const c15   = bars15m?.length >= 20 ? bars15m.map(b => b.c) : null;
   const vol   = bars5m.map(b => +b.v || 0);
   const highs = bars5m.map(b => b.h);
@@ -5265,8 +5263,7 @@ function generateSignal(sym, bars5m, bars15m) {
 
   // ── GATE 1: RSI must be in meaningful territory ──
   const r = rsi(c5, CONFIG.rsiPeriod);
-  // Crypto uses wider RSI bands (more volatile, 24/7, different dynamics)
-  const _isCryptoSym = isCrypto(sym);
+  // _isCryptoSym declared at top of function
   let rsiScore = 0;
 
   // Detect if this is a trending day vs mean-reversion day
