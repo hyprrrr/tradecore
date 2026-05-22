@@ -5281,7 +5281,14 @@ function generateSignal(sym, bars5m, bars15m) {
   const _rsiOs = _isCryptoSym ? 48 : CONFIG.rsiOversold;
   const _rsiOb = _isCryptoSym ? 54 : CONFIG.rsiOverbought;
 
-  const _afterHours = !isMarketOpen();
+  // Check actual clock time for after-hours logic — ignore BYPASS_HOURS
+  // BYPASS_HOURS makes isMarketOpen()=true even at 3am, breaking AH fast path
+  const _etNow   = getETTime();
+  const _etMins  = _etNow.getHours() * 60 + _etNow.getMinutes();
+  const _etDay   = _etNow.getDay();
+  const _isWeekday = _etDay >= 1 && _etDay <= 5;
+  const _trueMarketOpen = _isWeekday && _etMins >= 9*60+30 && _etMins < 16*60;
+  const _afterHours = !_trueMarketOpen;
 
   // ── AFTER-HOURS FAST PATH ────────────────────────────────────
   // After market close, most gates use stale bars that produce false signals:
@@ -8160,7 +8167,28 @@ async function runScan() {
         const cc15 = barCache.get(`${sym}_15Min`);
         bars5m  = cc5?.bars  || null;
         bars15m = cc15?.bars || null;
-        if (!bars5m) log('warn', `🪙 ${sym} barCache miss — Kraken not fetched yet`);
+        if (!bars5m) {
+          log('warn', `🪙 ${sym} barCache miss — fetching now`);
+          // Fetch synchronously as fallback
+          try {
+            const fetch = await getFetch();
+            const KRAKEN_MAP = { BTCUSD: 'XBTUSD', ETHUSD: 'ETHUSD' };
+            const krakenSym = KRAKEN_MAP[sym] || sym;
+            const since = Math.floor((Date.now() - 2*24*60*60*1000) / 1000);
+            const res = await fetch(`https://api.kraken.com/0/public/OHLC?pair=${krakenSym}&interval=5&since=${since}`, { signal: AbortSignal.timeout(8000) });
+            const json = await res.json();
+            const pairKey = Object.keys(json.result || {}).find(k => k !== 'last');
+            const ohlc = json.result?.[pairKey] || [];
+            const freshBars = ohlc.map(k => ({ t: new Date(k[0]*1000).toISOString(), o:+k[1], h:+k[2], l:+k[3], c:+k[4], v:+k[6] })).filter(b => isFinite(b.c) && b.c > 0);
+            if (freshBars.length >= 15) {
+              barCache.set(`${sym}_5Min`,  { bars: freshBars, ts: Date.now() });
+              barCache.set(`${sym}_15Min`, { bars: freshBars.filter((_,i) => i%3===0), ts: Date.now() });
+              bars5m  = freshBars;
+              bars15m = freshBars.filter((_,i) => i%3===0);
+              log('data', `🪙 ${sym} fallback fetch: ${freshBars.length} bars`);
+            }
+          } catch(e) { log('warn', `🪙 ${sym} fallback fetch failed: ${e.message?.slice(0,50)}`); }
+        }
       } else {
         bars5m  = barData5m[sym]  || await fetchBarsCached(sym, '5Min',  60);
         bars15m = barData15m[sym] || await fetchBarsCached(sym, '15Min', 40);
