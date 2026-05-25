@@ -971,7 +971,8 @@ function apexFilter(sig, ctx = {}) {
   if (!APEX.rules.length) return sig;
   let confBoost = 0;
   let blocked   = null;
-  let minConf   = CONFIG.minConfidence || 62;
+  // Crypto uses lower minConf — 24/7 market, different confidence dynamics
+  let minConf = (ctx.sym && isCrypto(ctx.sym)) ? 50 : (CONFIG.minConfidence || 62);
   const hour    = new Date().getHours();
   const hourBand = hour < 10 ? 'open' : hour < 12 ? 'mid-am' : hour < 14 ? 'lunch' : hour < 16 ? 'pm' : 'after';
 
@@ -9841,9 +9842,8 @@ function confirmSignal(sym, sig) {
     prev.sigInfo = sig;
     pendingSignals.set(sym, prev);
 
-    // Require 2 consecutive scans for longs, 3 for shorts
-    // Enough to filter noise without missing the move
-    const required = sig.signal === 'SELL' ? 3 : 2;
+    // Require 2 consecutive scans for longs, 3 for shorts (2 for crypto)
+    const required = (sig.signal === 'SELL' && !isCrypto(sym)) ? 3 : 2;
 
     if (prev.count >= required) {
       pendingSignals.delete(sym);
@@ -9867,7 +9867,7 @@ function confirmSignal(sym, sig) {
     return false;
   }
   // First time seeing this signal — store it, require one more scan to confirm
-  const required = sig.signal === 'SELL' ? 3 : 2;
+  const required = (sig.signal === 'SELL' && !isCrypto(sym)) ? 3 : 2;
   pendingSignals.set(sym, { signal: sig.signal, count: 1, sigInfo: sig });
   log('signal', `⏳ ${sym} new signal (${sig.signal} conf:${sig.confidence}%) — need ${required - 1} more confirmation`);
   return false;
