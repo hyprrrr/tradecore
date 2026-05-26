@@ -5589,9 +5589,13 @@ function generateSignal(sym, bars5m, bars15m) {
   const isAfterHours = !isMarketOpen();
   const minGates = c15 ? (isAfterHours ? 4 : 5) : (isAfterHours ? 3 : 4);
   const score    = passedGates * 10 + bonus * 5 + rsiScore * 5 + macdScore * 5 + volScore * 3;
-  const confidence = Math.min(99, Math.round((passedGates / (minGates + 2)) * 100));
+  // Crypto confidence based on score, not gate count (gates don't apply to crypto)
+  const confidence = _isCryptoSym
+    ? Math.min(99, Math.max(51, Math.round(50 + score * 2)))
+    : Math.min(99, Math.round((passedGates / (minGates + 2)) * 100));
 
-  if (passedGates < minGates) {
+  // Crypto: skip minGates check — crypto has fewer reliable indicators
+  if (!_isCryptoSym && passedGates < minGates) {
     reasons.push(`Only ${passedGates}/${minGates} gates passed — need more confluence`);
     return { signal: 'HOLD', confidence, score, reasons, rsi: r };
   }
@@ -9847,8 +9851,8 @@ function confirmSignal(sym, sig) {
 
     if (prev.count >= required) {
       pendingSignals.delete(sym);
-      // Final confidence check
-      const minConf = CONFIG.minConfidence || 62;
+      // Final confidence check — crypto gets lower threshold (24/7, fewer signals)
+      const minConf = isCrypto(sym) ? 50 : (CONFIG.minConfidence || 62);
       if (sig.confidence < minConf) {
         log('signal', `⛔ ${sym} conf:${sig.confidence}% < min:${minConf}% — rejected`);
         return false;
