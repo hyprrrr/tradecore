@@ -6310,8 +6310,17 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   // ── CONFLICT GUARD: no opposite-direction position on same symbol ──
   // Prevents bot from being long + short RBLX simultaneously (proven to
   // net to zero while burning commission on both sides)
+  // Block same-direction re-entry (prevents position stacking like SLV x450)
+  if (direction === 'long' && (positions[sym] || alpacaPositions.has(sym))) {
+    log('risk', `🚫 ${sym} — already LONG, blocking duplicate long entry`);
+    return;
+  }
   if (direction === 'long' && (shortPositions[sym] || alpacaShorts.has(sym))) {
     log('risk', `🚫 ${sym} — already SHORT, blocking LONG entry (no hedging)`);
+    return;
+  }
+  if (direction === 'short' && (shortPositions[sym] || alpacaShorts.has(sym))) {
+    log('risk', `🚫 ${sym} — already SHORT, blocking duplicate short entry`);
     return;
   }
   if (direction === 'short' && (positions[sym] || alpacaPositions.has(sym))) {
