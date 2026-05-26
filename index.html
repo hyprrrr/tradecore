@@ -10,6 +10,7 @@
   <meta name="theme-color" content="#07070b" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="apple-touch-icon" href="/icon-192.png" />
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
   <script src="chart.js"></script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ALPHACORE // Trading Bot Command Center</title>
@@ -1303,7 +1304,7 @@
         </div>
       </div>
       <div class="chart-canvas-wrap" id="chartWrap">
-        <div id="equityCanvas"></div>
+        <div id="equityCanvas" style="width:100%;height:100%;min-height:280px;"></div>
       </div>
     </section>
 
@@ -3086,12 +3087,10 @@ const chart = { tf: '1H', allCandles: [], _inst: null };
 let _liveCandleLastBucketKey = 0;
 
 function _equityChart() {
+  if (chart._inst && chart._inst.series && chart._inst.chart) {
+    return chart._inst;
+  }
   if (chart._inst) {
-    // Verify it has a candlestick series (not area from old cached version)
-    if (chart._inst.series && typeof chart._inst.series.priceScale === 'function') {
-      return chart._inst;
-    }
-    // Wrong series type — destroy and recreate
     try { chart._inst.chart?.remove(); } catch(e) {}
     chart._inst = null;
   }
@@ -3505,10 +3504,10 @@ async function renderCalendar() {
   let trades = [];
   try {
     const data = await sbFetch(
-      `${tbl}?select=pnl,created_at&created_at=gte.${startDate}T00:00:00&created_at=lte.${endDate}T23:59:59&pnl=not.is.null&order=created_at.asc`,
+      `${tbl}?select=pnl,created_at&created_at=gte.${startDate}&created_at=lte.${endDate}T23:59:59.999Z&order=created_at.asc&limit=500`,
       'GET'
     );
-    if (Array.isArray(data)) trades = data;
+    if (Array.isArray(data)) trades = data.filter(t => t.pnl != null);
   } catch(e) {}
 
   // Group P&L by day
