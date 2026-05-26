@@ -1303,8 +1303,8 @@
           </div>
         </div>
       </div>
-      <div class="chart-canvas-wrap" id="chartWrap">
-        <div id="equityCanvas" style="width:100%;height:100%;min-height:280px;"></div>
+      <div class="chart-canvas-wrap" id="chartWrap" style="position:relative;height:320px;min-height:320px;">
+        <div id="equityCanvas" style="width:100%;height:320px;position:absolute;top:0;left:0;right:0;bottom:0;"></div>
       </div>
     </section>
 
@@ -3048,33 +3048,8 @@ function renderEquityChart(snapshots) {
 
   const inst = _equityChart();
   if (inst) {
-    // buildCandlesForTF now returns Unix seconds directly (not Date objects)
-    const seen = new Set();
-    const data = chart.allCandles
-      .map(c => {
-        const t = typeof c.time === 'number' ? c.time
-                : c.time instanceof Date ? Math.floor(c.time.getTime()/1000)
-                : Math.floor(+c.time/1000);
-        const close = +c.close || +c.value || 0;
-        const open  = +c.open  || close;
-        const high  = +c.high  || Math.max(open, close);
-        const low   = +c.low   || Math.min(open, close);
-        return { time: t, open, high: high===low?high*1.00005:high, low: high===low?low*0.99995:low, close };
-      })
-      .filter(c => isFinite(c.close) && c.close > 0 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
-      .sort((a,b) => a.time - b.time);
-
-    if (!data.length) return;
-    if (inst.series) { try { inst.series.setData(data); } catch(e) { console.warn('Chart setData:', e); } }
-    if (inst.ema) {
-      const k = 2/21; let e = data[0].close;
-      const emaData = data.map((d,i) => { e = i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; });
-      inst.ema.setData(emaData);
-    }
-    if (inst.chart) {
-      inst.chart.applyOptions({ rightPriceScale: { scaleMargins: { top: 0.1, bottom: 0.1 } } });
-      inst.chart.timeScale().fitContent(); // show full equity curve
-    }
+    // Use EquityChart.setData() — handles all OHLC mapping internally
+    inst.setData(chart.allCandles);
     setTimeout(tickLiveCandle, 500);
   }
 }
