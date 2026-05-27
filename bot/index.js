@@ -5930,7 +5930,7 @@ function calcQty(symbol, price, bars, confidence = 70) {
     ? totalWins / (totalWins + totalLosses)
     : 0.5;
   const wrMult = recentWR >= 0.60 ? 1.0 : recentWR >= 0.50 ? 0.85 : recentWR >= 0.40 ? 0.65 : 0.45;
-  const confScale  = Math.max(0.4, Math.min(1.0, (confidence - CONFIG.minConfidence) / 30 + 0.5)) * wrMult;
+  const confScale  = Math.max(0.6, Math.min(1.0, (confidence - CONFIG.minConfidence) / 30 + 0.6)) * wrMult;
   const scaledPct  = cappedMaxPos * confScale;
   const maxCost    = baseCap * scaledPct;              // hard dollar cap
   const maxShares  = Math.floor(maxCost / price);
@@ -6394,7 +6394,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
     }
   }
   const cost = qty * price;
-  if (qty < 1) { log('warn', `Cannot enter ${sym}: qty too small`); return; }
+  if (qty < 3) { log('warn', `Cannot enter ${sym}: qty too small (${qty})`); return; }
 
   // Sanity check: max dollar loss at hardMaxLoss must be < 2% of portfolio
   // If position size would create a loss > this, reduce qty
@@ -6862,7 +6862,8 @@ async function manageShort(sym, price, bars) {
   if (!pos.tp1Hit && chg >= CONFIG.tp1Pct) {
     const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.33));
     shortPositions[sym].tp1Hit = true;
-    await coverPartialShort(sym, price, sell, 'TP1');
+    log('cover', `🎯 SHORT TP1 +${(hwChg*100).toFixed(1)}%: full cover ${shortPositions[sym].qtyRemaining || shortPositions[sym].qty}x ${sym}`);
+    return coverShort(sym, price, 'TAKE_PROFIT_1');
     return;
   }
   // TP2 — cover 50% of remainder at tp2Pct
@@ -7988,26 +7989,16 @@ async function managePosition(sym, price, bars) {
     }
   }
 
-  // ── Take profit tiers ──
-  // Partial sizing tuned for risk reduction: take MORE off at TP1 so the
-  // remaining shares stopping out (1% loss) is a smaller absolute dollar
-  // hit. Diag showed avg STOP_LOSS = -$70 vs avg TP1 = +$20 (R-ratio 0.36)
-  // because only 25% was taken at TP1, leaving 75% to ride the stop.
-  // Now: 40% at TP1, 35% at TP2, 25% at TP3. Avg loss should drop ~40%.
+  // ── Take profit — single full exit at TP1 ──
+  // Clean single entry + single exit (no partial fills cluttering the chart)
   if (!pos.tp1Hit && chg >= effectiveTP1) {
-    const sell = Math.max(1, Math.floor(pos.qtyRemaining * 0.40)); // was 0.25
     positions[sym].tp1Hit = true;
-    log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}% (dyn ${(effectiveTP1*100).toFixed(1)}%): selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
-    await partialExit(sym, price, sell, 'TP1');
-    if (!positions[sym]) return;
-    return;
+    log('sell', `🎯 TP1 +${(chg*100).toFixed(1)}%: full exit ${pos.qtyRemaining}x ${sym} @ $${price.toFixed(2)}`);
+    return closePosition(sym, price, 'TAKE_PROFIT_1');
   }
   if (pos.tp1Hit && !pos.tp2Hit && chg >= effectiveTP2) {
-    const sell = Math.max(1, Math.floor(positions[sym].qtyRemaining * 0.55)); // was 0.5
     positions[sym].tp2Hit = true;
-    log('sell', `🎯🎯 TP2 +${(chg*100).toFixed(1)}% (dyn ${(effectiveTP2*100).toFixed(1)}%): selling ${sell}x ${sym} @ $${price.toFixed(2)}`);
-    await partialExit(sym, price, sell, 'TP2');
-    if (!positions[sym]) return;
+    log('sell', `🎯🎯 TP2 +${(chg*100).toFixed(1)}%: already exited at TP1`);
     return;
   }
   if (pos.tp1Hit && pos.tp2Hit && chg >= effectiveTP3) {
