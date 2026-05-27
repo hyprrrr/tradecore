@@ -11,7 +11,78 @@
   <link rel="manifest" href="/manifest.json" />
   <link rel="apple-touch-icon" href="/icon-192.png" />
   <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
-  <script src="chart.js"></script>
+  <script>
+  // ── AlphaCore Equity Chart ─────────────────────────────────────
+  class EquityChart {
+    constructor(containerId) {
+      this.el = document.getElementById(containerId);
+      this.chart = null; this.series = null; this.ema = null;
+      if (this.el) this._init();
+    }
+    _init() {
+      // Force explicit dimensions before LW Charts init
+      this.el.style.width  = '100%';
+      this.el.style.height = '100%';
+      const w = this.el.offsetWidth  || 800;
+      const h = this.el.offsetHeight || 320;
+      this.chart = LightweightCharts.createChart(this.el, {
+        width: w, height: h,
+        layout:     { background:{color:'transparent'}, textColor:'#9b9ea4' },
+        grid:       { vertLines:{color:'#1e2130'}, horzLines:{color:'#1e2130'} },
+        crosshair:  { mode: LightweightCharts.CrosshairMode.Normal },
+        rightPriceScale: { borderColor:'#2a2e39', scaleMargins:{top:0.1,bottom:0.1} },
+        timeScale:  { borderColor:'#2a2e39', timeVisible:true, secondsVisible:false },
+        handleScale:  true,
+        handleScroll: true,
+      });
+      this.series = this.chart.addCandlestickSeries({
+        upColor:'#2962ff', downColor:'#131722',
+        borderUpColor:'#2962ff', borderDownColor:'#ef5350',
+        wickUpColor:'#2962ff', wickDownColor:'#ef5350',
+        priceFormat:{ type:'price', precision:2, minMove:0.01 },
+      });
+      this.ema = this.chart.addLineSeries({
+        color:'rgba(245,197,24,0.7)', lineWidth:1, lineStyle:1,
+        priceLineVisible:false, lastValueVisible:false,
+      });
+      // Auto-resize
+      const ro = new ResizeObserver(() => {
+        if (this.el && this.chart) {
+          const w2 = this.el.offsetWidth, h2 = this.el.offsetHeight;
+          if (w2 > 0 && h2 > 0) this.chart.resize(w2, h2);
+        }
+      });
+      ro.observe(this.el);
+    }
+    setData(candles) {
+      if (!this.series || !candles?.length) return;
+      const seen = new Set();
+      const data = candles.map(c => {
+        const t = typeof c.time==='number' ? c.time : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time)/1000);
+        const cl = +c.close||+c.value||0, op = +c.open||cl;
+        const hi = +c.high||Math.max(op,cl), lo = +c.low||Math.min(op,cl);
+        return {time:t, open:op, high:hi===lo?hi*1.00005:hi, low:hi===lo?lo*0.99995:lo, close:cl};
+      }).filter(c=>isFinite(c.close)&&c.close>0&&c.time>0&&!seen.has(c.time)&&seen.add(c.time)).sort((a,b)=>a.time-b.time);
+      if (!data.length) return;
+      try { this.series.setData(data); } catch(e) { console.warn('setData',e); }
+      try {
+        const k=2/21; let e=data[0].close;
+        this.ema.setData(data.map((d,i)=>{ e=i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; }));
+      } catch(e) {}
+      try { this.chart.timeScale().fitContent(); } catch(e) {}
+    }
+    update(c) {
+      if (!this.series) return;
+      try {
+        const t = typeof c.time==='number'?c.time:Math.floor((c.time instanceof Date?c.time.getTime():+c.time)/1000);
+        const cl=+c.close||+c.value||0, op=+c.open||cl, hi=+c.high||Math.max(op,cl), lo=+c.low||Math.min(op,cl);
+        if (!isFinite(cl)||cl<=0) return;
+        this.series.update({time:t, open:op, high:hi===lo?hi*1.00005:hi, low:hi===lo?lo*0.99995:lo, close:cl});
+      } catch(e) {}
+    }
+    fitAll() { try { this.chart?.timeScale().fitContent(); } catch(e) {} }
+  }
+  </script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ALPHACORE // Trading Bot Command Center</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2300e5c7'/><text x='16' y='22' font-family='Inter,system-ui,sans-serif' font-size='19' font-weight='800' text-anchor='middle' fill='%23070708'>A</text></svg>" />
@@ -1303,8 +1374,8 @@
           </div>
         </div>
       </div>
-      <div class="chart-canvas-wrap" id="chartWrap" style="position:relative;height:320px;min-height:320px;">
-        <div id="equityCanvas" style="width:100%;height:320px;position:absolute;top:0;left:0;right:0;bottom:0;"></div>
+      <div class="chart-canvas-wrap" id="chartWrap" style="position:relative;height:320px;">
+        <div id="equityCanvas" style="width:100%;height:100%;min-height:320px;display:block;"></div>
       </div>
     </section>
 
@@ -3062,16 +3133,15 @@ const chart = { tf: '1H', allCandles: [], _inst: null };
 let _liveCandleLastBucketKey = 0;
 
 function _equityChart() {
-  if (chart._inst && chart._inst.series && chart._inst.chart) {
-    return chart._inst;
-  }
-  if (chart._inst) {
-    try { chart._inst.chart?.remove(); } catch(e) {}
-    chart._inst = null;
-  }
-  if (!window.EquityChart) return null;
+  if (chart._inst?.series && chart._inst?.chart) return chart._inst;
+  if (chart._inst) { try { chart._inst.chart?.remove(); } catch(e) {} chart._inst = null; }
+  const el = document.getElementById('equityCanvas');
+  if (!el || !window.LightweightCharts) return null;
+  // Ensure container has dimensions before init
+  if (el.offsetWidth === 0) el.style.width = '100%';
+  if (el.offsetHeight === 0) el.style.height = '320px';
   chart._inst = new EquityChart('equityCanvas');
-  return chart._inst;
+  return chart._inst?.series ? chart._inst : null;
 }
 
 function buildCandlesForTF(snapshots, tf) {
