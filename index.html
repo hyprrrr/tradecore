@@ -69,7 +69,11 @@
         const k=2/21; let e=data[0].close;
         this.ema.setData(data.map((d,i)=>{ e=i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; }));
       } catch(e) {}
-      try { this.chart.timeScale().fitContent(); } catch(e) {}
+      // Only fit on first load — never reset user's zoom/scroll after that
+      if (!this._initialFitDone) {
+        try { this.chart.timeScale().fitContent(); } catch(e) {}
+        this._initialFitDone = true;
+      }
     }
     update(c) {
       if (!this.series) return;
@@ -80,7 +84,12 @@
         this.series.update({time:t, open:op, high:hi===lo?hi*1.00005:hi, low:hi===lo?lo*0.99995:lo, close:cl});
       } catch(e) {}
     }
-    fitAll() { try { this.chart?.timeScale().fitContent(); } catch(e) {} }
+    fitAll() {
+    if (!this._initialFitDone) {
+      try { this.chart?.timeScale().fitContent(); } catch(e) {}
+      this._initialFitDone = true;
+    }
+  }
   }
   </script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
