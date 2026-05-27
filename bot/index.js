@@ -10149,11 +10149,14 @@ async function tick() {
           if (positions[sym] || shortPositions[sym] || scalpPositions[sym]) continue;
           const sig = generateSignalByStrategy(sym, bars5m, bars15m) || generateSignal(sym, bars5m, bars15m);
           if (!sig || sig.signal === 'HOLD' || (sig.confidence || 0) < CONFIG.minConfidence) continue;
+          // Route through confirmSignal — requires 2 consecutive ticks before entry
+          // This prevents multiple buy arrows from rapid price ticks
+          if (!confirmSignal(sym, sig)) continue;
           const price = alpacaLivePrice[sym] || bars5m[bars5m.length-1]?.c;
           if (!price) continue;
           const edge = await edgeGate(sym, sig.signal === 'BUY' ? 'long' : 'short', sig, bars5m);
           if (!edge.pass) continue;
-          log('scan', `⚡ Tick-signal ${sym} ${sig.signal} conf:${sig.confidence}% — fast entry`);
+          log('scan', `⚡ Tick-signal ${sym} ${sig.signal} conf:${sig.confidence}% — confirmed entry`);
           await enterPosition(sym, price, sig, bars5m, sig.signal === 'BUY' ? 'long' : 'short');
         } catch(e) { /* non-critical */ }
       }
