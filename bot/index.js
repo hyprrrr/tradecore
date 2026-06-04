@@ -2996,11 +2996,22 @@ function buildScanList() {
 // END MARKET SCREENER
 // ═══════════════════════════════════════════════════════════════════
 
-async function placeOrder(symbol, qty, side) {
+async function placeOrder(symbol, qty, side, price = 0) {
   if (isSimMode()) return simOrder(symbol, qty, side);
+  // Crypto: use fractional qty (Alpaca supports up to 9 decimal places)
+  // Convert integer qty back to fractional using live price if needed
+  let orderBody;
+  if (isCrypto(symbol) && price > 0) {
+    // Use notional ordering for crypto — avoids qty rounding issues
+    const notional = Math.round(qty * price * 100) / 100;
+    orderBody = { symbol, notional: String(notional), side, type: 'market', time_in_force: 'gtc' };
+    log('order', `🪙 ${symbol} notional order: $${notional}`);
+  } else {
+    orderBody = { symbol, qty: String(qty), side, type: 'market', time_in_force: 'day' };
+  }
   const data = await alpacaFetch(`${ALPACA_BASE()}/v2/orders`, {
     method: 'POST',
-    body: JSON.stringify({ symbol, qty: String(qty), side, type: 'market', time_in_force: 'day' }),
+    body: JSON.stringify(orderBody),
   });
   if (!data.id) throw new Error(data.message || JSON.stringify(data));
   log('order', `${side.toUpperCase()} order placed: ${qty}x ${symbol} | ID: ${data.id}`);
@@ -5944,16 +5955,25 @@ function calcQty(symbol, price, bars, confidence = 70) {
     const atrFloor = price * 0.004;  // min 0.4% — prevents insane qty on low-ATR ETFs (was 0.25%)
     atrVal = Math.max(atrVal, atrFloor);
     if (atrVal > 0) {
-      // Risk at most 1% of starting capital per trade
-      const riskShares = Math.floor((baseCap * 0.01) / atrVal);
-      const qty = Math.min(riskShares, maxShares);
-      if (qty >= 1) {
-        log('size', `${symbol} conf=${confidence}% scale=${(confScale*100).toFixed(0)}% max=$${maxCost.toFixed(0)} ATR=${atrVal.toFixed(2)} → qty=${qty}`);
-        return qty;
+      const riskShares = (baseCap * 0.01) / atrVal;
+      // Crypto: return fractional qty rounded to 4 decimal places
+      if (isCrypto(symbol)) {
+        const cryptoQty = Math.min(riskShares, maxShares);
+        const finalCrypto = Math.round(cryptoQty * 10000) / 10000;
+        if (finalCrypto > 0.0001) {
+          log('size', `🪙 ${symbol} conf=${confidence}% max=$${maxCost.toFixed(0)} ATR=${atrVal.toFixed(2)} → qty=${finalCrypto}`);
+          return finalCrypto;
+        }
+      } else {
+        const qty = Math.min(Math.floor(riskShares), Math.floor(maxShares));
+        if (qty >= 1) {
+          log('size', `${symbol} conf=${confidence}% scale=${(confScale*100).toFixed(0)}% max=$${maxCost.toFixed(0)} ATR=${atrVal.toFixed(2)} → qty=${qty}`);
+          return qty;
+        }
       }
     }
   }
-  return maxShares;
+  return isCrypto(symbol) ? Math.round(maxShares * 10000) / 10000 : Math.floor(maxShares);
 }
 
 // ─────────────────────────────────────────────
@@ -6415,9 +6435,13 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
 
   // PMRB: 60% initial size — preserves capital for the 40% add-on at reclaim
   const isPMRBScaled = CONFIG.strategy === 'pmrb' && sigInfo?.pmrb?.reclaimLevel;
-  let finalQty = Math.min(qty, Math.max(1, Math.floor(maxDollarLoss / (price * CONFIG.hardMaxLoss))));
+  // Crypto: preserve fractional qty — don't floor to integer
+  const _cryptoSym = isCrypto(sym);
+  let finalQty = _cryptoSym
+    ? Math.min(qty, maxDollarLoss / (price * CONFIG.hardMaxLoss))
+    : Math.min(qty, Math.max(1, Math.floor(maxDollarLoss / (price * CONFIG.hardMaxLoss))));
   if (isPMRBScaled) {
-    finalQty = Math.max(1, Math.floor(finalQty * 0.60));
+    finalQty = _cryptoSym ? finalQty * 0.60 : Math.max(1, Math.floor(finalQty * 0.60));
     log('pmrb', `${sym} PMRB 60% entry: ${finalQty} shares | add at reclaim $${sigInfo.pmrb.reclaimLevel.toFixed(2)}`);
   }
 
@@ -6431,9 +6455,9 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   const atrPctNow = sigInfo?.atr ? sigInfo.atr / price : 0.01;
   const capPct = atrPctNow > 0.015 ? 0.06 : 0.10; // 6% for high-vol, 10% normal
   const maxPositionDollars = accountBase * capPct;
-  const maxQtyByCap = Math.floor(maxPositionDollars / price);
-  if (finalQty > maxQtyByCap && maxQtyByCap >= 1) {
-    log('risk', `📏 ${sym} qty capped: ${finalQty} → ${maxQtyByCap} (${(capPct*100).toFixed(0)}% cap, ATR=${(atrPctNow*100).toFixed(2)}%)`);
+  const maxQtyByCap = _cryptoSym ? maxPositionDollars / price : Math.floor(maxPositionDollars / price);
+  if (finalQty > maxQtyByCap && maxQtyByCap > 0.0001) {
+    log('risk', `📏 ${sym} qty capped: ${finalQty.toFixed(4)} → ${maxQtyByCap.toFixed(4)} (${(capPct*100).toFixed(0)}% cap)`);
     finalQty = maxQtyByCap;
   }
 
@@ -6499,7 +6523,7 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
       }
 
       try {
-        const orderRes = await placeSmartOrder(sym, finalQty, 'buy', false);
+        const orderRes = await placeSmartOrder(sym, finalQty, 'buy', false, price);
         // Use the actual fill price from Alpaca (falls back to pre-order
         // price only if we couldn't confirm a fill — prior bug: always
         // using pre-order price gave MCHP entry of $76 when it filled at $89)
@@ -9961,8 +9985,10 @@ function orbScoreBonus(symbol, price, direction) {
 // For swing trades: attempt a limit order just inside the spread
 // for better fill price. Falls back to market after 4 seconds.
 // For scalps: always market (speed > price improvement).
-async function placeSmartOrder(symbol, qty, side, isScalp = false) {
+async function placeSmartOrder(symbol, qty, side, isScalp = false, price = 0) {
   if (isSimMode()) return simOrder(symbol, qty, side);
+  // Crypto: use notional placeOrder directly — no quote spread check needed
+  if (isCrypto(symbol)) return placeOrder(symbol, qty, side, price);
   if (isScalp || !CONFIG.alpacaKey) return placeOrder(symbol, qty, side);
 
   try {
@@ -10225,8 +10251,9 @@ setInterval(async () => {
         ? strat : 'rsi_macd';
     }
     // Final guarantee — _activeStrategy must never be falsy
-    if (!CONFIG._activeStrategy || CONFIG._activeStrategy === 'None') {
+    if (!CONFIG._activeStrategy || CONFIG._activeStrategy === 'None' || CONFIG._activeStrategy === 'null') {
       CONFIG._activeStrategy = 'rsi_macd';
+      CONFIG.strategy = 'rsi_macd';
     }
 
     // Only log if something actually changed
