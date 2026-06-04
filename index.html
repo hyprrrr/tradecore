@@ -3157,11 +3157,22 @@ function buildCandlesForTF(snapshots, tf) {
   if (!snapshots?.length) return [];
   const msMap = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
   const bucketMs = msMap[tf] || 3600e3;
+
+  // Filter out bad snapshots — remove outliers more than 20% from median
+  const rawVals = snapshots.map(s => +s.value).filter(v => isFinite(v) && v > 0);
+  if (!rawVals.length) return [];
+  const sorted = [...rawVals].sort((a,b) => a-b);
+  const median = sorted[Math.floor(sorted.length/2)];
+  const validSnapshots = snapshots.filter(s => {
+    const v = +s.value;
+    return isFinite(v) && v > 0 && Math.abs(v - median) / median < 0.20;
+  });
+  if (!validSnapshots.length) return [];
+
   const buckets = {};
   let firstKey = Infinity, lastKey = -Infinity;
-  snapshots.forEach(s => {
+  validSnapshots.forEach(s => {
     const val = +s.value;
-    if (!isFinite(val) || val <= 0) return;
     const key = Math.floor(new Date(s.created_at).getTime() / bucketMs) * bucketMs;
     if (!buckets[key]) buckets[key] = [];
     buckets[key].push(val);
@@ -3169,6 +3180,7 @@ function buildCandlesForTF(snapshots, tf) {
     if (key > lastKey)  lastKey  = key;
   });
   if (firstKey === Infinity) return [];
+
   const out = []; let lastClose = null;
   const endKey = Math.min(lastKey, Math.floor(Date.now()/bucketMs)*bucketMs);
   for (let k = firstKey; k <= endKey; k += bucketMs) {
@@ -3176,13 +3188,18 @@ function buildCandlesForTF(snapshots, tf) {
     const timeSec = Math.floor(k / 1000);
     if (v) {
       const open  = lastClose ?? v[0];
-      const close = v[v.length-1];
+      const close = v[v.length - 1];
       const high  = Math.max(open, close, ...v);
       const low   = Math.min(open, close, ...v);
-      out.push({ time: timeSec, open, high: high===low?high*1.00005:high, low: high===low?low*0.99995:low, close });
+      // Minimum candle body height — flat candles look bad
+      const range = Math.max(high - low, close * 0.0002);
+      const hh = (high === low) ? close + range/2 : high;
+      const ll = (high === low) ? close - range/2 : low;
+      out.push({ time: timeSec, open, high: hh, low: ll, close });
       lastClose = close;
     } else if (lastClose !== null) {
-      out.push({ time: timeSec, open: lastClose, high: lastClose*1.00005, low: lastClose*0.99995, close: lastClose });
+      // Flat forward-fill — tiny range so it's visible as a doji
+      out.push({ time: timeSec, open: lastClose, high: lastClose*(1+0.0001), low: lastClose*(1-0.0001), close: lastClose });
     }
   }
   return out;
@@ -3199,6 +3216,9 @@ function scheduleRedraw() { redrawChart(); }
 function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
   if (!isFinite(v) || v <= 0) return;
+  // Sanity check — reject values more than 20% from last known equity
+  const lastKnown = tickLiveCandle._last || v;
+  if (lastKnown > 0 && Math.abs(v - lastKnown) / lastKnown > 0.20) return;
 
   const hasPositions = (state.positions?.length || 0) > 0;
   const prev = tickLiveCandle._last || 0;
