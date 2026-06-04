@@ -1790,7 +1790,9 @@ async function syncPortfolio() {
     const nowSim = Date.now();
     if (equity > 0 && (nowSim - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
       lastEquitySnapshot = nowSim;
-      await sbFetch(tbl('tc_equity'), 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+      if (equity > 50000 && equity < 500000) { // sanity: must be between $50k-$500k
+        await sbFetch(tbl('tc_equity'), 'POST', { value: +equity.toFixed(2), created_at: new Date().toISOString() });
+      }
     }
     return;
   }
@@ -1891,7 +1893,7 @@ async function syncPortfolio() {
   // candle chart reads (not trade pnls, which were getting corrupted by old
   // test rows and producing impossible $35k/5min candles).
   const now = Date.now();
-  if (equityValue > 0 && equityValue < CONFIG.startingCapital * 10
+  if (equityValue > 50000 && equityValue < 500000
       && (now - lastEquitySnapshot) > EQUITY_SNAPSHOT_INTERVAL_MS) {
     lastEquitySnapshot = now;
     await sbFetch(tbl('tc_equity'), 'POST', { value: +equityValue.toFixed(2), created_at: new Date().toISOString() });
@@ -2595,7 +2597,7 @@ function pushEquitySnapshot(equity) {
   if (now - _lastForceEquityMs < 30000) return;
   _lastForceEquityMs = now;
   lastEquitySnapshot = now;
-  sbFetch(tbl('tc_equity'), 'POST', {
+  if (equity > 50000 && equity < 500000) sbFetch(tbl('tc_equity'), 'POST', {
     value:      +equity.toFixed(2),
     created_at: new Date().toISOString(),
   }).catch(e => log('warn', `Equity snapshot failed: ${e.message?.slice(0,60)}`));
