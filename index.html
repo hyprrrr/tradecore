@@ -12,130 +12,98 @@
   <link rel="apple-touch-icon" href="/icon-192.png" />
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <script>
-  // ── AlphaCore Equity Chart — TradingView-style candlesticks ──────
+  // ── AlphaCore Equity Chart ──────────────────────────────────────────────
   class EquityChart {
     constructor(containerId) {
-      this.el = document.getElementById(containerId);
-      this.chart = null; this.series = null; this.ema = null;
-      this._initialFitDone = false;
-      if (this.el) this._init();
+      this.el   = document.getElementById(containerId);
+      this.lw   = null;   // LightweightCharts chart instance
+      this.cs   = null;   // candlestick series
+      this.em   = null;   // EMA line series
+      this._fit = false;  // fitContent called once
+      if (this.el) this._build();
     }
-    _init() {
-      const w = this.el.offsetWidth || 900;
-      const h = this.el.offsetHeight || 320;
-      this.chart = LightweightCharts.createChart(this.el, {
-        width: w, height: h,
-        layout: { background:{type:'solid',color:'transparent'}, textColor:'rgba(255,255,255,0.5)', fontSize:11 },
-        grid: { vertLines:{color:'rgba(255,255,255,0.04)'}, horzLines:{color:'rgba(255,255,255,0.04)'} },
-        crosshair: {
-          mode: LightweightCharts.CrosshairMode.Normal,
-          vertLine: { color:'rgba(255,255,255,0.3)', labelBackgroundColor:'#131722' },
-          horzLine: { color:'rgba(255,255,255,0.3)', labelBackgroundColor:'#131722' },
-        },
-        rightPriceScale: {
-          borderColor:  'rgba(255,255,255,0.08)',
-          autoScale:    true,
-          // Keep Y-axis tight to actual data — don't show huge empty space
-          scaleMargins: { top: 0.15, bottom: 0.15 },
-        },
-        timeScale: {
-          borderColor:    'rgba(255,255,255,0.08)',
-          timeVisible:    true,
-          secondsVisible: false,
-          rightOffset:    5,
-          barSpacing:     8,
-          minBarSpacing:  3,
-        },
-        handleScale:  { mouseWheel:true, pinch:true, axisPressedMouseMove:true },
-        handleScroll: { mouseWheel:true, pressedMouseMove:true, horzTouchDrag:true, vertTouchDrag:false },
+
+    _build() {
+      const LW = window.LightweightCharts;
+      if (!LW) { console.error('LightweightCharts not loaded'); return; }
+
+      this.lw = LW.createChart(this.el, {
+        layout:   { background:{type:'solid',color:'transparent'}, textColor:'rgba(255,255,255,0.45)', fontSize:11 },
+        grid:     { vertLines:{color:'rgba(255,255,255,0.04)'}, horzLines:{color:'rgba(255,255,255,0.04)'} },
+        crosshair:{ mode:LW.CrosshairMode.Normal,
+                    vertLine:{color:'rgba(255,255,255,0.25)', labelBackgroundColor:'#1a1d27'},
+                    horzLine:{color:'rgba(255,255,255,0.25)', labelBackgroundColor:'#1a1d27'} },
+        rightPriceScale:{ borderColor:'rgba(255,255,255,0.07)', autoScale:true, scaleMargins:{top:0.12,bottom:0.12} },
+        timeScale:{ borderColor:'rgba(255,255,255,0.07)', timeVisible:true, secondsVisible:false, rightOffset:6, barSpacing:10, minBarSpacing:4 },
+        handleScale:{ mouseWheel:true, pinch:true, axisPressedMouseMove:true },
+        handleScroll:{ mouseWheel:true, pressedMouseMove:true, horzTouchDrag:true },
       });
 
-      this.series = this.chart.addCandlestickSeries({
-        upColor:         '#26a69a',
-        downColor:       '#ef5350',
-        borderUpColor:   '#26a69a',
-        borderDownColor: '#ef5350',
-        wickUpColor:     '#26a69a',
-        wickDownColor:   '#ef5350',
-        priceLineVisible:    true,
-        priceLineColor:      'rgba(255,255,255,0.25)',
-        priceLineWidth:      1,
-        priceLineStyle:      2,
-        lastValueVisible:    true,
-        priceFormat:         { type:'price', precision:2, minMove:0.01 },
+      this.cs = this.lw.addCandlestickSeries({
+        upColor:'#26a69a', downColor:'#ef5350',
+        borderUpColor:'#26a69a', borderDownColor:'#ef5350',
+        wickUpColor:'#26a69a', wickDownColor:'#ef5350',
+        priceLineVisible:true, priceLineColor:'rgba(255,255,255,0.2)',
+        priceLineWidth:1, priceLineStyle:2,
+        lastValueVisible:true,
+        priceFormat:{ type:'price', precision:2, minMove:0.01 },
       });
 
-      this.ema = this.chart.addLineSeries({
-        color:'rgba(245,197,24,0.6)', lineWidth:1, lineStyle:2,
+      this.em = this.lw.addLineSeries({
+        color:'rgba(245,197,24,0.55)', lineWidth:1, lineStyle:2,
         priceLineVisible:false, lastValueVisible:false,
       });
 
-      new ResizeObserver(() => {
-        if (!this.el || !this.chart) return;
-        const nw = this.el.offsetWidth, nh = this.el.offsetHeight;
-        if (nw > 10 && nh > 10) this.chart.resize(nw, nh);
-      }).observe(this.el);
+      // Auto-resize
+      const ro = new ResizeObserver(() => {
+        if (!this.el || !this.lw) return;
+        const w = this.el.offsetWidth, h = this.el.offsetHeight;
+        if (w > 10 && h > 10) this.lw.resize(w, h);
+      });
+      ro.observe(this.el);
     }
 
+    // candles: [{time (unix sec), open, high, low, close}]
     setData(candles) {
-      if (!this.series || !candles?.length) return;
+      if (!this.cs || !candles?.length) return;
       const seen = new Set();
       const data = candles
         .map(c => {
-          const t  = typeof c.time==='number' ? c.time : Math.floor((c.time instanceof Date?c.time.getTime():+c.time)/1000);
-          const cl = +c.close||+c.value||0;
-          const op = +c.open||cl, hi = +c.high||Math.max(op,cl), lo = +c.low||Math.min(op,cl);
+          const t  = +c.time;
+          const cl = +c.close || 0, op = +c.open || cl;
+          const hi = +c.high  || Math.max(op, cl);
+          const lo = +c.low   || Math.min(op, cl);
           return { time:t, open:op, high:hi, low:lo, close:cl };
         })
-        .filter(c => isFinite(c.close) && c.close > 50000 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
+        .filter(c => c.close > 50000 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
         .sort((a,b) => a.time - b.time);
-
       if (!data.length) return;
 
-      // Only keep candles where equity actually moved (> $1 change from prev close)
-      // OR it's the first/last candle. This removes the flat line of identical candles.
-      const significant = data.filter((c, i, arr) => {
-        if (i === 0 || i === arr.length - 1) return true;
-        const prev = arr[i-1];
-        return Math.abs(c.close - prev.close) > 1 ||
-               Math.abs(c.high  - c.low)       > 5;
-      });
+      try { this.cs.setData(data); } catch(e) { console.warn('setData', e); return; }
 
-      // If less than 5 significant candles, show all (don't filter new sessions)
-      const display = significant.length >= 5 ? significant : data;
-
-      try { this.series.setData(display); } catch(e) { console.warn('setData',e); return; }
-
+      // EMA-21
       try {
-        const k=2/21; let e=display[0].close;
-        this.ema.setData(display.map((d,i)=>{ e=i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; }));
-      } catch(e) {}
+        const k = 2/21; let e = data[0].close;
+        this.em.setData(data.map((d,i)=>{ e=i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; }));
+      } catch(_) {}
 
-      if (!this._initialFitDone) {
-        try { this.chart.timeScale().fitContent(); } catch(e) {}
-        this._initialFitDone = true;
-      }
+      // Fit once on first load; never after (preserves user zoom)
+      if (!this._fit) { try { this.lw.timeScale().fitContent(); } catch(_){} this._fit = true; }
     }
 
+    // Live tick — update the last candle only
     update(c) {
-      if (!this.series) return;
+      if (!this.cs) return;
       try {
-        const t  = typeof c.time==='number'?c.time:Math.floor((c.time instanceof Date?c.time.getTime():+c.time)/1000);
-        const cl = +c.close||+c.value||0;
-        if (!isFinite(cl)||cl<50000) return;
-        const op = +c.open||cl, hi = +c.high||Math.max(op,cl), lo = +c.low||Math.min(op,cl);
-        this.series.update({ time:t, open:op, high:hi, low:lo, close:cl });
-      } catch(e) {}
+        const cl = +c.close||0, op = +c.open||cl, hi = +c.high||Math.max(op,cl), lo = +c.low||Math.min(op,cl);
+        if (cl < 50000) return;
+        this.cs.update({ time:+c.time, open:op, high:hi, low:lo, close:cl });
+      } catch(_) {}
     }
 
-    fitAll() {
-      if (!this._initialFitDone) {
-        try { this.chart?.timeScale().fitContent(); } catch(e) {}
-        this._initialFitDone = true;
-      }
-    }
+    fitAll() { if (!this._fit) { try { this.lw?.timeScale().fitContent(); } catch(_){} this._fit=true; } }
   }
-  </script>>>>
+  </script>>>>>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ALPHACORE // Trading Bot Command Center</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2300e5c7'/><text x='16' y='22' font-family='Inter,system-ui,sans-serif' font-size='19' font-weight='800' text-anchor='middle' fill='%23070708'>A</text></svg>" />
@@ -3186,72 +3154,80 @@ const chart = { tf: '4H', allCandles: [], _inst: null };
 let _liveCandleLastBucketKey = 0;
 
 function _equityChart() {
-  if (chart._inst?.series && chart._inst?.chart) return chart._inst;
-  if (chart._inst) { try { chart._inst.chart?.remove(); } catch(e) {} chart._inst = null; }
+  if (chart._inst?.cs && chart._inst?.lw) return chart._inst;
+  if (chart._inst) {
+    try { chart._inst.lw?.remove(); } catch(e) {}
+    try { chart._inst.chart?.remove(); } catch(e) {}
+    chart._inst = null;
+  }
   const el = document.getElementById('equityCanvas');
   if (!el || !window.LightweightCharts) return null;
-  // Ensure container has dimensions before init
-  if (el.offsetWidth === 0) el.style.width = '100%';
-  if (el.offsetHeight === 0) el.style.height = '320px';
+  if (!el.offsetHeight) el.style.height = '320px';
   chart._inst = new EquityChart('equityCanvas');
-  return chart._inst?.series ? chart._inst : null;
+  return chart._inst?.cs ? chart._inst : null;
 }
 
 function buildCandlesForTF(snapshots, tf) {
   if (!snapshots?.length) return [];
-  const msMap = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
-  const bucketMs = msMap[tf] || 3600e3;
 
-  // Filter out bad snapshots — remove outliers more than 20% from median
-  const rawVals = snapshots.map(s => +s.value).filter(v => isFinite(v) && v > 0);
-  if (!rawVals.length) return [];
-  const sorted = [...rawVals].sort((a,b) => a-b);
-  const median = sorted[Math.floor(sorted.length/2)];
-  const validSnapshots = snapshots.filter(s => {
-    const v = +s.value;
-    return isFinite(v) && v > 0 && Math.abs(v - median) / median < 0.20;
+  // Step 1: clean — reject obvious bad values
+  const vals = snapshots.map(s => +s.value).filter(v => isFinite(v) && v > 50000);
+  if (!vals.length) return [];
+  const sorted = [...vals].sort((a,b)=>a-b);
+  const med  = sorted[Math.floor(sorted.length/2)];
+  const good = snapshots.filter(s => { const v=+s.value; return isFinite(v)&&v>50000&&Math.abs(v-med)/med<0.15; });
+  if (!good.length) return [];
+
+  // Step 2: bucket by TF
+  const MS = {'5M':300e3,'15M':900e3,'30M':1800e3,'1H':3600e3,'4H':14400e3,'1D':86400e3};
+  const bMs = MS[tf] || 3600e3;
+  const bkts = {};
+  good.forEach(s => {
+    const k = Math.floor(new Date(s.created_at).getTime()/bMs)*bMs;
+    if (!bkts[k]) bkts[k] = [];
+    bkts[k].push(+s.value);
   });
-  if (!validSnapshots.length) return [];
 
-  const buckets = {};
-  let firstKey = Infinity, lastKey = -Infinity;
-  validSnapshots.forEach(s => {
-    const val = +s.value;
-    const key = Math.floor(new Date(s.created_at).getTime() / bucketMs) * bucketMs;
-    if (!buckets[key]) buckets[key] = [];
-    buckets[key].push(val);
-    if (key < firstKey) firstKey = key;
-    if (key > lastKey)  lastKey  = key;
-  });
-  if (firstKey === Infinity) return [];
+  // Step 3: build candles — ONLY include buckets where equity actually changed
+  const keys = Object.keys(bkts).map(Number).sort((a,b)=>a-b);
+  const out  = [];
+  let lastClose = null;
 
-  const out = []; let lastClose = null;
-  const endKey = Math.min(lastKey, Math.floor(Date.now()/bucketMs)*bucketMs);
-  for (let k = firstKey; k <= endKey; k += bucketMs) {
-    const v = buckets[k];
-    const timeSec = Math.floor(k / 1000);
-    if (v) {
-      const open  = lastClose ?? v[0];
-      const close = v[v.length - 1];
-      const high  = Math.max(open, close, ...v);
-      const low   = Math.min(open, close, ...v);
-      // Minimum candle body height — flat candles look bad
-      const range = Math.max(high - low, close * 0.0002);
-      const hh = (high === low) ? close + range/2 : high;
-      const ll = (high === low) ? close - range/2 : low;
-      out.push({ time: timeSec, open, high: hh, low: ll, close });
+  for (const k of keys) {
+    const v    = bkts[k];
+    const open  = lastClose ?? v[0];
+    const close = v[v.length-1];
+    const high  = Math.max(open, close, ...v);
+    const low   = Math.min(open, close, ...v);
+    const moved = Math.abs(close - open) > 0.50;   // at least $0.50 movement
+    const range = high - low;
+
+    // Skip flat buckets — only include if equity moved or range > $1
+    if (!moved && range < 1.00 && lastClose !== null) {
+      // Still advance lastClose so next real candle opens from right price
       lastClose = close;
-    } else if (lastClose !== null) {
-      const bm = lastClose * 0.0003;
-      out.push({ time: timeSec, open: lastClose, high: lastClose+bm, low: lastClose-bm, close: lastClose });
+      continue;
     }
+
+    // Ensure minimum visible body (0.5 basis points of price)
+    const minBody = close * 0.00005;
+    out.push({
+      time:  Math.floor(k/1000),
+      open,
+      high:  Math.max(high, close + minBody),
+      low:   Math.min(low,  close - minBody),
+      close,
+    });
+    lastClose = close;
   }
   return out;
 }
 
 function redrawChart() {
   const inst = _equityChart();
-  if (inst && chart.allCandles?.length) inst.setData(chart.allCandles);
+  if (inst && chart.allCandles?.length) {
+    try { inst.setData(chart.allCandles); } catch(e) { console.warn('redraw',e); }
+  }
 }
 
 function scheduleRedraw() { redrawChart(); }
@@ -3260,52 +3236,53 @@ function scheduleRedraw() { redrawChart(); }
 function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
   if (!isFinite(v) || v < 50000) return;
-  // Sanity check — reject values more than 15% from last known equity
-  const lastKnown = tickLiveCandle._last || v;
-  if (lastKnown > 0 && Math.abs(v - lastKnown) / lastKnown > 0.15) return;
 
-  const hasPositions = (state.positions?.length || 0) > 0;
-  const prev = tickLiveCandle._last || 0;
-  const changed = Math.abs(v - prev) > 0.01;
+  // Reject outliers
+  const prev = tickLiveCandle._last || v;
+  if (Math.abs(v - prev) / prev > 0.10) return;
   tickLiveCandle._last = v;
 
-  const msMap    = {'5M':5*60e3,'15M':15*60e3,'30M':30*60e3,'1H':3600e3,'4H':4*3600e3,'1D':86400e3};
-  const bucketMs  = msMap[chart.tf] || 3600e3;
-  const bucketSec = bucketMs / 1000;
-  const keySec    = Math.floor(Date.now() / bucketMs) * bucketMs / 1000;
+  const MS = {'5M':300e3,'15M':900e3,'30M':1800e3,'1H':3600e3,'4H':14400e3,'1D':86400e3};
+  const bMs = MS[chart.tf] || 3600e3;
+  const bSec = bMs / 1000;
+  const kSec = Math.floor(Date.now() / bMs) * bMs / 1000;
 
   if (!chart.allCandles?.length) {
-    chart.allCandles = [{ time: keySec, open: v, high: v*1.00005, low: v*0.99995, close: v }];
+    chart.allCandles = [{ time:kSec, open:v, high:v, low:v, close:v }];
   }
 
   const last = chart.allCandles[chart.allCandles.length - 1];
-  const lastSec = typeof last.time === 'number' ? last.time
-                : Math.floor((last.time instanceof Date ? last.time.getTime() : +last.time) / 1000);
-  const lastBucket = Math.floor(lastSec / bucketSec) * bucketSec;
+  const lastBucket = Math.floor(last.time / bSec) * bSec;
 
-  if (keySec > lastBucket) {
-    // New bucket — always advance
-    for (let k = lastBucket + bucketSec; k < keySec; k += bucketSec) {
-      const fc = last.close;
-      chart.allCandles.push({ time: k, open: fc, high: fc*1.00005, low: fc*0.99995, close: fc });
+  if (kSec > lastBucket) {
+    // New bucket — only create if equity actually moved from last candle
+    const moved = Math.abs(v - last.close) > 0.50;
+    if (moved) {
+      chart.allCandles.push({ time:kSec, open:last.close, high:Math.max(last.close,v), low:Math.min(last.close,v), close:v });
     }
-    const _bm = v * 0.0003;
-    chart.allCandles.push({ time: keySec, open: last.close, high: Math.max(last.close,v)+_bm, low: Math.min(last.close,v)-_bm, close: v });
-  } else if (hasPositions || changed) {
+    // Always update lastClose even if no candle created (so next candle opens right)
+  } else {
+    // Same bucket — only update series if equity changed
+    const changed = Math.abs(v - last.close) > 0.01;
+    if (!changed) return;
     last.close = v;
     last.high  = Math.max(last.high, v);
-    last.low   = Math.min(last.low, v);
-  } else {
-    return;
+    last.low   = Math.min(last.low,  v);
   }
 
-  const c = chart.allCandles[chart.allCandles.length - 1];
-  if (c.high <= c.low) { c.high *= 1.00005; c.low *= 0.99995; }
-
+  const c   = chart.allCandles[chart.allCandles.length - 1];
+  const mb  = c.close * 0.00005;
   const inst = _equityChart();
   if (inst) {
-    try { inst.update(c); }
-    catch(e) {}
+    try {
+      inst.update({
+        time:  c.time,
+        open:  c.open,
+        high:  Math.max(c.high, c.close + mb),
+        low:   Math.min(c.low,  c.close - mb),
+        close: c.close,
+      });
+    } catch(_) {}
   }
 }
 
@@ -3316,8 +3293,9 @@ function setTF(tf) {
   if (btn) btn.classList.add('active');
   _liveCandleLastBucketKey = 0;
 
-  // Destroy cached chart instance so it reinits with correct candlestick series
+  // Destroy chart instance — new TF will fitContent once on first load
   if (chart._inst) {
+    try { chart._inst.lw?.remove(); } catch(e) {}
     try { chart._inst.chart?.remove(); } catch(e) {}
     chart._inst = null;
   }
