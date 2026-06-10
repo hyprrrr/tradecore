@@ -3237,53 +3237,61 @@ function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
   if (!isFinite(v) || v < 50000) return;
 
-  // Reject outliers
+  // Reject outliers (>10% move = bad data)
   const prev = tickLiveCandle._last || v;
   if (Math.abs(v - prev) / prev > 0.10) return;
   tickLiveCandle._last = v;
 
-  const MS = {'5M':300e3,'15M':900e3,'30M':1800e3,'1H':3600e3,'4H':14400e3,'1D':86400e3};
+  const MS  = {'5M':300e3,'15M':900e3,'30M':1800e3,'1H':3600e3,'4H':14400e3,'1D':86400e3};
   const bMs = MS[chart.tf] || 3600e3;
-  const bSec = bMs / 1000;
-  const kSec = Math.floor(Date.now() / bMs) * bMs / 1000;
+  const now = Date.now();
+  // Current bucket key in UNIX SECONDS (matches LW Charts time format)
+  const kSec = Math.floor(now / bMs) * (bMs / 1000);
 
+  // Seed allCandles on first tick
   if (!chart.allCandles?.length) {
-    chart.allCandles = [{ time:kSec, open:v, high:v, low:v, close:v }];
+    chart.allCandles = [{ time: kSec, open: v, high: v, low: v, close: v }];
   }
 
   const last = chart.allCandles[chart.allCandles.length - 1];
-  const lastBucket = Math.floor(last.time / bSec) * bSec;
 
-  if (kSec > lastBucket) {
-    // New bucket — only create if equity actually moved from last candle
-    const moved = Math.abs(v - last.close) > 0.50;
-    if (moved) {
-      chart.allCandles.push({ time:kSec, open:last.close, high:Math.max(last.close,v), low:Math.min(last.close,v), close:v });
-    }
-    // Always update lastClose even if no candle created (so next candle opens right)
+  let candleToUpdate;
+
+  if (kSec > last.time) {
+    // ── NEW BUCKET ──
+    // Always create new candle when time bucket advances — even if flat
+    // (a flat candle is better than a missing candle at the current time)
+    const newCandle = {
+      time:  kSec,
+      open:  last.close,
+      high:  Math.max(last.close, v),
+      low:   Math.min(last.close, v),
+      close: v,
+    };
+    chart.allCandles.push(newCandle);
+    candleToUpdate = newCandle;
   } else {
-    // Same bucket — only update series if equity changed
-    const changed = Math.abs(v - last.close) > 0.01;
-    if (!changed) return;
+    // ── SAME BUCKET — update in place ──
+    if (Math.abs(v - last.close) < 0.01) return; // no change, skip render
     last.close = v;
     last.high  = Math.max(last.high, v);
-    last.low   = Math.min(last.low,  v);
+    last.low   = Math.min(last.low, v);
+    candleToUpdate = last;
   }
 
-  const c   = chart.allCandles[chart.allCandles.length - 1];
-  const mb  = c.close * 0.00005;
+  // Push to LW Charts
   const inst = _equityChart();
-  if (inst) {
-    try {
-      inst.update({
-        time:  c.time,
-        open:  c.open,
-        high:  Math.max(c.high, c.close + mb),
-        low:   Math.min(c.low,  c.close - mb),
-        close: c.close,
-      });
-    } catch(_) {}
-  }
+  if (!inst) return;
+  const mb = candleToUpdate.close * 0.00005; // min visible body
+  try {
+    inst.update({
+      time:  candleToUpdate.time,
+      open:  candleToUpdate.open,
+      high:  Math.max(candleToUpdate.high, candleToUpdate.close + mb),
+      low:   Math.min(candleToUpdate.low,  candleToUpdate.close - mb),
+      close: candleToUpdate.close,
+    });
+  } catch(e) { console.warn('tickLiveCandle update:', e); }
 }
 
 function setTF(tf) {
