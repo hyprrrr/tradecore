@@ -10,88 +10,170 @@
   <meta name="theme-color" content="#07070b" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="apple-touch-icon" href="/icon-192.png" />
-  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <script>
-  // ── AlphaCore Equity Chart ─────────────────────────────────────
+  // ── AlphaCore Equity Chart — TradingView-style candlesticks ──────
   class EquityChart {
     constructor(containerId) {
       this.el = document.getElementById(containerId);
-      this.chart = null; this.series = null; this.ema = null;
+      this.chart = null;
+      this.series = null;
+      this.ema   = null;
+      this._initialFitDone = false;
       if (this.el) this._init();
     }
+
     _init() {
-      // Force explicit dimensions before LW Charts init
-      this.el.style.width  = '100%';
-      this.el.style.height = '100%';
-      const w = this.el.offsetWidth  || 800;
+      const w = this.el.offsetWidth  || 900;
       const h = this.el.offsetHeight || 320;
+
       this.chart = LightweightCharts.createChart(this.el, {
-        width: w, height: h,
-        layout:     { background:{color:'transparent'}, textColor:'#9b9ea4' },
-        grid:       { vertLines:{color:'#1e2130'}, horzLines:{color:'#1e2130'} },
-        crosshair:  { mode: LightweightCharts.CrosshairMode.Normal },
-        rightPriceScale: { borderColor:'#2a2e39', scaleMargins:{top:0.1,bottom:0.1} },
-        timeScale:  { borderColor:'#2a2e39', timeVisible:true, secondsVisible:false },
-        handleScale:  true,
-        handleScroll: true,
+        width:  w,
+        height: h,
+        layout: {
+          background: { type: 'solid', color: 'transparent' },
+          textColor:  'rgba(255,255,255,0.5)',
+          fontSize:   12,
+        },
+        grid: {
+          vertLines: { color: 'rgba(255,255,255,0.05)' },
+          horzLines: { color: 'rgba(255,255,255,0.05)' },
+        },
+        crosshair: {
+          mode: LightweightCharts.CrosshairMode.Normal,
+          vertLine: { color: 'rgba(255,255,255,0.3)', labelBackgroundColor: '#131722' },
+          horzLine: { color: 'rgba(255,255,255,0.3)', labelBackgroundColor: '#131722' },
+        },
+        rightPriceScale: {
+          borderColor:   'rgba(255,255,255,0.08)',
+          scaleMargins:  { top: 0.1, bottom: 0.1 },
+          autoScale:     true,
+        },
+        timeScale: {
+          borderColor:       'rgba(255,255,255,0.08)',
+          timeVisible:       true,
+          secondsVisible:    false,
+          rightOffset:       8,
+          barSpacing:        6,
+          minBarSpacing:     2,
+        },
+        handleScale:  { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
+        handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true },
       });
+
+      // TV-style candlestick series
       this.series = this.chart.addCandlestickSeries({
-        upColor:'#2962ff', downColor:'#131722',
-        borderUpColor:'#2962ff', borderDownColor:'#ef5350',
-        wickUpColor:'#2962ff', wickDownColor:'#ef5350',
-        priceFormat:{ type:'price', precision:2, minMove:0.01 },
+        upColor:          '#26a69a',
+        downColor:        '#ef5350',
+        borderUpColor:    '#26a69a',
+        borderDownColor:  '#ef5350',
+        wickUpColor:      '#26a69a',
+        wickDownColor:    '#ef5350',
+        priceLineVisible:    true,
+        priceLineColor:      'rgba(255,255,255,0.3)',
+        priceLineWidth:      1,
+        priceLineStyle:      LightweightCharts.LineStyle.Dashed,
+        lastValueVisible:    true,
+        priceFormat:         { type: 'price', precision: 2, minMove: 0.01 },
       });
+
+      // EMA overlay
       this.ema = this.chart.addLineSeries({
-        color:'rgba(245,197,24,0.7)', lineWidth:1, lineStyle:1,
-        priceLineVisible:false, lastValueVisible:false,
+        color:            'rgba(245,197,24,0.7)',
+        lineWidth:        1,
+        lineStyle:        LightweightCharts.LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
       });
-      // Auto-resize
+
+      // Auto-resize when panel resizes
       const ro = new ResizeObserver(() => {
-        if (this.el && this.chart) {
-          const w2 = this.el.offsetWidth, h2 = this.el.offsetHeight;
-          if (w2 > 0 && h2 > 0) this.chart.resize(w2, h2);
-        }
+        if (!this.el || !this.chart) return;
+        const nw = this.el.offsetWidth, nh = this.el.offsetHeight;
+        if (nw > 10 && nh > 10) this.chart.resize(nw, nh);
       });
       ro.observe(this.el);
     }
+
+    // candles = array of {time (unix sec), open, high, low, close}
     setData(candles) {
       if (!this.series || !candles?.length) return;
       const seen = new Set();
-      const data = candles.map(c => {
-        const t = typeof c.time==='number' ? c.time : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time)/1000);
-        const cl = +c.close||+c.value||0, op = +c.open||cl;
-        const hi = +c.high||Math.max(op,cl), lo = +c.low||Math.min(op,cl);
-        return {time:t, open:op, high:hi===lo?hi*1.00005:hi, low:hi===lo?lo*0.99995:lo, close:cl};
-      }).filter(c=>isFinite(c.close)&&c.close>0&&c.time>0&&!seen.has(c.time)&&seen.add(c.time)).sort((a,b)=>a.time-b.time);
+      const data = candles
+        .map(c => {
+          const t  = typeof c.time === 'number' ? c.time
+                   : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000);
+          const cl = +c.close || +c.value || 0;
+          const op = +c.open  || cl;
+          const hi = +c.high  || Math.max(op, cl);
+          const lo = +c.low   || Math.min(op, cl);
+          // Minimum visible body — prevents invisible zero-height candles
+          const bodyMin = cl * 0.0003;
+          return {
+            time:  t,
+            open:  op,
+            high:  hi < cl + bodyMin ? cl + bodyMin : hi,
+            low:   lo > cl - bodyMin ? cl - bodyMin : lo,
+            close: cl,
+          };
+        })
+        .filter(c =>
+          isFinite(c.close) && c.close > 50000 &&
+          c.time > 0 &&
+          !seen.has(c.time) && seen.add(c.time)
+        )
+        .sort((a, b) => a.time - b.time);
+
       if (!data.length) return;
-      try { this.series.setData(data); } catch(e) { console.warn('setData',e); }
+      try { this.series.setData(data); } catch(e) { console.warn('Chart setData:', e); return; }
+
+      // EMA(21)
       try {
-        const k=2/21; let e=data[0].close;
-        this.ema.setData(data.map((d,i)=>{ e=i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; }));
+        const k = 2 / 21;
+        let e = data[0].close;
+        this.ema.setData(data.map((d, i) => {
+          e = i === 0 ? d.close : d.close * k + e * (1 - k);
+          return { time: d.time, value: e };
+        }));
       } catch(e) {}
-      // Only fit on first load — never reset user's zoom/scroll after that
+
+      // Fit on first load only — never reset user zoom
       if (!this._initialFitDone) {
         try { this.chart.timeScale().fitContent(); } catch(e) {}
         this._initialFitDone = true;
       }
     }
+
+    // Live tick — update current candle without resetting view
     update(c) {
       if (!this.series) return;
       try {
-        const t = typeof c.time==='number'?c.time:Math.floor((c.time instanceof Date?c.time.getTime():+c.time)/1000);
-        const cl=+c.close||+c.value||0, op=+c.open||cl, hi=+c.high||Math.max(op,cl), lo=+c.low||Math.min(op,cl);
-        if (!isFinite(cl)||cl<=0) return;
-        this.series.update({time:t, open:op, high:hi===lo?hi*1.00005:hi, low:hi===lo?lo*0.99995:lo, close:cl});
+        const t  = typeof c.time === 'number' ? c.time
+                 : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000);
+        const cl = +c.close || +c.value || 0;
+        if (!isFinite(cl) || cl < 50000) return;
+        const op = +c.open  || cl;
+        const hi = +c.high  || Math.max(op, cl);
+        const lo = +c.low   || Math.min(op, cl);
+        const bm = cl * 0.0003;
+        this.series.update({
+          time:  t,
+          open:  op,
+          high:  hi < cl + bm ? cl + bm : hi,
+          low:   lo > cl - bm ? cl - bm : lo,
+          close: cl,
+        });
       } catch(e) {}
     }
+
     fitAll() {
-    if (!this._initialFitDone) {
-      try { this.chart?.timeScale().fitContent(); } catch(e) {}
-      this._initialFitDone = true;
+      if (!this._initialFitDone) {
+        try { this.chart?.timeScale().fitContent(); } catch(e) {}
+        this._initialFitDone = true;
+      }
     }
   }
-  }
-  </script>
+  </script>>>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ALPHACORE // Trading Bot Command Center</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2300e5c7'/><text x='16' y='22' font-family='Inter,system-ui,sans-serif' font-size='19' font-weight='800' text-anchor='middle' fill='%23070708'>A</text></svg>" />
@@ -3138,7 +3220,7 @@ function renderEquityChart(snapshots) {
 // CHART ENGINE — wraps chart.js (EquityChart + StockChart)
 // ═══════════════════════════════════════════════════════════════════
 
-const chart = { tf: '1H', allCandles: [], _inst: null };
+const chart = { tf: '4H', allCandles: [], _inst: null };
 let _liveCandleLastBucketKey = 0;
 
 function _equityChart() {
@@ -3198,8 +3280,8 @@ function buildCandlesForTF(snapshots, tf) {
       out.push({ time: timeSec, open, high: hh, low: ll, close });
       lastClose = close;
     } else if (lastClose !== null) {
-      // Flat forward-fill — tiny range so it's visible as a doji
-      out.push({ time: timeSec, open: lastClose, high: lastClose*(1+0.0001), low: lastClose*(1-0.0001), close: lastClose });
+      const bm = lastClose * 0.0003;
+      out.push({ time: timeSec, open: lastClose, high: lastClose+bm, low: lastClose-bm, close: lastClose });
     }
   }
   return out;
@@ -3215,10 +3297,10 @@ function scheduleRedraw() { redrawChart(); }
 
 function tickLiveCandle() {
   const v = +(state.portfolio?.total_value || state.botStatus?.equity || 0);
-  if (!isFinite(v) || v <= 0) return;
-  // Sanity check — reject values more than 20% from last known equity
+  if (!isFinite(v) || v < 50000) return;
+  // Sanity check — reject values more than 15% from last known equity
   const lastKnown = tickLiveCandle._last || v;
-  if (lastKnown > 0 && Math.abs(v - lastKnown) / lastKnown > 0.20) return;
+  if (lastKnown > 0 && Math.abs(v - lastKnown) / lastKnown > 0.15) return;
 
   const hasPositions = (state.positions?.length || 0) > 0;
   const prev = tickLiveCandle._last || 0;
@@ -3245,7 +3327,8 @@ function tickLiveCandle() {
       const fc = last.close;
       chart.allCandles.push({ time: k, open: fc, high: fc*1.00005, low: fc*0.99995, close: fc });
     }
-    chart.allCandles.push({ time: keySec, open: last.close, high: last.close, low: last.close, close: v });
+    const _bm = v * 0.0003;
+    chart.allCandles.push({ time: keySec, open: last.close, high: Math.max(last.close,v)+_bm, low: Math.min(last.close,v)-_bm, close: v });
   } else if (hasPositions || changed) {
     last.close = v;
     last.high  = Math.max(last.high, v);
@@ -3258,8 +3341,8 @@ function tickLiveCandle() {
   if (c.high <= c.low) { c.high *= 1.00005; c.low *= 0.99995; }
 
   const inst = _equityChart();
-  if (inst?.series && c) {
-    try { inst.series.update({ time: c.time, open: +c.open, high: +c.high, low: +c.low, close: +c.close }); }
+  if (inst) {
+    try { inst.update(c); }
     catch(e) {}
   }
 }
