@@ -16,153 +16,115 @@
   class EquityChart {
     constructor(containerId) {
       this.el = document.getElementById(containerId);
-      this.chart = null;
-      this.series = null;
-      this.ema   = null;
+      this.chart = null; this.series = null; this.ema = null;
       this._initialFitDone = false;
       if (this.el) this._init();
     }
-
     _init() {
-      const w = this.el.offsetWidth  || 900;
+      const w = this.el.offsetWidth || 900;
       const h = this.el.offsetHeight || 320;
-
       this.chart = LightweightCharts.createChart(this.el, {
-        width:  w,
-        height: h,
-        layout: {
-          background: { type: 'solid', color: 'transparent' },
-          textColor:  'rgba(255,255,255,0.5)',
-          fontSize:   12,
-        },
-        grid: {
-          vertLines: { color: 'rgba(255,255,255,0.05)' },
-          horzLines: { color: 'rgba(255,255,255,0.05)' },
-        },
+        width: w, height: h,
+        layout: { background:{type:'solid',color:'transparent'}, textColor:'rgba(255,255,255,0.5)', fontSize:11 },
+        grid: { vertLines:{color:'rgba(255,255,255,0.04)'}, horzLines:{color:'rgba(255,255,255,0.04)'} },
         crosshair: {
           mode: LightweightCharts.CrosshairMode.Normal,
-          vertLine: { color: 'rgba(255,255,255,0.3)', labelBackgroundColor: '#131722' },
-          horzLine: { color: 'rgba(255,255,255,0.3)', labelBackgroundColor: '#131722' },
+          vertLine: { color:'rgba(255,255,255,0.3)', labelBackgroundColor:'#131722' },
+          horzLine: { color:'rgba(255,255,255,0.3)', labelBackgroundColor:'#131722' },
         },
         rightPriceScale: {
-          borderColor:   'rgba(255,255,255,0.08)',
-          scaleMargins:  { top: 0.1, bottom: 0.1 },
-          autoScale:     true,
+          borderColor:  'rgba(255,255,255,0.08)',
+          autoScale:    true,
+          // Keep Y-axis tight to actual data — don't show huge empty space
+          scaleMargins: { top: 0.15, bottom: 0.15 },
         },
         timeScale: {
-          borderColor:       'rgba(255,255,255,0.08)',
-          timeVisible:       true,
-          secondsVisible:    false,
-          rightOffset:       8,
-          barSpacing:        6,
-          minBarSpacing:     2,
+          borderColor:    'rgba(255,255,255,0.08)',
+          timeVisible:    true,
+          secondsVisible: false,
+          rightOffset:    5,
+          barSpacing:     8,
+          minBarSpacing:  3,
         },
-        handleScale:  { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
-        handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true },
+        handleScale:  { mouseWheel:true, pinch:true, axisPressedMouseMove:true },
+        handleScroll: { mouseWheel:true, pressedMouseMove:true, horzTouchDrag:true, vertTouchDrag:false },
       });
 
-      // TV-style candlestick series
       this.series = this.chart.addCandlestickSeries({
-        upColor:          '#26a69a',
-        downColor:        '#ef5350',
-        borderUpColor:    '#26a69a',
-        borderDownColor:  '#ef5350',
-        wickUpColor:      '#26a69a',
-        wickDownColor:    '#ef5350',
+        upColor:         '#26a69a',
+        downColor:       '#ef5350',
+        borderUpColor:   '#26a69a',
+        borderDownColor: '#ef5350',
+        wickUpColor:     '#26a69a',
+        wickDownColor:   '#ef5350',
         priceLineVisible:    true,
-        priceLineColor:      'rgba(255,255,255,0.3)',
+        priceLineColor:      'rgba(255,255,255,0.25)',
         priceLineWidth:      1,
-        priceLineStyle:      LightweightCharts.LineStyle.Dashed,
+        priceLineStyle:      2,
         lastValueVisible:    true,
-        priceFormat:         { type: 'price', precision: 2, minMove: 0.01 },
+        priceFormat:         { type:'price', precision:2, minMove:0.01 },
       });
 
-      // EMA overlay
       this.ema = this.chart.addLineSeries({
-        color:            'rgba(245,197,24,0.7)',
-        lineWidth:        1,
-        lineStyle:        LightweightCharts.LineStyle.Dashed,
-        priceLineVisible: false,
-        lastValueVisible: false,
+        color:'rgba(245,197,24,0.6)', lineWidth:1, lineStyle:2,
+        priceLineVisible:false, lastValueVisible:false,
       });
 
-      // Auto-resize when panel resizes
-      const ro = new ResizeObserver(() => {
+      new ResizeObserver(() => {
         if (!this.el || !this.chart) return;
         const nw = this.el.offsetWidth, nh = this.el.offsetHeight;
         if (nw > 10 && nh > 10) this.chart.resize(nw, nh);
-      });
-      ro.observe(this.el);
+      }).observe(this.el);
     }
 
-    // candles = array of {time (unix sec), open, high, low, close}
     setData(candles) {
       if (!this.series || !candles?.length) return;
       const seen = new Set();
       const data = candles
         .map(c => {
-          const t  = typeof c.time === 'number' ? c.time
-                   : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000);
-          const cl = +c.close || +c.value || 0;
-          const op = +c.open  || cl;
-          const hi = +c.high  || Math.max(op, cl);
-          const lo = +c.low   || Math.min(op, cl);
-          // Minimum visible body — prevents invisible zero-height candles
-          const bodyMin = cl * 0.0003;
-          return {
-            time:  t,
-            open:  op,
-            high:  hi < cl + bodyMin ? cl + bodyMin : hi,
-            low:   lo > cl - bodyMin ? cl - bodyMin : lo,
-            close: cl,
-          };
+          const t  = typeof c.time==='number' ? c.time : Math.floor((c.time instanceof Date?c.time.getTime():+c.time)/1000);
+          const cl = +c.close||+c.value||0;
+          const op = +c.open||cl, hi = +c.high||Math.max(op,cl), lo = +c.low||Math.min(op,cl);
+          return { time:t, open:op, high:hi, low:lo, close:cl };
         })
-        .filter(c =>
-          isFinite(c.close) && c.close > 50000 &&
-          c.time > 0 &&
-          !seen.has(c.time) && seen.add(c.time)
-        )
-        .sort((a, b) => a.time - b.time);
+        .filter(c => isFinite(c.close) && c.close > 50000 && c.time > 0 && !seen.has(c.time) && seen.add(c.time))
+        .sort((a,b) => a.time - b.time);
 
       if (!data.length) return;
-      try { this.series.setData(data); } catch(e) { console.warn('Chart setData:', e); return; }
 
-      // EMA(21)
+      // Only keep candles where equity actually moved (> $1 change from prev close)
+      // OR it's the first/last candle. This removes the flat line of identical candles.
+      const significant = data.filter((c, i, arr) => {
+        if (i === 0 || i === arr.length - 1) return true;
+        const prev = arr[i-1];
+        return Math.abs(c.close - prev.close) > 1 ||
+               Math.abs(c.high  - c.low)       > 5;
+      });
+
+      // If less than 5 significant candles, show all (don't filter new sessions)
+      const display = significant.length >= 5 ? significant : data;
+
+      try { this.series.setData(display); } catch(e) { console.warn('setData',e); return; }
+
       try {
-        const k = 2 / 21;
-        let e = data[0].close;
-        this.ema.setData(data.map((d, i) => {
-          e = i === 0 ? d.close : d.close * k + e * (1 - k);
-          return { time: d.time, value: e };
-        }));
+        const k=2/21; let e=display[0].close;
+        this.ema.setData(display.map((d,i)=>{ e=i===0?d.close:d.close*k+e*(1-k); return {time:d.time,value:e}; }));
       } catch(e) {}
 
-      // Fit on first load only — never reset user zoom
       if (!this._initialFitDone) {
         try { this.chart.timeScale().fitContent(); } catch(e) {}
         this._initialFitDone = true;
       }
     }
 
-    // Live tick — update current candle without resetting view
     update(c) {
       if (!this.series) return;
       try {
-        const t  = typeof c.time === 'number' ? c.time
-                 : Math.floor((c.time instanceof Date ? c.time.getTime() : +c.time) / 1000);
-        const cl = +c.close || +c.value || 0;
-        if (!isFinite(cl) || cl < 50000) return;
-        const op = +c.open  || cl;
-        const hi = +c.high  || Math.max(op, cl);
-        const lo = +c.low   || Math.min(op, cl);
-        const bm = cl * 0.0003;
-        this.series.update({
-          time:  t,
-          open:  op,
-          high:  hi < cl + bm ? cl + bm : hi,
-          low:   lo > cl - bm ? cl - bm : lo,
-          close: cl,
-        });
+        const t  = typeof c.time==='number'?c.time:Math.floor((c.time instanceof Date?c.time.getTime():+c.time)/1000);
+        const cl = +c.close||+c.value||0;
+        if (!isFinite(cl)||cl<50000) return;
+        const op = +c.open||cl, hi = +c.high||Math.max(op,cl), lo = +c.low||Math.min(op,cl);
+        this.series.update({ time:t, open:op, high:hi, low:lo, close:cl });
       } catch(e) {}
     }
 
@@ -173,7 +135,7 @@
       }
     }
   }
-  </script>>>
+  </script>>>>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ALPHACORE // Trading Bot Command Center</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2300e5c7'/><text x='16' y='22' font-family='Inter,system-ui,sans-serif' font-size='19' font-weight='800' text-anchor='middle' fill='%23070708'>A</text></svg>" />
@@ -2202,17 +2164,17 @@ async function fetchEquity() {
   // Range based on selected timeframe — don't pull 30 days when viewing 5M chart
   // That causes Y-axis to span full account history ($83k-$118k) and squishes today's candles
   const tfRangeMs = {
-    '5M':  1  * 24*60*60*1000,  // 5m chart  = today only
-    '15M': 2  * 24*60*60*1000,  // 15m chart = 2 days
-    '30M': 3  * 24*60*60*1000,  // 30m chart = 3 days
-    '1H':  7  * 24*60*60*1000,  // 1h chart  = 1 week
-    '4H':  14 * 24*60*60*1000,  // 4h chart  = 2 weeks
-    '1D':  90 * 24*60*60*1000,  // 1d chart  = 3 months
+    '5M':  3  * 24*60*60*1000,  // 5m  = 3 days
+    '15M': 7  * 24*60*60*1000,  // 15m = 1 week
+    '30M': 14 * 24*60*60*1000,  // 30m = 2 weeks
+    '1H':  30 * 24*60*60*1000,  // 1h  = 1 month
+    '4H':  180* 24*60*60*1000,  // 4h  = 6 months (full history)
+    '1D':  365* 24*60*60*1000,  // 1d  = 1 year
   };
-  const rangeMs = tfRangeMs[chart?.tf || '5M'] || 1 * 24*60*60*1000;
+  const rangeMs = tfRangeMs[chart?.tf || '4H'] || 180 * 24*60*60*1000;
   const since = new Date(Date.now() - rangeMs).toISOString();
   const data = await sbFetch(
-    `${tbl}?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=500`,
+    `${tbl}?select=value,created_at&created_at=gte.${since}&order=created_at.asc&limit=2000`,
     'GET'
   );
 
