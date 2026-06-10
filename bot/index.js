@@ -6163,6 +6163,9 @@ function sentimentAllows(direction, sentiment) {
 
 // sizeMultiplier lets regime pass entries but at reduced size (e.g. 0.5 in chop)
 async function edgeGate(sym, direction, sigInfo, bars5m) {
+  // Crypto always passes edge gate at full size — no regime/volume concerns
+  if (isCrypto(sym)) return { pass: true, sizeMultiplier: 1.0, reason: 'crypto 24/7' };
+
   // ── SIM MODE: skip market-data gates ──
   // The regime classifier pulls LIVE SPY/UVXY data — meaningless when sim
   // is replaying historical bars from days/weeks ago. Volume/MTF rely on
@@ -6437,7 +6440,6 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
 
   // PMRB: 60% initial size — preserves capital for the 40% add-on at reclaim
   const isPMRBScaled = CONFIG.strategy === 'pmrb' && sigInfo?.pmrb?.reclaimLevel;
-  // Crypto: preserve fractional qty — don't floor to integer
   const _cryptoSym = isCrypto(sym);
   let finalQty = _cryptoSym
     ? Math.min(qty, maxDollarLoss / (price * CONFIG.hardMaxLoss))
@@ -6813,6 +6815,12 @@ async function manageShort(sym, price, bars) {
   const chg      = (pos.entryPrice - price) / pos.entryPrice;
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
 
+  // ── STALE SHORT GUARD: force cover if held > 48 hours ──
+  if (holdMins > 48 * 60 && !isSimMode()) {
+    log('warn', `⚠️ ${sym} STALE short (${Math.round(holdMins/60)}h) — force covering`);
+    return coverShort(sym, price, 'STALE_POSITION');
+  }
+
   // Intraday only — close shorts before market close too
   // Close after market — don't require isMarketOpen() since it's already false
   if (!isSimMode() && isWeekday()) {
@@ -6995,10 +7003,6 @@ async function exitPosition(sym, price, reason) {
   const pos = positions[sym];
   if (!pos) return;
 
-  // ── Exit in-flight guard ─────────────────────────────────────
-  // Without this: sell order fires, takes 200ms to settle, next scan
-  // still sees the position open (Alpaca hasn't confirmed yet), fires
-  // another sell. With partial fills this loops indefinitely.
   if (_exitInFlight.has(sym)) {
     log('warn', `⚠️ ${sym} exit already in-flight — skipping duplicate`);
     return;
@@ -7009,7 +7013,26 @@ async function exitPosition(sym, price, reason) {
   }
   _exitInFlight.add(sym);
 
-  const qtyToSell = pos.qtyRemaining || pos.qty;
+  // Sync qty from Alpaca to prevent "insufficient qty" errors (e.g. LYFT 222→215)
+  let qtyToSell = pos.qtyRemaining || pos.qty;
+  try {
+    const ap = await alpacaFetch(`${ALPACA_BASE()}/v2/positions/${encodeURIComponent(sym)}`).catch(() => null);
+    if (ap) {
+      const aqty = Math.abs(+(ap.qty || 0));
+      if (aqty === 0) {
+        log('sys', `🔧 ${sym} already flat on Alpaca — cleaning up position`);
+        delete positions[sym];
+        _exitInFlight.delete(sym);
+        await syncPortfolio();
+        return;
+      }
+      if (aqty !== qtyToSell) {
+        log('sys', `🔧 ${sym} qty sync before exit: bot=${qtyToSell} → alpaca=${aqty}`);
+        qtyToSell = aqty;
+        if (positions[sym]) { positions[sym].qty = aqty; positions[sym].qtyRemaining = aqty; }
+      }
+    }
+  } catch(e) { log('warn', `${sym} qty sync failed: ${e.message?.slice(0,50)}`); }
   const forceClose = reason === 'MANUAL_DISCORD';
 
   if (isSimMode() || (CONFIG.mode === 'alpaca' && CONFIG.alpacaKey)) {
@@ -7824,6 +7847,12 @@ async function managePosition(sym, price, bars) {
 
   const chg      = (price - pos.entryPrice) / pos.entryPrice;
   const holdMins = (Date.now() - new Date(pos.entryTime).getTime()) / 60000;
+
+  // ── STALE POSITION GUARD: force close if held > 48 hours ──────────
+  if (holdMins > 48 * 60 && !isSimMode()) {
+    log('warn', `⚠️ ${sym} STALE long (${Math.round(holdMins/60)}h old) — force closing`);
+    return exitPosition(sym, price, 'STALE_POSITION');
+  }
 
   // ── INTRADAY ONLY — close 15 min before market close ─────────────
   // Never hold overnight — gaps are unpredictable and can blow through stops
