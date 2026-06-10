@@ -65,8 +65,8 @@ const CONFIG = {
   // neutral  = take both directions (ranging market, lower confidence)
   marketSentiment: process.env.MARKET_SENTIMENT || 'auto',
   rsiPeriod:     +(process.env.RSI_PERIOD     || 14),
-  rsiOversold:   +(process.env.RSI_OVERSOLD   || 35),
-  rsiOverbought: +(process.env.RSI_OVERBOUGHT || 65),
+  rsiOversold:   +(process.env.RSI_OVERSOLD   || 30), // tighter — only extreme oversold
+  rsiOverbought: +(process.env.RSI_OVERBOUGHT || 70), // tighter — only extreme overbought
 
   startingCapital:  +(process.env.CAPITAL          || 100000),
   maxPositionPct:   +(process.env.MAX_POSITION_PCT  || 15) / 100,
@@ -121,7 +121,7 @@ const CONFIG = {
   scalpSymbols:        (process.env.SCALP_SYMBOLS || 'NVDA,TSLA,MSTR,COIN,AMD,META,AAPL,SPY,QQQ').split(',').map(s => s.trim().toUpperCase()),
   scalpTpPct:          +(process.env.SCALP_TP_PCT        || 0.3)  / 100, // 0.3% TP (2x ATR)
   scalpSlPct:          +(process.env.SCALP_SL_PCT        || 0.15) / 100, // 0.15% SL (1x ATR)
-  scalpMaxHoldMins:    +(process.env.SCALP_MAX_HOLD_MINS || 4),           // max 4 min
+  scalpMaxHoldMins:    +(process.env.SCALP_MAX_HOLD_MINS || 10),          // was 4 — more room
   scalpMaxPositions:   +(process.env.SCALP_MAX_POSITIONS || 1),           // 1 at a time — focus
   scalpPositionPct:    +(process.env.SCALP_POSITION_PCT  || 10)  / 100,  // 10% per scalp — smaller risk
   scalpMinScore:       +(process.env.SCALP_MIN_SCORE     || 75),          // 75 = high bar
@@ -480,8 +480,8 @@ const ADAPT_BOUNDS = {
 // and live's STOP_LOSS distribution shouldn't pre-bias sim either).
 const ADAPTIVE_DEFAULTS = {
   minConfidence:  70,
-  rsiOversold:    35,
-  rsiOverbought:  65,
+  rsiOversold:    30,
+  rsiOverbought:  70,
   atrStopMult:    2.0,
   maxPositionPct: 0.15,
   tp1Pct:         0.015,
@@ -1927,14 +1927,14 @@ async function syncPositions() {
       symbol:        sym,
       side:          'LONG',
       entry_price:   +pos.entryPrice.toFixed(4),
-      qty:           +Math.abs(qty || 0),
+      qty:           +parseFloat(Math.abs(qty || 0).toFixed(6)) || 0,
       cost:          +(pos.entryPrice * (qty||0)).toFixed(2),
       current_price: +cur.toFixed(4),
       pnl:           +pnl.toFixed(2),
       pnl_pct:       +pnlPct.toFixed(2),
       entry_time:    new Date(pos.entryTime).toISOString(),
       high_water:    +(pos.highWater || pos.entryPrice).toFixed(4),
-      confidence:    pos.sigInfo?.confidence || 0,
+      confidence:    +(pos.sigInfo?.confidence || 0),
       updated_at:    new Date().toISOString(),
     });
   }
@@ -1957,7 +1957,7 @@ async function syncPositions() {
       pnl_pct:       +pnlPct.toFixed(2),
       entry_time:    new Date(pos.entryTime).toISOString(),
       high_water:    +(pos.lowWater || pos.entryPrice).toFixed(4),
-      confidence:    pos.sigInfo?.confidence || 0,
+      confidence:    +(pos.sigInfo?.confidence || 0),
       updated_at:    new Date().toISOString(),
     });
   }
@@ -1985,7 +1985,7 @@ async function syncPositions() {
       pnl_pct:       +pnlPct.toFixed(2),
       entry_time:    new Date(pos.entryTime).toISOString(),
       high_water:    +(pos.highWater || pos.entryPrice).toFixed(4),
-      confidence:    pos.sigInfo?.confidence || 0,
+      confidence:    +(pos.sigInfo?.confidence || 0),
       updated_at:    new Date().toISOString(),
     });
   }
@@ -3009,7 +3009,9 @@ async function placeOrder(symbol, qty, side, price = 0) {
     orderBody = { symbol, notional: String(notional), side, type: 'market', time_in_force: 'gtc' };
     log('order', `🪙 ${symbol} notional order: $${notional}`);
   } else {
-    orderBody = { symbol, qty: String(qty), side, type: 'market', time_in_force: 'day' };
+    // Stocks use 'day' (expires at market close), crypto needs 'gtc' (good till cancelled)
+    orderBody = { symbol, qty: String(qty), side, type: 'market',
+                  time_in_force: isCrypto(symbol) ? 'gtc' : 'day' };
   }
   const data = await alpacaFetch(`${ALPACA_BASE()}/v2/orders`, {
     method: 'POST',
@@ -5343,22 +5345,35 @@ function generateSignal(sym, bars5m, bars15m) {
     return { signal:'HOLD', confidence:0, score:0, reasons:[`AH: RSI neutral ${r.toFixed(1)} — no after-hours edge`], rsi:r };
   }
 
+  // RSI momentum: check if RSI is moving in signal direction (confirms reversal)
+  const rsiPrev = rsi(c5.slice(0, -3), CONFIG.rsiPeriod); // RSI 3 bars ago
+  const rsiMomentumUp   = r > rsiPrev + 1;  // RSI rising = buy momentum confirming
+  const rsiMomentumDown = r < rsiPrev - 1;  // RSI falling = sell momentum confirming
+
   if (r < _rsiOs) {
-    // Falling knife: skip after-hours (bars are stale from yesterday's close)
     if (isFallingKnife && !_isCryptoSym && !_afterHours) {
       return { signal:'HOLD', confidence:0, score:0,
         reasons:[`RSI oversold (${r.toFixed(1)}) but price still falling — falling knife`], rsi:r };
     }
+    // Require RSI turning up for oversold entries (momentum confirmation)
+    if (!rsiMomentumUp && !_afterHours && !_isCryptoSym) {
+      return { signal:'HOLD', confidence:0, score:0,
+        reasons:[`RSI oversold (${r.toFixed(1)}) but momentum still down (prev:${rsiPrev.toFixed(1)}) — wait for turn`], rsi:r };
+    }
     rsiScore = 2; direction = 'buy';
-    reasons.push(`RSI ${_isCryptoSym?'crypto ':''}oversold ${r.toFixed(1)} ✅`);
+    reasons.push(`RSI ${_isCryptoSym?'crypto ':''}oversold ${r.toFixed(1)} ↑ turning ✅`);
   } else if (r > _rsiOb) {
     if (!CONFIG.shortsEnabled && !_isCryptoSym) {
       return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi:r };
     }
-    // Rising tide: skip after-hours
     if (isRisingTide && !_afterHours) {
       return { signal:'HOLD', confidence:0, score:0,
         reasons:[`RSI overbought (${r.toFixed(1)}) but price still rising — wait for peak`], rsi:r };
+    }
+    // Require RSI turning down for overbought shorts
+    if (!rsiMomentumDown && !_afterHours && !_isCryptoSym) {
+      return { signal:'HOLD', confidence:0, score:0,
+        reasons:[`RSI overbought (${r.toFixed(1)}) but momentum still up (prev:${rsiPrev.toFixed(1)}) — wait for turn`], rsi:r };
     }
     rsiScore = 2; direction = 'sell';
     reasons.push(`RSI overbought ${r.toFixed(1)} + momentum fading ✅`);
@@ -7949,8 +7964,8 @@ async function managePosition(sym, price, bars) {
   //   2. Confirmation: hwChg must hold >=0.5× ATR for 2 bars before arming
   //   3. BE stop set ABOVE entry by fee+slippage buffer (~0.12%) so the
   //      "break-even stop" is actually slightly green, not slightly red
-  const beThreshold = Math.max(posAtrPct * 1.0, 0.004); // min 0.4% (was 0.2%)
-  const BE_BUFFER   = 0.0012; // 0.12% above entry covers fees+slippage
+  const beThreshold = Math.max(posAtrPct * 1.2, 0.006); // min 0.6% — requires more profit before arming
+  const BE_BUFFER   = 0.002; // 0.2% buffer — covers fees + slippage + noise
   if (!pos.breakEvenSet && chg >= beThreshold && hwChg >= beThreshold) {
     // Confirm: has price held the gain for at least 1 bar? Avoids wick fakeouts.
     const confirmed = !bars || bars.length < 2
@@ -9444,7 +9459,7 @@ async function scalpPositionMonitor() {
 
       // ── EXIT 4: Time stop ──
       // Max 4 minutes — scalps that haven't moved must be cut loose
-      const maxMins = Math.min(CONFIG.scalpMaxHoldMins, 4);
+      const maxMins = CONFIG.scalpMaxHoldMins || 10;
       if (holdMins >= maxMins) {
         log('scalp', `⏰ Time stop: ${sym} held ${holdMins.toFixed(1)}m P&L: ${pnlNow>=0?'+':''}$${pnlNow.toFixed(2)}`);
         await exitScalp(sym, price, 'SCALP_TIME');
