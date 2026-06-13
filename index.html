@@ -3610,11 +3610,14 @@ async function renderCalendar() {
     // Always read live trades for calendar — sim trades are practice, not real P&L history
     const liveTbl = 'tc_trades';
     const data = await sbFetch(
-      `${liveTbl}?select=pnl,created_at&created_at=gte.${startDate}&created_at=lte.${endDate}T23:59:59.999Z&pnl=not.is.null&order=created_at.asc&limit=1000`,
+      `${liveTbl}?select=pnl,created_at,reason&created_at=gte.${startDate}&created_at=lte.${endDate}T23:59:59.999Z&pnl=not.is.null&order=created_at.asc&limit=1000`,
       'GET'
     );
     if (Array.isArray(data)) {
-      trades = data.filter(t => t.pnl != null); // include zero-pnl trades in sum
+      // Exclude MANUAL_CLOSE — it's a duplicate logged when bot detects Alpaca already closed
+      // the position. The real P&L is already captured by SCALP_EXIT/TAKE_PROFIT etc.
+      const EXCLUDED_REASONS = new Set(['MANUAL_CLOSE', 'MANUAL_DISCORD']);
+      trades = data.filter(t => t.pnl != null && !EXCLUDED_REASONS.has(t.reason));
       console.log(`[Calendar] ${_calMonth+1}/${_calYear}: fetched ${data.length} trades, ${trades.length} with P&L`);
     }
   } catch(e) { console.error('[Calendar] fetch error:', e); }
