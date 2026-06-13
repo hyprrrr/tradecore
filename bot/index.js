@@ -73,7 +73,7 @@ const CONFIG = {
   maxOpenPositions: +(process.env.MAX_POSITIONS     || 2),  // max 2 concurrent positions
   stopLossPct:      +(process.env.STOP_LOSS_PCT     || 2.5)/ 100, // 2.5% default — tighter R ratio
   minPrice:         15,    // skip sub-$15 stocks — wide spreads kill R ratio
-  takeProfitPct:    +(process.env.TAKE_PROFIT_PCT   || 8)  / 100,
+  takeProfitPct:    +(process.env.TAKE_PROFIT_PCT   || 3)  / 100, // 3% TP — realistic for intraday
   trailingStop:     process.env.TRAILING_STOP       !== 'false',
   trailingStopPct:  +(process.env.TRAILING_STOP_PCT || 3)  / 100,
   maxDailyLossPct:  +(process.env.MAX_DAILY_LOSS    || 3)  / 100,
@@ -189,8 +189,8 @@ async function loadRemoteConfig() {
     if (s.marketSentiment)  CONFIG.marketSentiment  = s.marketSentiment;
     if (s.market_sentiment) CONFIG.marketSentiment  = s.market_sentiment; // snake_case fallback
     if (s.rsi_period)       CONFIG.rsiPeriod        = +s.rsi_period;
-    if (s.rsi_oversold)     CONFIG.rsiOversold      = +s.rsi_oversold;
-    if (s.rsi_overbought)   CONFIG.rsiOverbought    = +s.rsi_overbought;
+    if (s.rsi_oversold)     CONFIG.rsiOversold  = Math.min(35, Math.max(25, +s.rsi_oversold));
+    if (s.rsi_overbought)   CONFIG.rsiOverbought = Math.max(65, Math.min(75, +s.rsi_overbought));
     if (s.scan_interval)    CONFIG.scanIntervalSec  = +s.scan_interval; // seconds
     if (s.stop_loss_pct)    CONFIG.stopLossPct      = +s.stop_loss_pct / 100;
     if (s.take_profit_pct)  CONFIG.takeProfitPct    = +s.take_profit_pct / 100;
@@ -489,7 +489,7 @@ const ADAPTIVE_DEFAULTS = {
   tp3Pct:         0.050,
   breakEvenAt:    0.003,
   hardMaxLoss:    0.010,
-  adaptTargetWR:  0.75,
+  adaptTargetWR:  0.60,
 };
 
 async function resetAdaptiveParams(reason = 'mode toggle') {
@@ -5355,13 +5355,9 @@ function generateSignal(sym, bars5m, bars15m) {
       return { signal:'HOLD', confidence:0, score:0,
         reasons:[`RSI oversold (${r.toFixed(1)}) but price still falling — falling knife`], rsi:r };
     }
-    // Require RSI turning up for oversold entries (momentum confirmation)
-    if (!rsiMomentumUp && !_afterHours && !_isCryptoSym) {
-      return { signal:'HOLD', confidence:0, score:0,
-        reasons:[`RSI oversold (${r.toFixed(1)}) but momentum still down (prev:${rsiPrev.toFixed(1)}) — wait for turn`], rsi:r };
-    }
-    rsiScore = 2; direction = 'buy';
-    reasons.push(`RSI ${_isCryptoSym?'crypto ':''}oversold ${r.toFixed(1)} ↑ turning ✅`);
+      rsiScore = rsiMomentumUp ? 3 : 2; // bonus score if RSI turning in signal direction
+    direction = 'buy';
+    reasons.push(`RSI ${_isCryptoSym?'crypto ':''}oversold ${r.toFixed(1)}${rsiMomentumUp?' ↑ turning ✅':' (flat momentum)'}`);
   } else if (r > _rsiOb) {
     if (!CONFIG.shortsEnabled && !_isCryptoSym) {
       return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi:r };
@@ -5370,13 +5366,10 @@ function generateSignal(sym, bars5m, bars15m) {
       return { signal:'HOLD', confidence:0, score:0,
         reasons:[`RSI overbought (${r.toFixed(1)}) but price still rising — wait for peak`], rsi:r };
     }
-    // Require RSI turning down for overbought shorts
-    if (!rsiMomentumDown && !_afterHours && !_isCryptoSym) {
-      return { signal:'HOLD', confidence:0, score:0,
-        reasons:[`RSI overbought (${r.toFixed(1)}) but momentum still up (prev:${rsiPrev.toFixed(1)}) — wait for turn`], rsi:r };
-    }
-    rsiScore = 2; direction = 'sell';
-    reasons.push(`RSI overbought ${r.toFixed(1)} + momentum fading ✅`);
+    // RSI momentum bonus for shorts
+    rsiScore = rsiMomentumDown ? 3 : 2;
+    direction = 'sell';
+    reasons.push(`RSI overbought ${r.toFixed(1)}${rsiMomentumDown?' ↓ turning ✅':' (flat momentum)'}`);
   } else if (r < 38) {
     rsiScore = 1; direction = 'buy';
     reasons.push(`RSI leaning oversold ${r.toFixed(1)}`);
@@ -10346,8 +10339,8 @@ setTimeout(async () => {
 
 // Hard reset adaptive params on every startup — prevents paralytic drift across restarts
 // These values are relearned from scratch each session
-CONFIG.rsiOversold   = 35;
-CONFIG.rsiOverbought = 65;
+CONFIG.rsiOversold   = 30;  // tighter — only extreme oversold
+CONFIG.rsiOverbought = 70;  // tighter — only extreme overbought
 CONFIG.minConfidence = 62;
 CONFIG.maxPositionPct = 0.10;
 CONFIG.adaptTargetWR  = 0.60;
