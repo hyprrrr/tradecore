@@ -5286,9 +5286,11 @@ function generateSignal(sym, bars5m, bars15m) {
   const r = rsi(c5, CONFIG.rsiPeriod);
   // _isCryptoSym declared at top of function
   // Per-coin RSI thresholds — high-vol cryptos use wider bands for better signal capture
-  const _isHighVolCrypto = _isCryptoSym && ['DOGEUSD','SOLUSD','AVAXUSD','XRPUSD'].includes(sym);
-  const _effRsiOs = _isHighVolCrypto ? 42 : _rsiOs;  // DOGE/SOL/AVAX: oversold < 42
-  const _effRsiOb = _isHighVolCrypto ? 58 : _rsiOb;  // DOGE/SOL/AVAX: overbought > 58
+  // Crypto RSI thresholds — wider than stocks to catch more signals
+  // High-vol coins (DOGE/SOL/AVAX/XRP) swing more, use slightly wider bands
+  const _isHighVolCrypto = _isCryptoSym && ['DOGEUSD','SOLUSD','AVAXUSD','XRPUSD','LINKUSD'].includes(sym);
+  const _effRsiOs = _isCryptoSym ? (_isHighVolCrypto ? 40 : 42) : _rsiOs;
+  const _effRsiOb = _isCryptoSym ? (_isHighVolCrypto ? 60 : 58) : _rsiOb;
   let rsiScore = 0;
 
   // Detect if this is a trending day vs mean-reversion day
