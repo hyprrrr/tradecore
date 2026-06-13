@@ -2716,9 +2716,14 @@ const BYPASS_HOURS = process.env.BYPASS_HOURS === 'true';
 // Crypto symbols trade 24/7 on Alpaca — never blocked by market hours
 // Alpaca supports: BTCUSD, ETHUSD, LTCUSD, BCHUSD, UNIUSD, LINKUSD, etc.
 const CRYPTO_SYMBOLS = new Set([
-  'BTCUSD','ETHUSD','LTCUSD','BCHUSD','UNIUSD','LINKUSD',
-  'AAVEUSD','MATICUSD','SOLUSD','AVAXUSD','DOGEUSD','SHIBUSD',
-  'XRPUSD','ADAUSD','DOTUSD','ALGOUSD','XLMUSD','BATUSD',
+  // Tier 1 — highest liquidity on Alpaca
+  'BTCUSD','ETHUSD','SOLUSD','AVAXUSD','XRPUSD','DOGEUSD','LINKUSD',
+  // Tier 2 — good volume
+  'LTCUSD','BCHUSD','DOTUSD','ADAUSD','UNIUSD','AAVEUSD',
+  // Tier 3 — lower volume but valid
+  'MATICUSD','SHIBUSD','ALGOUSD','XLMUSD','BATUSD',
+  // Slash variants (Kraken/Coinbase format)
+  'BTC/USD','ETH/USD','SOL/USD','AVAX/USD','XRP/USD','DOGE/USD','LINK/USD',
 ]);
 
 function isCrypto(sym) {
@@ -2802,7 +2807,7 @@ async function fetchBars(symbol, timeframe, limit) {
   if (isCrypto(symbol)) {
     try {
       const fetch = await getFetch();
-      const KRAKEN_MAP = { BTCUSD: 'XBTUSD', ETHUSD: 'ETHUSD', LTCUSD: 'LTCUSD' };
+      const KRAKEN_MAP = { BTCUSD:'XBTUSD', ETHUSD:'ETHUSD', LTCUSD:'LTCUSD', SOLUSD:'SOLUSD', AVAXUSD:'AVAXUSD', LINKUSD:'LINKUSD', XRPUSD:'XRPUSD', DOGEUSD:'XDGUSD', DOTUSD:'DOTUSD' };
       const krakenSym = KRAKEN_MAP[symbol] || symbol;
       const kInterval = timeframe === '5Min' ? 5 : timeframe === '15Min' ? 15 : timeframe === '1Day' ? 1440 : 60;
       const since = Math.floor((Date.now() - 7*24*60*60*1000) / 1000);
@@ -5280,6 +5285,10 @@ function generateSignal(sym, bars5m, bars15m) {
   // ── GATE 1: RSI must be in meaningful territory ──
   const r = rsi(c5, CONFIG.rsiPeriod);
   // _isCryptoSym declared at top of function
+  // Per-coin RSI thresholds — high-vol cryptos use wider bands for better signal capture
+  const _isHighVolCrypto = _isCryptoSym && ['DOGEUSD','SOLUSD','AVAXUSD','XRPUSD'].includes(sym);
+  const _effRsiOs = _isHighVolCrypto ? 42 : _rsiOs;  // DOGE/SOL/AVAX: oversold < 42
+  const _effRsiOb = _isHighVolCrypto ? 58 : _rsiOb;  // DOGE/SOL/AVAX: overbought > 58
   let rsiScore = 0;
 
   // Detect if this is a trending day vs mean-reversion day
@@ -5350,7 +5359,7 @@ function generateSignal(sym, bars5m, bars15m) {
   const rsiMomentumUp   = r > rsiPrev + 1;  // RSI rising = buy momentum confirming
   const rsiMomentumDown = r < rsiPrev - 1;  // RSI falling = sell momentum confirming
 
-  if (r < _rsiOs) {
+  if (r < _effRsiOs) {
     if (isFallingKnife && !_isCryptoSym && !_afterHours) {
       return { signal:'HOLD', confidence:0, score:0,
         reasons:[`RSI oversold (${r.toFixed(1)}) but price still falling — falling knife`], rsi:r };
@@ -5358,7 +5367,7 @@ function generateSignal(sym, bars5m, bars15m) {
       rsiScore = rsiMomentumUp ? 3 : 2; // bonus score if RSI turning in signal direction
     direction = 'buy';
     reasons.push(`RSI ${_isCryptoSym?'crypto ':''}oversold ${r.toFixed(1)}${rsiMomentumUp?' ↑ turning ✅':' (flat momentum)'}`);
-  } else if (r > _rsiOb) {
+  } else if (r > _effRsiOb) {
     if (!CONFIG.shortsEnabled && !_isCryptoSym) {
       return { signal:'HOLD', confidence:0, score:0, reasons:[`RSI overbought (${r.toFixed(1)}) — shorts disabled`], rsi:r };
     }
@@ -9738,7 +9747,18 @@ async function fetchAllBarsParallel(symbols) {
   const cryptoToFetch = symbols.filter(s => isCrypto(s));
   if (cryptoToFetch.length > 0) {
     const fetch = await getFetch();
-    const KRAKEN_MAP = { BTCUSD: 'XBTUSD', ETHUSD: 'ETHUSD', LTCUSD: 'LTCUSD', SOLUSD: 'SOLUSD' };
+    const KRAKEN_MAP = {
+    BTCUSD:  'XBTUSD',
+    ETHUSD:  'ETHUSD',
+    LTCUSD:  'LTCUSD',
+    SOLUSD:  'SOLUSD',
+    AVAXUSD: 'AVAXUSD',
+    LINKUSD: 'LINKUSD',
+    XRPUSD:  'XRPUSD',
+    DOGEUSD: 'XDGUSD',  // Kraken uses XDG for DOGE
+    DOTUSD:  'DOTUSD',
+    ADAUSD:  'ADAUSD',
+  };
     await Promise.allSettled(cryptoToFetch.map(async sym => {
       const cached = barCache.get(`${sym}_5Min`);
       if (cached?.bars?.length >= 15 && Date.now() - cached.ts < 60000) return;
@@ -10372,7 +10392,17 @@ async function prewarmBarCache() {
 
 loadRemoteConfig().then(async () => {
   // Add crypto to watchlist after config is loaded (CONFIG.symbols is populated)
-  const DEFAULT_CRYPTO = ['BTCUSD', 'ETHUSD'];
+  // Alpaca-supported cryptos — ordered by liquidity/volume
+  // These all have 24/7 trading, fractional ordering, and good spreads
+  const DEFAULT_CRYPTO = [
+    'BTCUSD',   // Bitcoin — most liquid
+    'ETHUSD',   // Ethereum — 2nd most liquid
+    'SOLUSD',   // Solana — high volatility, great for signals
+    'AVAXUSD',  // Avalanche — good momentum moves
+    'LINKUSD',  // Chainlink — strong trend signals
+    'XRPUSD',   // XRP — high volume, good for scalps
+    'DOGEUSD',  // Doge — volatile, big RSI swings
+  ];
   for (const cs of DEFAULT_CRYPTO) {
     if (Array.isArray(CONFIG.symbols) && !CONFIG.symbols.includes(cs)) {
       CONFIG.symbols.unshift(cs);
