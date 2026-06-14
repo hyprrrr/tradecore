@@ -8130,11 +8130,16 @@ async function runScan() {
   lastScanTime = new Date();
   const session = getCurrentSession();
 
-  // Sim runs regardless of weekend (replay continues on its own historical
-  // calendar). Live mode still bails on weekends — markets are closed.
-  if (!isSimMode() && !isWeekday()) {
+  // Sim runs regardless of weekend.
+  // Live mode: skip weekend ONLY if no crypto in watchlist.
+  // Crypto trades 24/7 — BTC/ETH/SOL etc don't care about weekends.
+  const hasCrypto = Array.isArray(CONFIG.symbols) && CONFIG.symbols.some(s => isCrypto(s));
+  if (!isSimMode() && !isWeekday() && !hasCrypto) {
     log('scan', 'Weekend — markets closed globally');
     return;
+  }
+  if (!isSimMode() && !isWeekday()) {
+    log('scan', 'Weekend — stocks closed, scanning crypto only');
   }
 
   // Settings are loaded by the fast config poll every 5s — no need to reload here
@@ -8149,7 +8154,13 @@ async function runScan() {
 
   // Build dynamic scan list: favorites + screener candidates
   const scanList = buildScanList();
-  const eligible = scanList.filter(s => shouldScanSymbol(s));
+  // Weekend: only scan crypto (stocks are closed, crypto trades 24/7)
+  const _isWeekend = !isSimMode() && !isWeekday();
+  const eligible = scanList.filter(s => shouldScanSymbol(s) && (_isWeekend ? isCrypto(s) : true));
+  if (_isWeekend && !eligible.length) {
+    log('scan', 'Weekend — no crypto in watchlist, nothing to scan');
+    return;
+  }
 
   // ── SCAN ROTATION ──
   // Alpaca Basic = 200 req/min. Each symbol = ~2 bar fetches. At 10s scan
