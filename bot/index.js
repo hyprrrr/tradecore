@@ -8148,18 +8148,26 @@ async function runScan() {
   // Settings are loaded by the fast config poll every 5s — no need to reload here
   // This prevents the sim mode from being reset on every scan
 
-  // If swing mode is disabled, skip signal scanning (scalp still runs separately)
+  // If swing mode is disabled, skip stock signal scanning
+  // BUT crypto always runs 24/7 regardless of swing setting
   if (CONFIG.swingEnabled === false) {
-    log('scan', '📈 Swing trading DISABLED from dashboard — skipping swing scan');
+    log('scan', '📈 Swing DISABLED — stocks skipped, crypto still scanning');
     await syncAll();
-    return;
+    // Don't return — fall through to scan crypto symbols below
+    // The weekend filter and shouldScanSymbol will handle stock exclusion
+    if (!Array.isArray(CONFIG.symbols) || !CONFIG.symbols.some(s => isCrypto(s))) return;
   }
 
   // Build dynamic scan list: favorites + screener candidates
   const scanList = buildScanList();
   // Weekend: only scan crypto (stocks are closed, crypto trades 24/7)
   const _isWeekend = !isSimMode() && !isWeekday();
-  const eligible = scanList.filter(s => shouldScanSymbol(s) && (_isWeekend ? isCrypto(s) : true));
+  const _swingOff  = CONFIG.swingEnabled === false;
+  const eligible = scanList.filter(s =>
+    shouldScanSymbol(s) &&
+    (_isWeekend ? isCrypto(s) : true) &&
+    (_swingOff  ? isCrypto(s) : true)   // swing off = crypto only
+  );
   if (_isWeekend && !eligible.length) {
     log('scan', 'Weekend — no crypto in watchlist, nothing to scan');
     return;
