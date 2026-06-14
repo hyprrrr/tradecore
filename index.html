@@ -1379,6 +1379,10 @@
               <span class="pair-stat-label">Cash</span>
               <span class="pair-stat-value" id="mainCash">--</span>
             </div>
+            <div class="pair-stat">
+              <span class="pair-stat-label">Scan</span>
+              <span class="pair-stat-value" id="lastScanAgo" style="font-size:11px;">--</span>
+            </div>
           </div>
         </div>
         <div class="chart-controls">
@@ -2182,14 +2186,7 @@ async function fetchEquity() {
 
 }
 
-async function fetchLogs() {
-  const tbl = state.mode === 'sim' ? 'sim_tc_logs' : 'tc_logs';
-  const data = await sbFetch(`${tbl}?select=type,message,created_at&order=created_at.desc&limit=40`, 'GET');
-  if (data && Array.isArray(data)) {
-    state.logs = data;
-    renderLogs(data);
-  }
-}
+
 
 async function fetchSettings() {
   const data = await sbFetch('tc_settings?id=eq.1&select=*', 'GET');
@@ -4325,8 +4322,16 @@ async function fetchLogs() {
   const data = await sbFetch(`${tbl}?select=type,message,created_at&order=created_at.desc&limit=200`, 'GET');
   if (data && Array.isArray(data)) {
     state.logs = data;
-    renderLogs(data);          // mini panel in rightbar
-    renderLogsTable(data);     // full overlay table
+    renderLogs(data);
+    renderLogsTable(data);
+    // Update last-scan indicator in header
+    const scanLog = data.find(l => l.message?.startsWith('Scan complete'));
+    const el = document.getElementById('lastScanAgo');
+    if (el && scanLog) {
+      const ago = Math.round((Date.now() - new Date(scanLog.created_at).getTime()) / 1000);
+      el.textContent = ago < 60 ? `${ago}s` : `${Math.round(ago/60)}m`;
+      el.style.color = ago < 30 ? 'rgba(41,198,126,0.8)' : ago < 120 ? 'rgba(245,197,24,0.8)' : 'rgba(239,83,80,0.8)';
+    }
   }
 }
 
