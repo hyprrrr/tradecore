@@ -6360,6 +6360,12 @@ async function enterPosition(sym, price, sigInfo, bars, direction = 'long') {
   // ── CONFLICT GUARD: no opposite-direction position on same symbol ──
   // Prevents bot from being long + short RBLX simultaneously (proven to
   // net to zero while burning commission on both sides)
+  // Block swing entries when swing mode is disabled from dashboard
+  if (CONFIG.swingEnabled === false && !isCrypto(sym) && !isSimMode()) {
+    log('risk', `🚫 ${sym} swing entry blocked — swing mode disabled from dashboard`);
+    return;
+  }
+
   // Block same-direction re-entry (prevents position stacking like SLV x450)
   if (direction === 'long' && (positions[sym] || alpacaPositions.has(sym))) {
     log('risk', `🚫 ${sym} — already LONG, blocking duplicate long entry`);
@@ -8151,15 +8157,8 @@ async function runScan() {
   // Settings are loaded by the fast config poll every 5s — no need to reload here
   // This prevents the sim mode from being reset on every scan
 
-  // If swing mode is disabled, skip stock signal scanning
-  // BUT crypto always runs 24/7 regardless of swing setting
-  if (CONFIG.swingEnabled === false) {
-    log('scan', '📈 Swing DISABLED — stocks skipped, crypto still scanning');
-    await syncAll();
-    // Don't return — fall through to scan crypto symbols below
-    // The weekend filter and shouldScanSymbol will handle stock exclusion
-    if (!Array.isArray(CONFIG.symbols) || !CONFIG.symbols.some(s => isCrypto(s))) return;
-  }
+  // swingEnabled=false means: don't enter new swing positions
+  // The scan loop still runs for position management + crypto 24/7
 
   // Build dynamic scan list: favorites + screener candidates
   const scanList = buildScanList();
