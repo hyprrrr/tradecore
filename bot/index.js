@@ -8442,7 +8442,13 @@ async function runScan() {
   const total = portfolio + openPnl;
   const dayPnl = total - dailyStartPortfolio;
   log('info', `${session} | Total=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
-  await syncLog('sys', `Scan complete | Portfolio=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`);
+  const _scanMsg = `Scan complete | Portfolio=$${total.toFixed(2)} DayP&L=${dayPnl >= 0 ? '+' : ''}$${dayPnl.toFixed(2)} | Open:${Object.keys(positions).length} W:${totalWins}/L:${totalLosses}`;
+  await syncLog('sys', _scanMsg);
+  // Update heartbeat so dashboard knows scans are alive
+  sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
+    last_scan_at: new Date().toISOString(),
+    updated_at:   new Date().toISOString(),
+  }).catch(() => {});
 
   // Recovery scan — runs every live scan when recovery mode is active
   if (isInRecovery()) {
@@ -10275,7 +10281,12 @@ async function tick() {
 
     if (now - lastFullScan >= FULL_SCAN_INTERVAL_MS) {
       lastFullScan = now;
-      await runScan();
+      try {
+        await runScan();
+      } catch(scanErr) {
+        log('error', `runScan crashed: ${scanErr.message?.slice(0,100)}`);
+        syncLog('error', `runScan crashed: ${scanErr.message?.slice(0,100)}`).catch(()=>{});
+      }
     } else {
       await syncPricesOnly();
     }
