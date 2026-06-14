@@ -274,6 +274,7 @@ async function loadRemoteConfig() {
           circuitBreakerOn     = false;
           realEquity           = 0; // force re-fetch from Alpaca
           realDailyStartEquity = 0; // force re-fetch from Alpaca
+          dailyStartPortfolio  = 0;
 
           // 2. Wipe sim positions from Supabase
           await sbFetch(tbl('tc_positions')+'?symbol=neq.____NONE____', 'DELETE');
@@ -1775,7 +1776,8 @@ async function syncPortfolio() {
         const acctSnap = await getAccount().catch(() => null);
         realDailyStartEquity = (acctSnap?.last_equity && +acctSnap.last_equity > 0)
           ? +parseFloat(acctSnap.last_equity)
-          : equity; // fallback: use current equity (day P&L = 0)
+          : equity;
+        dailyStartPortfolio = realDailyStartEquity; // keep scan dayPnl in sync
       }
     }
     await sbFetch(tbl('tc_portfolio')+'?id=eq.1', 'PATCH', {
@@ -1818,6 +1820,7 @@ async function syncPortfolio() {
         if (!isSimMode() && cashValue > 0) portfolio = cashValue;
         if (!realDailyStartEquity && lastEquity > 0) {
           realDailyStartEquity = lastEquity;
+          dailyStartPortfolio  = lastEquity; // keep scan dayPnl in sync
           log('risk', `Day baseline set: $${lastEquity.toFixed(2)}`);
         }
       }
@@ -2536,7 +2539,7 @@ let prevDayClose        = {};
 let trades              = [];
 let totalWins           = 0;
 let totalLosses         = 0;
-let dailyStartPortfolio = CONFIG.startingCapital;
+let dailyStartPortfolio = 0; // set from real Alpaca equity on first sync
 let circuitBreakerOn    = false;
 let lastScanTime        = null;
 let scanRotationOffset  = 0;  // Rotates through CONFIG.symbols, scanning SCAN_SLICE per cycle
