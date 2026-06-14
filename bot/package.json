@@ -7,8 +7,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
+    "node-cron": "^3.0.3",
     "node-fetch": "^2.7.0",
+    "tweetnacl": "^1.0.3",
     "ws": "^8.16.0"
   },
   "engines": {
