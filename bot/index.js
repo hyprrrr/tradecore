@@ -7899,6 +7899,17 @@ async function managePosition(sym, price, bars) {
     return exitPosition(sym, price, 'STALE_POSITION');
   }
 
+  // ── CRYPTO OVERNIGHT PROTECTION ──────────────────────────────────
+  // Crypto 24/7 means positions can run overnight and gap badly
+  // Close crypto positions after 4 hours if not profitable
+  if (isCrypto(sym) && holdMins > 240 && !isSimMode()) {
+    const chg = (price - pos.entryPrice) / pos.entryPrice;
+    if (chg < 0.003) { // less than 0.3% profit after 4h = close it
+      log('warn', `🪙 ${sym} crypto timeout (${Math.round(holdMins)}min, ${(chg*100).toFixed(2)}%) — closing`);
+      return exitPosition(sym, price, 'CRYPTO_TIMEOUT');
+    }
+  }
+
   // ── INTRADAY ONLY — close 15 min before market close ─────────────
   // Never hold overnight — gaps are unpredictable and can blow through stops
   if (!isSimMode() && isWeekday()) {
@@ -9193,16 +9204,18 @@ async function enterScalp(sym, price, sigInfo, direction = 'long') {
   }
 
   // ── CRYPTO position size cap ────────────────────────────────────
-  // Crypto is much more volatile — cap at 3% of account per position
+  // Crypto: cap at 2% of account notional per position (crypto is volatile)
   if (isCrypto(sym)) {
-    const cryptoCap = (realEquity > 0 ? realEquity : CONFIG.startingCapital) * 0.03;
-    const cryptoMaxQty = Math.floor(cryptoCap / price);
-    if (finalQty > cryptoMaxQty && cryptoMaxQty >= 1) {
-      log('risk', `🪙 ${sym} crypto cap: ${finalQty} → ${cryptoMaxQty} (3% account)`);
-      finalQty = cryptoMaxQty;
-    } else if (cryptoMaxQty < 1) {
-      // For high-price crypto (BTC at $100k), use notional ordering
-      finalQty = 1; // Alpaca handles fractional
+    const equity = realEquity > 0 ? realEquity : CONFIG.startingCapital;
+    const maxNotional = equity * 0.02; // 2% max — was 3% and caused $300 losses
+    const curNotional = finalQty * price;
+    if (curNotional > maxNotional) {
+      finalQty = maxNotional / price; // fractional qty OK for crypto
+      log('risk', `🪙 ${sym} crypto cap: $${curNotional.toFixed(0)} → $${maxNotional.toFixed(0)} (2% acct)`);
+    }
+    if (finalQty * price < 100) {
+      log('warn', `Cannot enter ${sym}: notional $${(finalQty*price).toFixed(0)} < $100 min`);
+      return;
     }
   }
 
@@ -9996,9 +10009,9 @@ function confirmSignal(sym, sig) {
         return false;
       }
       // Per-cycle entry limit — max 1 new trade per scan cycle
+      // Don't re-add — if signal is still valid next scan it will re-confirm naturally
       if (_confirmationsThisCycle >= 1) {
-        log('signal', `⏸ ${sym} confirmed but entry limit reached this cycle — queuing next scan`);
-        pendingSignals.set(sym, { signal: sig.signal, count: required, sigInfo: sig }); // re-add so it fires next cycle
+        log('signal', `⏸ ${sym} entry limit this cycle — will retry next scan`);
         return false;
       }
       _confirmationsThisCycle++;
