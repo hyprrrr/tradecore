@@ -5638,10 +5638,13 @@ function generateSignal(sym, bars5m, bars15m) {
   const isAfterHours = !isMarketOpen();
   const minGates = c15 ? (isAfterHours ? 4 : 5) : (isAfterHours ? 3 : 4);
   const score    = passedGates * 10 + bonus * 5 + rsiScore * 5 + macdScore * 5 + volScore * 3;
-  // Crypto confidence based on score, not gate count (gates don't apply to crypto)
-  const confidence = _isCryptoSym
-    ? Math.min(99, Math.max(51, Math.round(50 + score * 2)))
-    : Math.min(99, Math.round((passedGates / (minGates + 2)) * 100));
+  // Confidence: same formula for stocks and crypto
+  // passedGates/totalGates gives real quality signal
+  // Score provides small bonus for strong confluence
+  const totalGates = minGates + 3; // +3 for EMA, volume, RSI gates
+  const gateConf   = Math.round((passedGates / totalGates) * 100);
+  const scoreBonus = Math.min(15, Math.round(score * 0.5)); // score bonus capped at 15%
+  const confidence = Math.min(95, Math.max(50, gateConf + scoreBonus));
 
   // Crypto: skip minGates check — crypto has fewer reliable indicators
   if (!_isCryptoSym && passedGates < minGates) {
@@ -9802,21 +9805,28 @@ async function fetchAllBarsParallel(symbols) {
     DOTUSD:  'DOTUSD',
     ADAUSD:  'ADAUSD',
   };
-    await Promise.allSettled(cryptoToFetch.map(async sym => {
+    // Sequential fetch with delay to avoid Kraken rate limiting
+  // Parallel fetching causes 429s on BTC/ETH (high-demand pairs)
+  for (const sym of cryptoToFetch) {
       const cached = barCache.get(`${sym}_5Min`);
-      if (cached?.bars?.length >= 15 && Date.now() - cached.ts < 60000) return;
+      if (cached?.bars?.length >= 15 && Date.now() - cached.ts < 90000) continue; // 90s cache
       try {
         const krakenSym = KRAKEN_MAP[sym] || sym;
-        // Kraken OHLC: interval=5 (minutes), since = 2 days ago
-        const since = Math.floor((Date.now() - 2*24*60*60*1000) / 1000);
+        const since = Math.floor((Date.now() - 3*24*60*60*1000) / 1000); // 3 days
         const url = `https://api.kraken.com/0/public/OHLC?pair=${krakenSym}&interval=5&since=${since}`;
-        const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-        if (!res.ok) throw new Error(`Kraken ${res.status}`);
+        const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+        if (!res.ok) {
+          log('warn', `🪙 Kraken ${sym} (${krakenSym}): HTTP ${res.status}`);
+          continue;
+        }
         const json = await res.json();
-        if (json.error?.length) throw new Error(json.error[0]);
-        // Kraken returns {result: {XBTUSD: [[time,open,high,low,close,vwap,vol,count], ...], last: N}}
+        if (json.error?.length) {
+          log('warn', `🪙 Kraken ${sym}: ${json.error[0]}`);
+          continue;
+        }
         const pairKey = Object.keys(json.result || {}).find(k => k !== 'last');
-        const ohlc = json.result?.[pairKey] || [];
+        if (!pairKey) { log('warn', `🪙 Kraken ${sym}: no pair key in result`); continue; }
+        const ohlc = json.result[pairKey] || [];
         const bars = ohlc.map(k => ({
           t: new Date(k[0] * 1000).toISOString(),
           o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[6]
@@ -9832,7 +9842,9 @@ async function fetchAllBarsParallel(symbols) {
       } catch(e) {
         log('warn', `🪙 ${sym} Kraken error: ${e.message?.slice(0,60)}`);
       }
-    }));
+      // Small delay between requests to avoid rate limiting
+      await new Promise(r => setTimeout(r, 200));
+    }
   }
 
   // Skip crypto in Yahoo fetch — Yahoo format is BTC-USD not BTCUSD
