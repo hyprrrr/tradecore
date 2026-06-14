@@ -2990,8 +2990,11 @@ async function syncScreenerResults(candidates) {
 // Build the final scan list: favorites + screener candidates, deduplicated
 function buildScanList() {
   const favorites  = CONFIG.symbols.slice(0, 200);
-  // Always include crypto at the front for 24/7 scanning
-  const cryptoSyms = ['BTCUSD', 'ETHUSD'];
+  // Always include ALL configured crypto at the front for 24/7 scanning
+  const cryptoSyms = [
+    'BTCUSD','ETHUSD','SOLUSD','AVAXUSD','LINKUSD','XRPUSD','DOGEUSD',
+    'LTCUSD','BCHUSD','ADAUSD','DOTUSD',
+  ];
   const discovered = screenerCandidates.slice(0, 5);
   const combined   = [...new Set([...cryptoSyms, ...favorites, ...discovered])];
   // Allow crypto symbols (6-7 chars ending in USD) + standard ticker format
