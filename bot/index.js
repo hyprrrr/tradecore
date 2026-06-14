@@ -182,7 +182,14 @@ async function loadRemoteConfig() {
     const s = rows[0];
 
     // Apply remote settings over CONFIG — secrets never overwritten
-    if (s.symbols)          CONFIG.symbols          = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 200); // hard cap 200 (was 20)
+    if (s.symbols) {
+      CONFIG.symbols = s.symbols.split(',').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 200);
+      // Always ensure all crypto coins are in the watchlist after Supabase load
+      const _mustHaveCrypto = ['BTCUSD','ETHUSD','SOLUSD','AVAXUSD','LINKUSD','XRPUSD','DOGEUSD'];
+      for (const cs of _mustHaveCrypto) {
+        if (!CONFIG.symbols.includes(cs)) CONFIG.symbols.unshift(cs);
+      }
+    }
     CONFIG.strategy = (s.strategy && s.strategy !== 'None' && s.strategy !== 'null')
       ? s.strategy
       : (CONFIG.strategy && CONFIG.strategy !== 'None' ? CONFIG.strategy : 'rsi_macd');
@@ -5294,9 +5301,10 @@ function generateSignal(sym, bars5m, bars15m) {
   // Per-coin RSI thresholds — high-vol cryptos use wider bands for better signal capture
   // Crypto RSI thresholds — wider than stocks to catch more signals
   // High-vol coins (DOGE/SOL/AVAX/XRP) swing more, use slightly wider bands
+  // Per-coin RSI thresholds computed here — _rsiOs/_rsiOb declared further below
+  // Use CONFIG values directly to avoid temporal dead zone
   const _isHighVolCrypto = _isCryptoSym && ['DOGEUSD','SOLUSD','AVAXUSD','XRPUSD','LINKUSD'].includes(sym);
-  const _effRsiOs = _isCryptoSym ? (_isHighVolCrypto ? 40 : 42) : _rsiOs;
-  const _effRsiOb = _isCryptoSym ? (_isHighVolCrypto ? 60 : 58) : _rsiOb;
+  // These will be used after _rsiOs/_rsiOb are declared (they reference _effRsiOs/_effRsiOb)
   let rsiScore = 0;
 
   // Detect if this is a trending day vs mean-reversion day
@@ -5313,6 +5321,9 @@ function generateSignal(sym, bars5m, bars15m) {
   // Crypto uses wider RSI bands — more volatile, 24/7 market
   const _rsiOs = _isCryptoSym ? 48 : CONFIG.rsiOversold;
   const _rsiOb = _isCryptoSym ? 54 : CONFIG.rsiOverbought;
+  // Effective thresholds — high-vol crypto uses wider bands
+  const _effRsiOs = _isCryptoSym ? (_isHighVolCrypto ? 40 : 42) : _rsiOs;
+  const _effRsiOb = _isCryptoSym ? (_isHighVolCrypto ? 60 : 58) : _rsiOb;
 
   // Check actual clock time for after-hours logic — ignore BYPASS_HOURS
   // BYPASS_HOURS makes isMarketOpen()=true even at 3am, breaking AH fast path
