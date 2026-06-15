@@ -1825,9 +1825,9 @@ async function syncPortfolio() {
         realEquity = equityValue;
         // Keep portfolio in sync with real cash so calcQty etc work correctly
         if (!isSimMode() && cashValue > 0) portfolio = cashValue;
-        if (!realDailyStartEquity && lastEquity > 0) {
-          realDailyStartEquity = lastEquity;
-          dailyStartPortfolio  = lastEquity; // keep scan dayPnl in sync
+        if (!realDailyStartEquity && equityValue > 0) {
+          realDailyStartEquity = equityValue;
+          dailyStartPortfolio  = equityValue; // keep scan dayPnl in sync
           log('risk', `Day baseline set: $${lastEquity.toFixed(2)}`);
         }
       }
@@ -10593,7 +10593,6 @@ setInterval(async () => {
     log('recovery', `⏸ Recovery paused — market closed, will resume at open`);
     return; // pause, don't clear — recovery persists until next open
   }
-  log('recovery', `🔄 Recovery interval: active for ${recoveryState?.sym} (attempt ${recoveryState?.attempts||0})`);
   await runRecoveryScan();
 }, 30000);
 // (catches positions opened after initial subscription)
